@@ -1,0 +1,12 @@
+# Override for the Proxmox LXC: host networking (Docker's bridge cannot
+# set the ports sysctl inside an unprivileged container), so the service
+# binds :8080 and the UI :3000 on the LXC directly and no ports are mapped.
+services:
+  airdash:
+    network_mode: host
+    ports: !reset []
+  ui:
+    network_mode: host
+    ports: !reset []
+    environment:
+      AIRDASH_API: http://127.0.0.1:8080

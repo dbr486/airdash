@@ -1,0 +1,6 @@
+.env
+firmware/include/config.h
+firmware/.pio/
+service/bin/
+.DS_Store
+__pycache__/

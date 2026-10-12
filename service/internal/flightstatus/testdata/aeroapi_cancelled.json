@@ -1,0 +1,3 @@
+{"flights":[
+{"ident":"VLG1234","status":"Cancelled","progress_percent":0,"scheduled_out":"2026-09-28T18:00:00Z","actual_off":null,"actual_on":null,"departure_delay":null,"arrival_delay":null,"cancelled":true,"diverted":false}
+],"links":null,"num_pages":1}

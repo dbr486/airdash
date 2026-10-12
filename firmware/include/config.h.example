@@ -1,0 +1,9 @@
+#pragma once
+// Copy to config.h (gitignored) and fill in. The ESP32 only joins 2.4 GHz
+// networks. AIRDASH_URL points at the machine running the AirDash service:
+// replace 192.0.2.10 with its LAN address, and give that machine a static
+// address or a DHCP reservation so the URL keeps working.
+#define WIFI_SSID    "your-2.4ghz-ssid"
+#define WIFI_PASS    "your-password"
+#define AIRDASH_URL  "http://192.0.2.10:8080/api/nearest"
+#define POLL_MS      3000

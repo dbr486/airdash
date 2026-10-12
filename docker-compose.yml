@@ -1,0 +1,33 @@
+services:
+  airdash:
+    build: ./service
+    image: airdash:local
+    env_file: .env
+    environment:
+      # Pinned so AIRDASH_LISTEN in .env (meant for the standalone binary)
+      # cannot move the in-container port out from under the published
+      # port mapping below; the host side is AIRDASH_PORT instead.
+      AIRDASH_LISTEN: ":8080"
+      # Runtime settings (filters, radius) changed from the web UI persist
+      # here across restarts; env vars remain the defaults.
+      AIRDASH_SETTINGS_FILE: /data/settings.json
+    volumes:
+      - airdash-data:/data
+    ports:
+      - "${AIRDASH_PORT:-8080}:8080"
+    restart: unless-stopped
+
+  ui:
+    build: ./ui
+    image: airdash-ui:local
+    environment:
+      AIRDASH_API: http://airdash:8080
+    ports:
+      - "${AIRDASH_UI_PORT:-3000}:3000"
+    depends_on:
+      airdash:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  airdash-data:

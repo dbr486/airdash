@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AirDash</title>
+<link rel="stylesheet" href="mirror.css">
+<style>
+  /* Embeddable mirror: fills whatever box it is given (a Home Assistant
+     iframe card), keeping the 240x135 shape. --s must be a plain number
+     (mirror.css multiplies lengths by it), so a script sets it from the
+     container width. */
+  html,body { margin:0; background:var(--panel); font-family:ui-monospace,Menlo,Consolas,monospace; color:var(--fg); }
+  .fit { width:100%; }
+  .fit .screen { border:0; border-radius:0; }
+  .controls { display:none; gap:6px; padding:6px; background:var(--bg); }
+  .controls.on { display:flex; }
+  .controls button { background:#1e88e5; color:#fff; border:0; border-radius:4px; padding:6px 12px; font:inherit; cursor:pointer; }
+</style>
+</head>
+<body>
+<div class="fit">
+  <div class="screen" id="screen" aria-live="polite">
+    <div id="aircraft" class="hidden">
+      <div class="row r0" id="cs"></div>
+      <div class="row r1" id="route"></div>
+      <div class="row r2"><span class="rt" id="type"></span><span class="dl" id="delay"></span></div>
+      <div class="row r3" id="alt"></div>
+      <div class="row r4" id="dist"></div>
+      <svg class="tri" id="tri" viewBox="0 0 20 20"><polygon points="10,1 16.4,15 3.6,15" fill="#fff"/></svg>
+      <img class="logo hidden" id="logo" alt="">
+    </div>
+    <div id="notraffic" class="hidden">
+      <div class="big">No aircraft</div>
+      <div class="sub" id="within"></div>
+      <div class="dot" id="dot"></div>
+    </div>
+    <div id="boot"><div class="big">AirDash</div><div class="sub" id="bootline">connecting ...</div></div>
+    <div class="stale hidden" id="stale">stale</div>
+    <div class="err hidden" id="err">x</div>
+  </div>
+</div>
+<div class="controls" id="controls">
+  <button type="button" id="refresh">Refresh</button>
+  <button type="button" id="next">Next aircraft</button>
+</div>
+<script src="mirror.js"></script>
+<script>
+// Scale the 240-px-wide screen to the box we were given, now and on resize.
+(() => {
+  const fit = document.querySelector('.fit'), scr = document.getElementById('screen');
+  const apply = () => scr.style.setProperty('--s', (fit.clientWidth / 240).toFixed(4));
+  apply();
+  if (window.ResizeObserver) new ResizeObserver(apply).observe(fit);
+  else window.addEventListener('resize', apply);
+})();
+// ?controls=1 shows the two buttons under the screen (off by default so
+// the card is just the display).
+if (new URLSearchParams(location.search).get('controls') === '1') document.getElementById('controls').classList.add('on');
+document.getElementById('refresh').addEventListener('click', () => poll());
+document.getElementById('next').addEventListener('click', nextAircraft);
+</script>
+</body>
+</html>

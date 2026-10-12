@@ -1,0 +1,329 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AirDash</title>
+<link rel="stylesheet" href="mirror.css">
+<style>
+  html,body { margin:0; background:var(--bg); color:var(--fg); font-family:ui-monospace,Menlo,Consolas,monospace; }
+  main { max-width:760px; margin:24px auto; padding:0 16px; }
+  h1 { font-size:18px; font-weight:600; margin:0 0 12px; color:var(--muted); }
+  form { margin-top:20px; display:grid; grid-template-columns:auto 1fr; gap:10px 14px; align-items:center; max-width:560px; }
+  fieldset { grid-column:1/-1; border:1px solid #333; border-radius:6px; padding:8px 12px; display:flex; flex-wrap:wrap; gap:8px 18px; }
+  legend { color:var(--muted); font-size:12px; padding:0 4px; }
+  label { font-size:14px; }
+  input[type=text], input[type=number] { background:#000; color:var(--fg); border:1px solid #444; border-radius:4px; padding:6px 8px; font:inherit; width:100%; box-sizing:border-box; }
+  input:disabled { opacity:.4; }
+  button { grid-column:2; justify-self:start; background:#1e88e5; color:#fff; border:0; border-radius:4px; padding:8px 16px; font:inherit; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:default; }
+  .controls { display:flex; gap:8px; margin:8px 0 16px; }
+  .controls button { grid-column:auto; }
+  #status { margin-top:14px; color:var(--muted); font-size:14px; }
+  #apply-msg { margin-left:12px; font-size:13px; color:var(--red); }
+  #custom { grid-column:1/-1; font-size:13px; color:var(--yellow); }
+  #display legend { color:var(--muted); }
+  #lookups, #board, #find-msg { grid-column:1/-1; font-size:13px; color:var(--muted); }
+  #home button { grid-column:auto; padding:6px 12px; }
+  #delay-note { grid-column:1/-1; font-size:13px; color:var(--yellow); }
+  #ha { margin-top:28px; color:var(--muted); font-size:14px; }
+  #ha h2 { font-size:16px; font-weight:600; margin:0 0 8px; }
+  #ha pre { background:#000; color:var(--fg); border:1px solid #333; border-radius:6px; padding:10px 12px; font-size:13px; overflow:auto; }
+  #ha button { grid-column:auto; margin-bottom:12px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>AirDash</h1>
+
+  <div class="screen" id="screen" aria-live="polite">
+    <div id="aircraft" class="hidden">
+      <div class="row r0" id="cs"></div>
+      <div class="row r1" id="route"></div>
+      <div class="row r2"><span class="rt" id="type"></span><span class="dl" id="delay"></span></div>
+      <div class="row r3" id="alt"></div>
+      <div class="row r4" id="dist"></div>
+      <svg class="tri" id="tri" viewBox="0 0 20 20"><polygon points="10,1 16.4,15 3.6,15" fill="#fff"/></svg>
+      <img class="logo hidden" id="logo" alt="">
+    </div>
+    <div id="notraffic" class="hidden">
+      <div class="big">No aircraft</div>
+      <div class="sub" id="within"></div>
+      <div class="dot" id="dot"></div>
+    </div>
+    <div id="boot"><div class="big">AirDash</div><div class="sub" id="bootline">connecting ...</div></div>
+    <div class="stale hidden" id="stale">stale</div>
+    <div class="err hidden" id="err">x</div>
+  </div>
+
+  <div class="controls">
+    <button type="button" id="refresh">Refresh</button>
+    <button type="button" id="next">Next aircraft</button>
+  </div>
+
+  <form id="filters">
+    <fieldset id="home">
+      <legend>Home</legend>
+      <label>Latitude <input type="number" id="lat" min="-90" max="90" step="any" style="width:9em"></label>
+      <label>Longitude <input type="number" id="lon" min="-180" max="180" step="any" style="width:9em"></label>
+      <label>Address <input type="text" id="address" placeholder="street, town or place" autocomplete="off" style="width:16em"></label>
+      <button type="button" id="find">Find</button>
+      <div id="find-msg">Address lookup by OpenStreetMap Nominatim, © OpenStreetMap contributors</div>
+    </fieldset>
+    <fieldset>
+      <legend>Show</legend>
+      <label><input type="radio" name="mode" value="all" checked> Everything</label>
+      <label><input type="radio" name="mode" value="origin"> Departing from</label>
+      <label><input type="radio" name="mode" value="dest"> Arriving at</label>
+      <label><input type="radio" name="mode" value="airport"> Touching</label>
+    </fieldset>
+    <fieldset id="display">
+      <legend>Display</legend>
+      <label><input type="checkbox" id="show_delay"> Show delay status (on time / late)</label>
+      <label><input type="checkbox" id="show_names"> Show city names instead of airport codes</label>
+      <label><input type="checkbox" id="show_logos"> Show airline logos</label>
+      <label>Delay lookups per day <input type="number" id="delay_cap" min="0" max="1000" step="1" style="width:6em"></label>
+      <label>Airport board (IATA/ICAO) <input type="text" id="board_airport" placeholder="AGP" maxlength="4" style="width:5em" autocomplete="off"></label>
+      <div id="delay-note" class="hidden"></div>
+      <div id="lookups"></div>
+      <div id="board"></div>
+    </fieldset>
+    <div id="custom" class="hidden"></div>
+    <label for="codes">Airport code(s)</label>
+    <input type="text" id="codes" placeholder="AGP or LEMG, comma-separated" autocomplete="off" spellcheck="false">
+    <label for="radius">Radius (km)</label>
+    <input type="number" id="radius" min="0.1" max="250" step="any" value="10">
+    <button type="submit" id="apply" disabled>Apply <span id="apply-msg"></span></button>
+  </form>
+
+  <div id="status">loading settings ...</div>
+
+  <section id="ha">
+    <h2>Home Assistant</h2>
+    <p>Paste this card into a dashboard (Edit dashboard → Add card → Manual). It embeds the live screen from this page's address, so Home Assistant needs to reach it on the LAN; if Home Assistant is served over HTTPS the browser will refuse an HTTP iframe, in which case use the sensor below instead.</p>
+    <pre id="ha-yaml"></pre>
+    <button type="button" id="copy-yaml">Copy card YAML</button>
+    <p>Optional: a REST sensor in <code>configuration.yaml</code> with the nearest aircraft's fields as attributes, for automations or a Markdown card.</p>
+    <pre id="ha-sensor"></pre>
+    <button type="button" id="copy-sensor">Copy sensor YAML</button>
+  </section>
+</main>
+
+<script src="mirror.js"></script>
+<script>
+// --- settings form ---
+let current = null;
+
+// Called by mirror.js after every poll. The service may have still been
+// down when the page first loaded, so settings were never fetched; a later
+// successful poll means it's up now, and the form must not stay at markup
+// defaults with Apply live.
+function onMirrorPoll(ok) {
+  if (ok && current === null) loadSettings();
+  updateStatus();
+}
+
+function describe(s) {
+  const r = radiusText(s.radius_km);
+  if (!s.origin && !s.dest && !s.airport) return `everything ${r}`;
+  const parts = [];
+  if (s.origin) parts.push(`departures from ${s.origin}`);
+  if (s.dest) parts.push(`arrivals to ${s.dest}`);
+  if (s.airport) parts.push(`flights touching ${s.airport}`);
+  return `${parts.join(' and ')} ${r}`;
+}
+function updateStatus() {
+  if (!current) return;
+  $('status').textContent = `Showing ${describe(current)} — ${lastNearby} nearby`;
+}
+function fillForm(s) {
+  current = s;
+  const set = [s.origin && 'origin', s.dest && 'dest', s.airport && 'airport'].filter(Boolean);
+  let mode = 'all', codes = '';
+  if (set.length === 1) { mode = set[0]; codes = s[mode]; }
+  const custom = set.length > 1;
+  $('custom').classList.toggle('hidden', !custom);
+  if (custom) $('custom').textContent = `custom: origin=${s.origin || '-'}, dest=${s.dest || '-'}, airport=${s.airport || '-'} (Apply replaces it)`;
+  document.querySelector(`input[name=mode][value=${mode}]`).checked = true;
+  $('codes').value = codes;
+  $('radius').value = s.radius_km;
+  $('lat').value = s.lat;
+  $('lon').value = s.lon;
+  $('show_delay').checked = !!s.show_delay;
+  $('show_names').checked = !!s.show_names;
+  $('show_logos').checked = !!s.show_logos;
+  $('delay_cap').value = s.delay_lookups_per_day;
+  $('board_airport').value = s.board_airport || '';
+  syncCodesEnabled();
+  updateStatus();
+  // Apply stays disabled until real settings are loaded, so a page that
+  // loaded while the service was down can't submit markup defaults over a
+  // persisted filter it never saw.
+  $('apply').disabled = false;
+}
+function syncCodesEnabled() {
+  const mode = document.querySelector('input[name=mode]:checked').value;
+  $('codes').disabled = mode === 'all';
+}
+document.querySelectorAll('input[name=mode]').forEach((r) => r.addEventListener('change', syncCodesEnabled));
+
+async function loadSettings() {
+  try {
+    const res = await fetch('/api/settings', { cache: 'no-store' });
+    if (!res.ok) throw new Error(`http ${res.status}`);
+    fillForm(await res.json());
+  } catch (e) {
+    $('status').textContent = 'settings unavailable: ' + e.message;
+  }
+}
+
+$('filters').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const mode = document.querySelector('input[name=mode]:checked').value;
+  const codes = $('codes').value.trim();
+  const lat = Number($('lat').value), lon = Number($('lon').value);
+  if ($('lat').value.trim() === '' || $('lon').value.trim() === '' || !Number.isFinite(lat) || !Number.isFinite(lon)) {
+    $('apply-msg').textContent = 'enter home latitude and longitude';
+    return;
+  }
+  const body = { lat, lon, origin: '', dest: '', airport: '', radius_km: Number($('radius').value) };
+  if (mode !== 'all') {
+    if (!codes) { $('apply-msg').textContent = 'enter an airport code'; return; }
+    body[mode] = codes;
+  }
+  body.show_names = $('show_names').checked;
+  body.show_logos = $('show_logos').checked;
+  body.board_airport = $('board_airport').value.trim();
+  // No key configured: the delay controls are disabled and the page can't
+  // meaningfully edit them. Omit both keys instead of writing back
+  // whatever the disabled inputs happen to hold, so a key added later
+  // still gets the service's on-by-default-with-a-key behaviour instead
+  // of being pinned to a value saved while there was no key.
+  if (!$('show_delay').disabled) {
+    const capRaw = $('delay_cap').value.trim();
+    const cap = Number(capRaw);
+    if (capRaw === '' || !Number.isInteger(cap) || cap < 0 || cap > 1000) {
+      $('apply-msg').textContent = 'delay lookups per day must be 0-1000';
+      return;
+    }
+    body.show_delay = $('show_delay').checked;
+    body.delay_lookups_per_day = cap;
+  }
+  $('apply').disabled = true; $('apply-msg').textContent = '';
+  try {
+    const res = await fetch('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    let out;
+    try {
+      out = await res.json();
+    } catch (e) {
+      // Body wasn't JSON (e.g. a proxy/gateway error page); fall back to
+      // the status code instead of surfacing a JSON-parser error message.
+      throw new Error(`http ${res.status}`);
+    }
+    if (!res.ok) throw new Error(out.error || `http ${res.status}`);
+    fillForm(out);
+    poll();
+    loadStats();
+  } catch (e) {
+    $('apply-msg').textContent = e.message;
+  } finally {
+    $('apply').disabled = false;
+  }
+});
+
+async function loadStats() {
+  try {
+    const res = await fetch('/api/stats', { cache: 'no-store' });
+    if (!res.ok) throw new Error(`http ${res.status}`);
+    const st = await res.json();
+    const noKey = !st.delay_source;
+    $('show_delay').disabled = noKey;
+    $('delay_cap').disabled = noKey;
+    $('delay-note').classList.toggle('hidden', !noKey);
+    if (noKey) $('delay-note').textContent = 'No delay source configured (AIRDASH_AEROAPI_KEY or AIRDASH_AIRLABS_KEY)';
+    $('lookups').textContent = (noKey || !st.delay_source.includes('aeroapi')) ? '' : `AeroAPI lookups today: ${st.delay_lookups_today} / ${st.delay_lookups_cap}${st.delay_enabled ? '' : ' (off)'}`;
+    const b = $('board');
+    if (!st.board_source) b.textContent = '';
+    else if (!st.board_airport) b.textContent = `Airport board: off (set an airport) · ${st.board_calls_month}/${st.board_calls_cap} calls this month`;
+    else if (st.board_age_s < 0) b.textContent = `Board ${st.board_airport}: not fetched yet · ${st.board_calls_month}/${st.board_calls_cap} calls this month`;
+    else b.textContent = `Board ${st.board_airport}: ${st.board_flights} flights, refreshed ${Math.round(st.board_age_s / 60)} min ago · ${st.board_calls_month}/${st.board_calls_cap} calls this month`;
+  } catch (e) {
+    $('lookups').textContent = '';
+    $('board').textContent = '';
+  }
+}
+
+// Address lookup fills the coordinate fields; Apply still has to be pressed,
+// so a wrong match can be corrected before the display moves.
+$('find').addEventListener('click', async () => {
+  const q = $('address').value.trim();
+  const msg = $('find-msg');
+  if (q.length < 3) { msg.textContent = 'type at least 3 characters'; return; }
+  $('find').disabled = true; msg.textContent = 'looking up ...';
+  try {
+    const res = await fetch('/api/geocode?q=' + encodeURIComponent(q), { cache: 'no-store' });
+    const out = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(out.error || `http ${res.status}`);
+    $('lat').value = out.lat.toFixed(6);
+    $('lon').value = out.lon.toFixed(6);
+    msg.textContent = `${out.name} — press Apply to move home there`;
+  } catch (e) {
+    msg.textContent = e.message;
+  } finally {
+    $('find').disabled = false;
+  }
+});
+$('refresh').addEventListener('click', () => poll());
+$('next').addEventListener('click', nextAircraft);
+// Home Assistant snippets, built from this page's own address so they
+// work wherever the stack is deployed.
+(() => {
+  const base = location.origin;
+  $('ha-yaml').textContent = [
+    'type: iframe',
+    `url: ${base}/widget`,
+    'aspect_ratio: 56.25%',
+    'title: AirDash',
+  ].join('\n');
+  $('ha-sensor').textContent = [
+    'rest:',
+    `  - resource: ${base}/api/nearest`,
+    '    scan_interval: 10',
+    '    sensor:',
+    '      - name: AirDash nearest',
+    '        value_template: "{{ value_json.callsign if value_json.found else \'none\' }}"',
+    '        json_attributes:',
+    '          - airline', '          - origin', '          - dest', '          - alt_ft', '          - gs_kt', '          - dist_km', '          - bearing', '          - nearby', '          - delay',
+  ].join('\n');
+  // navigator.clipboard only exists on HTTPS or localhost; on the LAN's
+  // plain-HTTP address fall back to selecting the text and the legacy
+  // copy command, and failing that leave the text selected for the user.
+  const copyText = async (el) => {
+    const text = el.textContent;
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+    try { return document.execCommand('copy'); } catch (e) { return false; }
+  };
+  const copier = (btn, pre) => async () => {
+    const label = btn === 'copy-yaml' ? 'Copy card YAML' : 'Copy sensor YAML';
+    let ok = false;
+    try { ok = await copyText($(pre)); } catch (e) { ok = false; }
+    $(btn).textContent = ok ? 'Copied' : 'Selected: press Ctrl/Cmd+C';
+    setTimeout(() => { $(btn).textContent = label; }, 2000);
+  };
+  $('copy-yaml').addEventListener('click', copier('copy-yaml', 'ha-yaml'));
+  $('copy-sensor').addEventListener('click', copier('copy-sensor', 'ha-sensor'));
+})();
+loadSettings();
+loadStats();
+setInterval(loadStats, 30000);
+</script>
+</body>
+</html>

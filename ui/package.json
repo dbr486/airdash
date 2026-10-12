@@ -1,0 +1,16 @@
+{
+  "name": "airdash-ui",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Web mirror of the AirDash display with filter settings",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  },
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
