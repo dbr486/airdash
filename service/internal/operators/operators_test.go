@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"airdash/internal/routes"
 	"airdash/internal/standing"
 )
 
@@ -203,5 +204,22 @@ func TestCache_DoneContextSkipsInner(t *testing.T) {
 	code, ok, err = c.FlagCode(dead, "3451d5")
 	if err != nil || !ok || code != "VLG" || inner.calls != 1 {
 		t.Errorf("cache hit on dead ctx: %q %v %v calls=%d", code, ok, err, inner.calls)
+	}
+}
+
+// A closed adsbdb gate made no upstream call, so the hex must reach inner
+// again the moment the gate reopens rather than sit out a cooldown.
+func TestCache_GateRejectionStartsNoCooldown(t *testing.T) {
+	now := time.Date(2026, 10, 31, 18, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
+	inner := &fakeFlags{err: routes.ErrRateLimited}
+	c := NewCache(inner, 7*24*time.Hour, 24*time.Hour, 60*time.Second, clock)
+
+	if _, _, err := c.FlagCode(t.Context(), "3451d5"); !errors.Is(err, routes.ErrRateLimited) {
+		t.Fatalf("err = %v, want ErrRateLimited", err)
+	}
+	inner.err, inner.code, inner.ok = nil, "RYR", true
+	if code, ok, err := c.FlagCode(t.Context(), "3451d5"); err != nil || !ok || code != "RYR" {
+		t.Fatalf("second call: code=%q ok=%v err=%v", code, ok, err)
 	}
 }

@@ -37,11 +37,15 @@ func (f *fakeProvider) Fetch(ctx context.Context, lat, lon, r float64) ([]provid
 type fakeRoutes struct {
 	byCallsign map[string]routes.Route
 	errFor     map[string]bool
+	errAll     error // when set, every lookup fails with it
 	calls      int
 }
 
 func (f *fakeRoutes) Route(ctx context.Context, cs string) (routes.Route, bool, error) {
 	f.calls++
+	if f.errAll != nil {
+		return routes.Route{}, false, f.errAll
+	}
 	if f.errFor[cs] {
 		return routes.Route{}, false, errors.New("lookup failed")
 	}
@@ -273,6 +277,41 @@ func countMsg(msgs []string, want string) int {
 		}
 	}
 	return n
+}
+
+// A suppressed lookup (cooldown, or the adsbdb gate during a ban) carries no
+// news about the upstream, so it must neither log "recovered" while the ban
+// lasts nor a second "failing" when the next probe is refused again.
+func TestTick_SuppressedRouteLookupsKeepFailingState(t *testing.T) {
+	h, msgs := newRecordingHandler()
+	ac := airborne("a", "RYR1HU", 51.48, -0.45)
+	p := &fakeProvider{acs: []provider.Aircraft{ac}}
+	r := &fakeRoutes{errAll: errors.New("adsbdb: status 429")}
+	ck := &clock{t: time.Now()}
+	tr := New(Options{
+		Lat: homeLat, Lon: homeLon, RadiusKm: 10, Poll: 5 * time.Second,
+		Provider: p, Routes: r, Filter: filter.Filter{}, Now: ck.now,
+		Logger: slog.New(h),
+	})
+
+	tr.Tick(t.Context())
+	r.errAll = routes.ErrRateLimited
+	tr.Tick(t.Context())
+	tr.Tick(t.Context())
+	r.errAll = errors.New("adsbdb: status 429")
+	tr.Tick(t.Context())
+	if got := countMsg(*msgs, "route lookup recovered"); got != 0 {
+		t.Errorf(`"route lookup recovered" logged %d times during the ban, want 0: %v`, got, *msgs)
+	}
+	if got := countMsg(*msgs, "route lookup failing"); got != 1 {
+		t.Errorf(`"route lookup failing" logged %d times, want 1: %v`, got, *msgs)
+	}
+
+	r.errAll = nil
+	tr.Tick(t.Context())
+	if got := countMsg(*msgs, "route lookup recovered"); got != 1 {
+		t.Errorf(`"route lookup recovered" logged %d times after a real answer, want 1: %v`, got, *msgs)
+	}
 }
 
 func TestTick_RouteFailureLogsOnce(t *testing.T) {

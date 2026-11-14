@@ -34,9 +34,10 @@ import (
 const version = "0.1.0"
 const userAgent = "airdash/" + version + " (+https://github.com/dbr486/airdash)"
 
-// routeErrorCooldown bounds how often a failing adsbdb lookup is retried
+// routeErrorCooldown bounds how often a failing route lookup is retried
 // for the same callsign, so an outage does not turn into a retry storm
-// against a free, unauthenticated API.
+// against a free, unauthenticated API. A 429 from adsbdb is handled
+// source-wide by routes.Gate instead; see there.
 const routeErrorCooldown = 60 * time.Second
 
 func main() {
@@ -87,7 +88,11 @@ func run() error {
 	// source comparison can disagree about, and the raw body is what explains
 	// a disagreement. Owner, logo, geocoder and position traffic is either
 	// not part of that comparison or not JSON worth keeping.
-	adsbdbClient := capture.Wrap(client, sink, tracker.SourceADSBDB, capture.SubjectLastSegment, time.Now)
+	// One gate for every adsbdb client: its rate limit is per IP, so an
+	// owner lookup during a ban would keep the route lookups banned too. It
+	// sits outside the capture so a request it refuses leaves no row.
+	adsbdbGate := routes.NewGate(time.Now, logger)
+	adsbdbClient := adsbdbGate.Wrap(capture.Wrap(client, sink, tracker.SourceADSBDB, capture.SubjectLastSegment, time.Now))
 	hexdbClient := capture.Wrap(client, sink, tracker.SourceHexDB, capture.SubjectHexDB, time.Now)
 	aeroClient := capture.Wrap(client, sink, tracker.SourceAeroAPI, capture.SubjectLastSegment, time.Now)
 	airlabsClient := capture.Wrap(client, sink, capture.SourceAirLabs, capture.SubjectAirLabs, time.Now)
@@ -102,7 +107,7 @@ func run() error {
 	// Owner answers change rarely, so known ones are cached for a week;
 	// unknown ones for a day in case the registry gets filled in.
 	opResolver := operators.NewResolver(operators.NewCache(
-		operators.NewADSBDBOwner(client, routes.DefaultADSBDBURL, userAgent),
+		operators.NewADSBDBOwner(adsbdbGate.Wrap(client), routes.DefaultADSBDBURL, userAgent),
 		7*24*time.Hour, 24*time.Hour, routeErrorCooldown, time.Now))
 
 	initial := settings.FromConfig(cfg)

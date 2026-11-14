@@ -252,6 +252,9 @@ func (t *Tracker) Tick(ctx context.Context) {
 	// it cannot spend it and push an aircraft on to the paid lookup.
 	fallbackCtx, fbCancel := lazyBudget(ctx, t.o.RouteTimeout)
 	var routeErr error // first non-cooldown route lookup error this tick, if any
+	// Set when a lookup was suppressed (cooldown, or the adsbdb gate during
+	// a ban): such a tick says nothing about whether adsbdb has recovered.
+	routeSuppressed := false
 	for _, ac := range acs {
 		if ac.OnGround || !ac.HasPos {
 			continue
@@ -271,7 +274,9 @@ func (t *Tracker) Tick(ctx context.Context) {
 				// A cooldown hit is a consequence of an earlier failure,
 				// not a new one; only a fresh error should (re)trigger the
 				// failing/recovered transition below.
-				if routeErr == nil && !errors.Is(err, routes.ErrCooldown) {
+				if errors.Is(err, routes.ErrCooldown) {
+					routeSuppressed = true
+				} else if routeErr == nil {
 					routeErr = err
 				}
 				c.trace.adsbdb.Status = StatusError
@@ -394,7 +399,7 @@ func (t *Tracker) Tick(ctx context.Context) {
 		t.paidAnswer(best, seen)
 		t.o.Recorder.Record(passRecords(matched, seen, fetchedAt))
 	}
-	t.onSuccess(snap, list, fetchedAt, routeErr, delayState, delayErr)
+	t.onSuccess(snap, list, fetchedAt, routeErr, routeSuppressed, delayState, delayErr)
 }
 
 // cachedFlights is the paid lookup's cache seen without calling upstream.
@@ -901,7 +906,7 @@ func firstNonEmpty(a, b string) string {
 	return b
 }
 
-func (t *Tracker) onSuccess(snap Snapshot, list []Snapshot, fetchedAt time.Time, routeErr error, delayState delayOutcome, delayErr error) {
+func (t *Tracker) onSuccess(snap Snapshot, list []Snapshot, fetchedAt time.Time, routeErr error, routeSuppressed bool, delayState delayOutcome, delayErr error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.failures > 0 {
@@ -910,14 +915,17 @@ func (t *Tracker) onSuccess(snap Snapshot, list []Snapshot, fetchedAt time.Time,
 	t.failures = 0
 	t.interval = t.o.Poll
 
+	// Recovery needs a tick with no suppressed lookups, so a cooldown or a
+	// closed adsbdb gate cannot flap the state to "recovered" mid-outage.
 	failing := routeErr != nil
 	switch {
 	case failing && !t.routeFailing:
 		t.o.Logger.Warn("route lookup failing", "err", routeErr)
-	case !failing && t.routeFailing:
+		t.routeFailing = true
+	case !failing && t.routeFailing && !routeSuppressed:
 		t.o.Logger.Info("route lookup recovered")
+		t.routeFailing = false
 	}
-	t.routeFailing = failing
 
 	if delayState != delayNoInfo {
 		failing := delayState == delayFailed

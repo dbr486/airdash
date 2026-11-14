@@ -152,6 +152,7 @@ the host.
 | adsb.fi | 1 request/s | default 5 s poll; minimum 2 s |
 | adsb.lol | ~8 requests/min | use `AIRDASH_POLL_SECONDS` ≥ 10 |
 | Nominatim | 1 request/s | `geocode` throttle and 1-day cache |
+| adsbdb | 512 requests/min per IP; every request counts, rejected ones too, and past 1,024 each request restarts a 300 s ban | route and owner caches; on a 429 `routes.Gate` stops all adsbdb calls for 300 s (or `Retry-After`) + 15 s, doubling on repeats (max 1 h), then sends one probe |
 | hexdb | none published | asked only when board and adsbdb miss; same route cache as adsbdb, airports cached for the process |
 | AirLabs | plan quota (free: 1,000/month) | `AIRDASH_BOARD_CALLS_PER_MONTH` (default 900), persisted counter |
 | AeroAPI | paid per call | `delay_lookups_per_day` setting (default 65, shared by delay and paid routes), 15-min cache |

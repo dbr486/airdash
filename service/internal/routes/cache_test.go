@@ -137,3 +137,22 @@ func TestCache_SpentContextSkipsUpstreamWithoutCooldown(t *testing.T) {
 		t.Errorf("skipping for a spent budget must not start a cooldown: calls=%d ok=%v err=%v", inner.calls, ok, err)
 	}
 }
+
+func TestCache_GateRejectionStartsNoCooldown(t *testing.T) {
+	inner := &fakeLookup{err: ErrRateLimited}
+	ck := &clock{t: time.Date(2026, 10, 31, 18, 0, 0, 0, time.UTC)}
+	c := NewCache(inner, 6*time.Hour, time.Hour, testCooldown, ck.now)
+
+	if _, _, err := c.Route(t.Context(), "RYR1HU"); !errors.Is(err, ErrRateLimited) {
+		t.Fatalf("err = %v, want ErrRateLimited", err)
+	}
+	// No upstream call was made, so the gate alone decides when to retry:
+	// the moment it reopens, the callsign must reach inner again.
+	inner.err, inner.ok, inner.route = nil, true, Route{OriginIATA: "STN"}
+	if r, ok, err := c.Route(t.Context(), "RYR1HU"); err != nil || !ok || r.OriginIATA != "STN" {
+		t.Fatalf("second call: r=%+v ok=%v err=%v", r, ok, err)
+	}
+	if inner.calls != 2 {
+		t.Errorf("inner called %d times, want 2", inner.calls)
+	}
+}

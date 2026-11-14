@@ -6,6 +6,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"airdash/internal/routes"
 )
 
 // ErrCooldown is returned while an aircraft is in its post-error cooldown
@@ -67,6 +69,11 @@ func (c *Cache) FlagCode(ctx context.Context, hex string) (string, bool, error) 
 
 	code, ok, err := c.inner.FlagCode(ctx, key)
 	if err != nil {
+		// The shared adsbdb gate refused the call without asking upstream;
+		// it alone decides when to retry, so no per-hex cooldown here.
+		if errors.Is(err, routes.ErrRateLimited) {
+			return "", false, err
+		}
 		c.mu.Lock()
 		c.entries[key] = cacheEntry{err: true, expires: now.Add(c.errorCooldown)}
 		c.mu.Unlock()

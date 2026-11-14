@@ -70,6 +70,11 @@ func (c *Cache) Route(ctx context.Context, callsign string) (Route, bool, error)
 	}
 	r, ok, err := c.inner.Route(ctx, callsign)
 	if err != nil {
+		// A closed gate made no upstream call; a cooldown here would only
+		// hold the callsign back after the gate reopens.
+		if errors.Is(err, ErrRateLimited) {
+			return Route{}, false, err
+		}
 		c.mu.Lock()
 		c.entries[callsign] = cacheEntry{err: true, expires: now.Add(c.errorCooldown)}
 		c.mu.Unlock()
