@@ -5,6 +5,8 @@ import (
 	"errors"
 	"sync"
 	"time"
+
+	"airdash/internal/usage"
 )
 
 // ErrCooldown is returned while a callsign is in its post-error cooldown
@@ -62,8 +64,22 @@ func (c *Cache) Route(ctx context.Context, callsign string) (Route, bool, error)
 		return e.route, e.ok, nil
 	}
 
+	// A caller whose budget is already spent still gets cached answers above,
+	// but no upstream call; that is the caller's limit, not an upstream
+	// failure, so it must not start a cooldown either.
+	if err := ctx.Err(); err != nil {
+		return Route{}, false, err
+	}
 	r, ok, err := c.inner.Route(ctx, callsign)
 	if err != nil {
+		// A closed gate made no upstream call; a cooldown here would only
+		// hold the callsign back after the gate reopens.
+		// Neither a closed gate nor a spent daily cap asked upstream; each
+		// decides itself when to let calls through, so no per-callsign
+		// cooldown here.
+		if errors.Is(err, ErrRateLimited) || errors.Is(err, usage.ErrCapReached) {
+			return Route{}, false, err
+		}
 		c.mu.Lock()
 		c.entries[callsign] = cacheEntry{err: true, expires: now.Add(c.errorCooldown)}
 		c.mu.Unlock()

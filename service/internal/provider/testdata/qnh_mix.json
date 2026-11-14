@@ -1,0 +1,6 @@
+{"ac":[
+{"hex":"aaaaaa","flight":"AAA1","alt_baro":1125,"nav_qnh":1020.0,"lat":36.7,"lon":-4.4},
+{"hex":"bbbbbb","flight":"BBB2","alt_baro":2000,"lat":36.7,"lon":-4.4},
+{"hex":"cccccc","flight":"CCC3","alt_baro":7000,"nav_qnh":1018.0,"lat":36.7,"lon":-4.4},
+{"hex":"dddddd","flight":"DDD4","alt_baro":3000,"nav_qnh":0,"lat":36.7,"lon":-4.4}
+]}

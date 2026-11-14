@@ -21,6 +21,13 @@ before(async () => {
       } else if (req.url === '/api/settings') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end('{"origin":"","dest":"","airport":"AGP","radius_km":10}');
+      } else if (req.url === '/api/sources/summary?days=7') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end('{"days":[],"totals":{"passes":0}}');
+      } else if (req.url === '/api/sources/responses/1/raw') {
+        res.writeHead(200, { 'Content-Type': 'text/html', 'X-Content-Type-Options': 'nosniff',
+          'Content-Security-Policy': "default-src 'none'; sandbox" });
+        res.end('<b>raw</b>');
       } else if (req.url === '/api/logo/BA') {
         res.writeHead(200, { 'Content-Type': 'image/png', 'Cache-Control': 'public, max-age=86400' });
         res.end(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0xff, 0xfe, 0x0d, 0x0a]));
@@ -146,4 +153,78 @@ test('settings page carries the Home Assistant snippet and the shared mirror', a
   const js = await fetch(`${appUrl}/mirror.js`);
   assert.equal(js.status, 200);
   assert.match(await js.text(), /async function poll\(\)/);
+});
+
+test('page assets are refetched so a deploy reaches open browsers', async () => {
+  for (const p of ['/', '/widget', '/mirror.js']) {
+    const res = await fetch(`${appUrl}${p}`);
+    assert.equal(res.status, 200, p);
+    assert.equal(res.headers.get('cache-control'), 'no-cache', p);
+    assert.equal(res.headers.get('last-modified'), null, p);
+    assert.equal(res.headers.get('etag'), null, p);
+  }
+});
+
+test('api responses carry a stable UI version', async () => {
+  const a = await fetch(`${appUrl}/api/nearest`);
+  const b = await fetch(`${appUrl}/api/settings`);
+  const v = a.headers.get('x-airdash-ui');
+  assert.match(v ?? '', /^[0-9a-f]{12}$/);
+  assert.equal(b.headers.get('x-airdash-ui'), v);
+});
+
+test('the UI version is sent on upstream errors too', async () => {
+  const down = createApp({ apiBase: 'http://127.0.0.1:1', logger: () => {} }).listen(0, '127.0.0.1');
+  await new Promise((r) => down.once('listening', r));
+  const res = await fetch(`http://127.0.0.1:${down.address().port}/api/nearest`);
+  down.close();
+  assert.equal(res.status, 502);
+  assert.match(res.headers.get('x-airdash-ui') ?? '', /^[0-9a-f]{12}$/);
+});
+
+test('serves the route sources dashboard, linked from the main page', async () => {
+  const res = await fetch(`${appUrl}/sources.html`);
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get('cache-control'), 'no-cache');
+  const html = await res.text();
+  assert.match(html, /\/api\/sources\/summary/);
+  assert.match(await (await fetch(`${appUrl}/`)).text(), /href="sources\.html"/);
+});
+
+test('proxies the route source log with its query string', async () => {
+  const res = await fetch(`${appUrl}/api/sources/summary?days=7`);
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get('cache-control'), 'no-store');
+  assert.deepEqual(await res.json(), { days: [], totals: { passes: 0 } });
+});
+
+test('passes the raw response safety headers through', async () => {
+  const res = await fetch(`${appUrl}/api/sources/responses/1/raw`);
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get('x-content-type-options'), 'nosniff');
+  assert.equal(res.headers.get('content-security-policy'), "default-src 'none'; sandbox");
+  assert.equal(await res.text(), '<b>raw</b>');
+});
+
+test('omits the safety headers when the service does not send them', async () => {
+  const res = await fetch(`${appUrl}/api/nearest`);
+  assert.equal(res.headers.get('content-security-policy'), null);
+});
+
+test('serves the response viewer page and its helper assets', async () => {
+  for (const f of ['response.html', 'jsonview.js', 'jsonview.css', 'rawdata.js', 'sources.css']) {
+    const res = await fetch(`${appUrl}/${f}`);
+    assert.equal(res.status, 200, f);
+  }
+  const html = await (await fetch(`${appUrl}/response.html`)).text();
+  assert.match(html, /jsonview\.js/);
+  assert.match(html, /\/api\/sources\/responses/);
+});
+
+test('serves the airport board page', async () => {
+  const res = await fetch(`${appUrl}/board.html`);
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.match(html, /rawdata\.js/);
+  assert.match(html, /source=airlabs/);
 });

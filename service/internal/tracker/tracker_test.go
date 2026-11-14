@@ -3,9 +3,12 @@ package tracker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -14,6 +17,8 @@ import (
 	"airdash/internal/provider"
 	"airdash/internal/routes"
 	"airdash/internal/settings"
+	"airdash/internal/standing"
+	"airdash/internal/usage"
 )
 
 // Home is Heathrow-ish. Distances below are approximate and only need
@@ -34,11 +39,15 @@ func (f *fakeProvider) Fetch(ctx context.Context, lat, lon, r float64) ([]provid
 type fakeRoutes struct {
 	byCallsign map[string]routes.Route
 	errFor     map[string]bool
+	errAll     error // when set, every lookup fails with it
 	calls      int
 }
 
 func (f *fakeRoutes) Route(ctx context.Context, cs string) (routes.Route, bool, error) {
 	f.calls++
+	if f.errAll != nil {
+		return routes.Route{}, false, f.errAll
+	}
 	if f.errFor[cs] {
 		return routes.Route{}, false, errors.New("lookup failed")
 	}
@@ -272,6 +281,41 @@ func countMsg(msgs []string, want string) int {
 	return n
 }
 
+// A suppressed lookup (cooldown, or the adsbdb gate during a ban) carries no
+// news about the upstream, so it must neither log "recovered" while the ban
+// lasts nor a second "failing" when the next probe is refused again.
+func TestTick_SuppressedRouteLookupsKeepFailingState(t *testing.T) {
+	h, msgs := newRecordingHandler()
+	ac := airborne("a", "RYR1HU", 51.48, -0.45)
+	p := &fakeProvider{acs: []provider.Aircraft{ac}}
+	r := &fakeRoutes{errAll: errors.New("adsbdb: status 429")}
+	ck := &clock{t: time.Now()}
+	tr := New(Options{
+		Lat: homeLat, Lon: homeLon, RadiusKm: 10, Poll: 5 * time.Second,
+		Provider: p, Routes: r, Filter: filter.Filter{}, Now: ck.now,
+		Logger: slog.New(h),
+	})
+
+	tr.Tick(t.Context())
+	r.errAll = routes.ErrRateLimited
+	tr.Tick(t.Context())
+	tr.Tick(t.Context())
+	r.errAll = errors.New("adsbdb: status 429")
+	tr.Tick(t.Context())
+	if got := countMsg(*msgs, "route lookup recovered"); got != 0 {
+		t.Errorf(`"route lookup recovered" logged %d times during the ban, want 0: %v`, got, *msgs)
+	}
+	if got := countMsg(*msgs, "route lookup failing"); got != 1 {
+		t.Errorf(`"route lookup failing" logged %d times, want 1: %v`, got, *msgs)
+	}
+
+	r.errAll = nil
+	tr.Tick(t.Context())
+	if got := countMsg(*msgs, "route lookup recovered"); got != 1 {
+		t.Errorf(`"route lookup recovered" logged %d times after a real answer, want 1: %v`, got, *msgs)
+	}
+}
+
 func TestTick_RouteFailureLogsOnce(t *testing.T) {
 	h, msgs := newRecordingHandler()
 	ac := airborne("a", "ERR1", 51.48, -0.45)
@@ -449,6 +493,7 @@ type fakeSettings struct {
 	radius float64
 	delay  bool
 	show   bool
+	paid   bool
 	lat    float64
 	lon    float64
 }
@@ -477,6 +522,12 @@ func (s *fakeSettings) set(f filter.Filter, r float64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.f, s.radius = f, r
+}
+
+func (s *fakeSettings) PaidRoutesWanted() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.paid
 }
 
 func (s *fakeSettings) DelayWanted() bool {
@@ -612,11 +663,11 @@ func TestTick_DelayCooldownDoesNotFlapLogs(t *testing.T) {
 	tr.Tick(t.Context())
 	tr.Tick(t.Context())
 
-	if got := countMsg(*msgs, "delay lookup failing"); got != 1 {
-		t.Errorf(`"delay lookup failing" logged %d times, want 1: %v`, got, *msgs)
+	if got := countMsg(*msgs, "AeroAPI lookup failing"); got != 1 {
+		t.Errorf(`"AeroAPI lookup failing" logged %d times, want 1: %v`, got, *msgs)
 	}
-	if got := countMsg(*msgs, "delay lookup recovered"); got != 0 {
-		t.Errorf(`"delay lookup recovered" logged %d times, want 0: %v`, got, *msgs)
+	if got := countMsg(*msgs, "AeroAPI lookup recovered"); got != 0 {
+		t.Errorf(`"AeroAPI lookup recovered" logged %d times, want 0: %v`, got, *msgs)
 	}
 }
 
@@ -848,5 +899,1153 @@ func TestTick_HomeComesFromSettings(t *testing.T) {
 	}
 	if p.lat < 40.4 || p.lat > 40.6 {
 		t.Errorf("the feed must be asked around the settings home, got %v,%v", p.lat, p.lon)
+	}
+}
+
+type opCall struct {
+	callsign, hex string
+	haveAirline   bool
+}
+
+type fakeOperators struct {
+	res   standing.Airline
+	ok    bool
+	err   error
+	calls []opCall
+}
+
+func (f *fakeOperators) Operator(ctx context.Context, callsign, hex string, haveAirline bool) (standing.Airline, bool, error) {
+	f.calls = append(f.calls, opCall{callsign, hex, haveAirline})
+	return f.res, f.ok, f.err
+}
+
+func newOpTracker(p provider.Provider, r routes.Lookup, ops OperatorLookup) *Tracker {
+	return New(Options{
+		Lat: homeLat, Lon: homeLon, RadiusKm: 10, Poll: 5 * time.Second,
+		Provider: p, Routes: r, Operators: ops, Now: time.Now,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+}
+
+func TestTick_OperatorFromPrefixOverridesRouteAirline(t *testing.T) {
+	p := &fakeProvider{acs: []provider.Aircraft{airborne("aaa", "SCR137", 51.48, -0.45)}}
+	r := &fakeRoutes{byCallsign: map[string]routes.Route{"SCR137": {Airline: "Si-Chang Flying Service"}}}
+	ops := &fakeOperators{res: standing.Airline{Name: "Silver Cloud Air"}, ok: true}
+	tr := newOpTracker(p, r, ops)
+	tr.Tick(t.Context())
+	s, _ := tr.Current()
+	if s.Airline != "Silver Cloud Air" || s.AirlineIATA != "" {
+		t.Errorf("airline = %q/%q", s.Airline, s.AirlineIATA)
+	}
+}
+
+// The logo must belong to the airline whose name is shown: VRS's code wins,
+// and the route's code survives only when VRS has none.
+func TestTick_OperatorIATAPrecedence(t *testing.T) {
+	for _, c := range []struct {
+		name     string
+		op       standing.Airline
+		wantName string
+		wantIATA string
+	}{
+		{"vrs code replaces route code", standing.Airline{Name: "Jet2.com", IATA: "XX"}, "Jet2.com", "XX"},
+		{"route code kept when vrs has none", standing.Airline{Name: "Silver Cloud Air"}, "Silver Cloud Air", "LS"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			p := &fakeProvider{acs: []provider.Aircraft{airborne("aaa", "EXS1", 51.48, -0.45)}}
+			r := &fakeRoutes{byCallsign: map[string]routes.Route{"EXS1": {Airline: "Jet2", AirlineIATA: "LS"}}}
+			tr := newOpTracker(p, r, &fakeOperators{res: c.op, ok: true})
+			tr.Tick(t.Context())
+			s, _ := tr.Current()
+			if s.Airline != c.wantName || s.AirlineIATA != c.wantIATA {
+				t.Errorf("airline = %q/%q, want %q/%q", s.Airline, s.AirlineIATA, c.wantName, c.wantIATA)
+			}
+		})
+	}
+}
+
+func TestTick_OperatorForNoCallsign(t *testing.T) {
+	ac := airborne("3451d5", "", 51.48, -0.45)
+	ac.Reg = "EC-MKO"
+	p := &fakeProvider{acs: []provider.Aircraft{ac}}
+	ops := &fakeOperators{res: standing.Airline{Name: "Vueling Airlines", IATA: "VY"}, ok: true}
+	tr := newOpTracker(p, &fakeRoutes{}, ops)
+	tr.Tick(t.Context())
+	s, _ := tr.Current()
+	if s.Callsign != "EC-MKO" || s.Airline != "Vueling Airlines" || s.AirlineIATA != "VY" {
+		t.Errorf("snapshot = %+v", s)
+	}
+	if s.Origin != "" || s.Dest != "" {
+		t.Errorf("route fields must stay empty: %+v", s)
+	}
+	if len(ops.calls) != 1 || ops.calls[0].haveAirline {
+		t.Errorf("calls = %+v", ops.calls)
+	}
+}
+
+func TestTick_HaveAirlinePassedThrough(t *testing.T) {
+	p := &fakeProvider{acs: []provider.Aircraft{airborne("aaa", "BAW1", 51.48, -0.45)}}
+	r := &fakeRoutes{byCallsign: map[string]routes.Route{"BAW1": {Airline: "British Airways"}}}
+	ops := &fakeOperators{}
+	tr := newOpTracker(p, r, ops)
+	tr.Tick(t.Context())
+	if len(ops.calls) != 1 || !ops.calls[0].haveAirline {
+		t.Errorf("calls = %+v", ops.calls)
+	}
+}
+
+func TestTick_OperatorErrorIgnored(t *testing.T) {
+	p := &fakeProvider{acs: []provider.Aircraft{airborne("aaa", "BAW1", 51.48, -0.45)}}
+	r := &fakeRoutes{byCallsign: map[string]routes.Route{"BAW1": {Airline: "British Airways"}}}
+	ops := &fakeOperators{err: errors.New("boom")}
+	tr := newOpTracker(p, r, ops)
+	tr.Tick(t.Context())
+	s, _ := tr.Current()
+	if !s.Found || s.Airline != "British Airways" {
+		t.Errorf("snapshot = %+v", s)
+	}
+	if tr.routeFailing {
+		t.Error("operator errors must not mark route lookups as failing")
+	}
+}
+
+func TestTick_TypeName(t *testing.T) {
+	a := airborne("aaa", "X1", 51.48, -0.45)
+	a.Type = "C56X"
+	b := airborne("bbb", "X2", 51.49, -0.45)
+	b.Type = "ZZZZ"
+	tr := newOpTracker(&fakeProvider{acs: []provider.Aircraft{a, b}}, &fakeRoutes{}, nil)
+	tr.Tick(t.Context())
+	l, _ := tr.List()
+	if l[0].TypeName != "Citation XLS" || l[1].TypeName != "" {
+		t.Errorf("type names = %q, %q", l[0].TypeName, l[1].TypeName)
+	}
+}
+
+func TestTick_NilOperators(t *testing.T) {
+	p := &fakeProvider{acs: []provider.Aircraft{airborne("aaa", "BAW1", 51.48, -0.45)}}
+	r := &fakeRoutes{byCallsign: map[string]routes.Route{"BAW1": {Airline: "British Airways"}}}
+	tr := newOpTracker(p, r, nil)
+	tr.Tick(t.Context())
+	s, _ := tr.Current()
+	if s.Airline != "British Airways" {
+		t.Errorf("airline = %q", s.Airline)
+	}
+}
+
+// blockingOperators waits for its context, like a stalled adsbdb.
+type blockingOperators struct{ calls int }
+
+func (b *blockingOperators) Operator(ctx context.Context, _, _ string, _ bool) (standing.Airline, bool, error) {
+	b.calls++
+	<-ctx.Done()
+	return standing.Airline{}, false, ctx.Err()
+}
+
+func TestTick_OperatorLookupsShareOneBudget(t *testing.T) {
+	var acs []provider.Aircraft
+	for i, hex := range []string{"3451d1", "3451d2", "3451d3", "3451d4", "3451d5"} {
+		acs = append(acs, airborne(hex, "", 51.48+float64(i)*0.001, -0.45))
+	}
+	tr := New(Options{
+		Lat: homeLat, Lon: homeLon, RadiusKm: 10, Poll: 5 * time.Second,
+		RouteTimeout: 50 * time.Millisecond,
+		Provider:     &fakeProvider{acs: acs}, Routes: &fakeRoutes{}, Operators: &blockingOperators{}, Now: time.Now,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	start := time.Now()
+	tr.Tick(t.Context())
+	if d := time.Since(start); d > 150*time.Millisecond {
+		t.Errorf("Tick took %v, want < 150ms", d)
+	}
+	if s, _ := tr.Current(); !s.Found || s.Nearby != 5 {
+		t.Errorf("snapshot = %+v", s)
+	}
+}
+
+func TestTick_FilteredAircraftMakeNoOperatorCall(t *testing.T) {
+	p := &fakeProvider{acs: []provider.Aircraft{airborne("aaa", "BAW1", 51.48, -0.45)}}
+	r := &fakeRoutes{byCallsign: map[string]routes.Route{"BAW1": {OriginIATA: "LHR", DestIATA: "BCN"}}}
+	ops := &fakeOperators{}
+	tr := New(Options{
+		Lat: homeLat, Lon: homeLon, RadiusKm: 10, Poll: 5 * time.Second,
+		Provider: p, Routes: r, Operators: ops, Now: time.Now,
+		Filter: mustFilter(t, "", "", "CDG"),
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	tr.Tick(t.Context())
+	if s, _ := tr.Current(); s.Found {
+		t.Fatalf("aircraft should be filtered out: %+v", s)
+	}
+	if len(ops.calls) != 0 {
+		t.Errorf("operator calls = %+v, want none", ops.calls)
+	}
+}
+
+func mustFilter(t *testing.T, o, d, a string) filter.Filter {
+	t.Helper()
+	f, err := filter.Parse(o, d, a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return f
+}
+
+// fakeFlights stands in for AeroAPI behind the real cache, so the tests
+// count upstream calls the way the paid budget does.
+type fakeFlights struct {
+	mu      sync.Mutex
+	queries []flightstatus.Query
+	fl      flightstatus.Flight
+	ok      bool
+	err     error
+}
+
+func (f *fakeFlights) Flight(ctx context.Context, q flightstatus.Query) (flightstatus.Flight, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.queries = append(f.queries, q)
+	return f.fl, f.ok, f.err
+}
+
+func (f *fakeFlights) calls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.queries)
+}
+
+type fakeBoardRoute struct {
+	r     flightstatus.FlightRoute
+	ok    bool
+	calls []string
+}
+
+func (b *fakeBoardRoute) Route(q flightstatus.Query, now time.Time) (flightstatus.FlightRoute, bool) {
+	b.calls = append(b.calls, q.Callsign)
+	return b.r, b.ok
+}
+
+var agpLGW = flightstatus.FlightRoute{
+	OriginIATA: "AGP", OriginICAO: "LEMG", OriginCity: "Malaga",
+	DestIATA: "LGW", DestICAO: "EGKK", DestCity: "London",
+	Operator: "EZY", OperatorIATA: "U2",
+}
+
+type paidRig struct {
+	tr    *Tracker
+	src   *fakeSettings
+	ck    *clock
+	inner *fakeFlights
+	rts   *fakeRoutes
+}
+
+// newPaidRig wires the same cache as both Delay and Flights, as main does,
+// so a route call and a delay call for one ident share an upstream call.
+func newPaidRig(acs []provider.Aircraft, delay, paid bool) *paidRig {
+	ck := &clock{t: time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)}
+	inner := &fakeFlights{}
+	cache := flightstatus.NewCache(inner, 15*time.Minute, 15*time.Minute, time.Minute, ck.now)
+	src := &fakeSettings{radius: 10, delay: delay, show: delay, paid: paid}
+	rts := &fakeRoutes{byCallsign: map[string]routes.Route{}}
+	tr := New(Options{
+		Lat: homeLat, Lon: homeLon, RadiusKm: 10, Poll: 5 * time.Second,
+		Provider: &fakeProvider{acs: acs}, Routes: rts, Settings: src,
+		Delay: cache, Flights: cache, Now: ck.now,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	return &paidRig{tr: tr, src: src, ck: ck, inner: inner, rts: rts}
+}
+
+func (r *paidRig) tick(t *testing.T) Snapshot {
+	t.Helper()
+	r.tr.Tick(t.Context())
+	s, _ := r.tr.Current()
+	return s
+}
+
+func TestPaidRoute_FreeRouteMeansNoPaidCall(t *testing.T) {
+	rig := newPaidRig([]provider.Aircraft{airborne("a", "BAW466", 51.48, -0.45)}, false, true)
+	rig.rts.byCallsign["BAW466"] = routes.Route{OriginIATA: "LHR", DestIATA: "BCN"}
+	rig.inner.fl, rig.inner.ok = flightstatus.Flight{Route: agpLGW, HasRoute: true}, true
+	s := rig.tick(t)
+	if rig.inner.calls() != 0 || s.Origin != "LHR" || s.Dest != "BCN" {
+		t.Errorf("free route must win with no paid call: calls=%d %+v", rig.inner.calls(), s)
+	}
+}
+
+func TestPaidRoute_BoardBeforePaying(t *testing.T) {
+	rig := newPaidRig([]provider.Aircraft{airborne("a", "EZY12", 51.48, -0.45)}, false, true)
+	brd := &fakeBoardRoute{r: flightstatus.FlightRoute{OriginIATA: "AGP", OriginICAO: "LEMG", DestIATA: "LGW", DestICAO: "EGKK"}, ok: true}
+	rig.tr.o.BoardRoute = brd
+	rig.inner.fl, rig.inner.ok = flightstatus.Flight{Route: agpLGW, HasRoute: true}, true
+	s := rig.tick(t)
+	if rig.inner.calls() != 0 || s.Origin != "AGP" || s.Dest != "LGW" {
+		t.Fatalf("board route must be used before paying: calls=%d %+v", rig.inner.calls(), s)
+	}
+	if len(brd.calls) != 1 || brd.calls[0] != "EZY12" {
+		t.Errorf("board asked with %v", brd.calls)
+	}
+	// The board row ageing out mid-pass must not cost a paid call.
+	brd.ok = false
+	rig.ck.t = rig.ck.t.Add(time.Minute)
+	if s := rig.tick(t); rig.inner.calls() != 0 || s.Origin != "AGP" {
+		t.Errorf("remembered board route: calls=%d %+v", rig.inner.calls(), s)
+	}
+}
+
+func TestPaidRoute_FillsRouteNamesAndAirline(t *testing.T) {
+	rig := newPaidRig([]provider.Aircraft{
+		airborne("near", "EZY12", 51.475, -0.45),
+		airborne("far", "FAR1", 51.50, -0.45),
+	}, false, true)
+	rig.inner.fl, rig.inner.ok = flightstatus.Flight{Route: agpLGW, HasRoute: true}, true
+	s := rig.tick(t)
+	if s.Origin != "AGP" || s.Dest != "LGW" || s.OriginName != "Malaga" || s.DestName != "London" ||
+		s.Airline != "EZY" || s.AirlineIATA != "U2" {
+		t.Fatalf("paid route not applied: %+v", s)
+	}
+	if s.Index != 0 || s.Nearby != 2 || s.Hex != "near" {
+		t.Errorf("snapshot identity lost: %+v", s)
+	}
+	list, _ := rig.tr.List()
+	if len(list) != 2 || list[0].Origin != "AGP" || list[0].Index != 0 || list[1].Origin != "" || list[1].Index != 1 {
+		t.Errorf("list head must carry the route, others untouched: %+v", list)
+	}
+	if rig.inner.calls() != 1 || rig.inner.queries[0].Callsign != "EZY12" {
+		t.Errorf("only the nearest is looked up: %+v", rig.inner.queries)
+	}
+}
+
+func TestPaidRoute_KeepsAirlineFromFreeSources(t *testing.T) {
+	rig := newPaidRig([]provider.Aircraft{airborne("a", "EZY12", 51.48, -0.45)}, false, true)
+	rig.tr.o.Operators = &fakeOperators{res: standing.Airline{Name: "easyJet Europe", IATA: "EC"}, ok: true}
+	rig.inner.fl, rig.inner.ok = flightstatus.Flight{Route: agpLGW, HasRoute: true}, true
+	s := rig.tick(t)
+	if s.Origin != "AGP" || s.Airline != "easyJet Europe" || s.AirlineIATA != "EC" {
+		t.Errorf("free airline must be kept: %+v", s)
+	}
+}
+
+func TestPaidRoute_UnknownRememberedForThePass(t *testing.T) {
+	rig := newPaidRig([]provider.Aircraft{airborne("a", "PRIV1", 51.48, -0.45)}, false, true)
+	rig.inner.ok = false
+	for i := 0; i < 20; i++ { // 20 minutes overhead: past the 15-min cache entry
+		if s := rig.tick(t); s.Origin != "" {
+			t.Fatalf("unknown must stay empty: %+v", s)
+		}
+		rig.ck.t = rig.ck.t.Add(time.Minute)
+	}
+	if rig.inner.calls() != 1 {
+		t.Errorf("one route-only call per pass, got %d", rig.inner.calls())
+	}
+}
+
+func TestPaidRoute_FoundRouteKeptForThePassThenNewPassMayCall(t *testing.T) {
+	ac := airborne("a", "EZY12", 51.48, -0.45)
+	rig := newPaidRig([]provider.Aircraft{ac}, false, true)
+	rig.inner.fl, rig.inner.ok = flightstatus.Flight{Route: agpLGW, HasRoute: true}, true
+	rig.tick(t)
+	rig.inner.fl, rig.inner.ok = flightstatus.Flight{}, false // AeroAPI would now say nothing
+	for i := 0; i < 20; i++ {
+		rig.ck.t = rig.ck.t.Add(time.Minute)
+		if s := rig.tick(t); s.Origin != "AGP" {
+			t.Fatalf("route must stay for the pass (minute %d): %+v", i+1, s)
+		}
+	}
+	if rig.inner.calls() != 1 {
+		t.Fatalf("calls within the pass = %d, want 1", rig.inner.calls())
+	}
+	// Gone past the sighting grace: the pass, and its memory, end.
+	rig.tr.o.Provider = &fakeProvider{}
+	rig.tick(t)
+	rig.ck.t = rig.ck.t.Add(10 * time.Minute)
+	rig.tr.o.Provider = &fakeProvider{acs: []provider.Aircraft{ac}}
+	rig.tick(t)
+	if rig.inner.calls() != 2 {
+		t.Errorf("a new pass may call again: calls=%d", rig.inner.calls())
+	}
+}
+
+func TestPaidRoute_LightAircraftSkipped(t *testing.T) {
+	a1 := airborne("a", "GLIDE1", 51.48, -0.45)
+	a1.Category = "A1"
+	anon := airborne("b", "", 51.48, -0.45) // no category, no callsign: local GA
+	for _, ac := range []provider.Aircraft{a1, anon} {
+		rig := newPaidRig([]provider.Aircraft{ac}, false, true)
+		rig.inner.fl, rig.inner.ok = flightstatus.Flight{Route: agpLGW, HasRoute: true}, true
+		if s := rig.tick(t); rig.inner.calls() != 0 || s.Origin != "" {
+			t.Errorf("%s: light aircraft must not be paid for: calls=%d %+v", ac.Hex, rig.inner.calls(), s)
+		}
+	}
+}
+
+func TestPaidRoute_RegistrationIdent(t *testing.T) {
+	ac := airborne("a", "", 51.48, -0.45)
+	ac.Reg, ac.Category = "EC-MKO", "A3"
+	rig := newPaidRig([]provider.Aircraft{ac}, false, true)
+	rig.inner.fl, rig.inner.ok = flightstatus.Flight{Route: agpLGW, HasRoute: true}, true
+	s := rig.tick(t)
+	if rig.inner.calls() != 1 || rig.inner.queries[0].Callsign != "ECMKO" || s.Origin != "AGP" {
+		t.Errorf("registration ident: %+v %+v", rig.inner.queries, s)
+	}
+}
+
+func TestPaidRoute_DelayAndRouteShareOneCall(t *testing.T) {
+	rig := newPaidRig([]provider.Aircraft{airborne("a", "EZY12", 51.48, -0.45)}, true, true)
+	late := flightstatus.Status{Kind: flightstatus.KindLate, DelayMin: 20, Basis: "arrival"}
+	rig.inner.fl = flightstatus.Flight{Route: agpLGW, HasRoute: true, Status: late, HasStatus: true}
+	rig.inner.ok = true
+	s := rig.tick(t)
+	if rig.inner.calls() != 1 {
+		t.Errorf("route and delay must share one AeroAPI call, got %d", rig.inner.calls())
+	}
+	if s.Origin != "AGP" || s.Delay == nil || s.Delay.DelayMin != 20 {
+		t.Errorf("route and delay both shown: %+v delay=%+v", s, s.Delay)
+	}
+	if list, _ := rig.tr.List(); list[0].Delay == nil || list[0].Origin != "AGP" {
+		t.Errorf("list head: %+v", list[0])
+	}
+}
+
+func TestPaidRoute_OffKeepsDelayAsToday(t *testing.T) {
+	rig := newPaidRig([]provider.Aircraft{airborne("a", "EZY12", 51.48, -0.45)}, true, false)
+	rig.inner.fl = flightstatus.Flight{Route: agpLGW, HasRoute: true,
+		Status: flightstatus.Status{Kind: flightstatus.KindOnTime}, HasStatus: true}
+	rig.inner.ok = true
+	s := rig.tick(t)
+	if s.Origin != "" || s.Dest != "" || s.Airline != "" {
+		t.Errorf("paid_routes off: no AeroAPI route may be used: %+v", s)
+	}
+	if s.Delay == nil || s.Delay.Kind != flightstatus.KindOnTime || rig.inner.calls() != 1 {
+		t.Errorf("delay as today: %+v calls=%d", s.Delay, rig.inner.calls())
+	}
+}
+
+func TestPaidRoute_OnWithShowDelayOff(t *testing.T) {
+	rig := newPaidRig([]provider.Aircraft{airborne("a", "EZY12", 51.48, -0.45)}, false, true)
+	rig.inner.fl = flightstatus.Flight{Route: agpLGW, HasRoute: true,
+		Status: flightstatus.Status{Kind: flightstatus.KindLate, DelayMin: 30}, HasStatus: true}
+	rig.inner.ok = true
+	s := rig.tick(t)
+	if s.Origin != "AGP" || s.Delay != nil {
+		t.Errorf("route shown, delay hidden: %+v delay=%+v", s, s.Delay)
+	}
+}
+
+func TestPaidRoute_DelayKeyedByIdentSharesTheCall(t *testing.T) {
+	rig := newPaidRig([]provider.Aircraft{airborne("a", "ezy12 ", 51.48, -0.45)}, false, true)
+	rig.inner.fl = flightstatus.Flight{Route: agpLGW, HasRoute: true,
+		Status: flightstatus.Status{Kind: flightstatus.KindOnTime}, HasStatus: true}
+	rig.inner.ok = true
+	rig.tick(t)
+	rig.src.delay, rig.src.show = true, true
+	rig.ck.t = rig.ck.t.Add(5 * time.Second)
+	s := rig.tick(t)
+	if rig.inner.calls() != 1 || s.Delay == nil {
+		t.Errorf("delay must hit the route call's cache entry: calls=%d delay=%+v", rig.inner.calls(), s.Delay)
+	}
+}
+
+// A refusal is not cached: asking the budget again is free, and a raised
+// cap must take effect on the very next tick rather than after a cooldown.
+func TestPaidRoute_BudgetRefusalIsAskedAgainEachTick(t *testing.T) {
+	h, msgs := newRecordingHandler()
+	ck := &clock{t: time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)}
+	inner := &fakeFlights{fl: flightstatus.Flight{Route: agpLGW, HasRoute: true}, ok: true}
+	limit := 1
+	budget := flightstatus.NewBudget(func() int { return limit }, ck.now, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	budget.Allow() // the day's only lookup is already spent
+	refusals := &countingFlights{inner: flightstatus.NewBudgeted(inner, budget)}
+	cache := flightstatus.NewCache(refusals, 15*time.Minute, 15*time.Minute, time.Minute, ck.now)
+	src := &fakeSettings{radius: 10, delay: true, paid: true}
+	tr := New(Options{
+		Lat: homeLat, Lon: homeLon, RadiusKm: 10, Poll: 5 * time.Second,
+		Provider: &fakeProvider{acs: []provider.Aircraft{airborne("a", "EZY12", 51.48, -0.45)}},
+		Routes:   &fakeRoutes{}, Settings: src, Delay: cache, Flights: cache, Now: ck.now,
+		Logger: slog.New(h),
+	})
+	for i := 0; i < 3; i++ {
+		tr.Tick(t.Context())
+		if s, _ := tr.Current(); s.Origin != "" || s.Delay != nil {
+			t.Fatalf("refused budget must leave the route empty: %+v", s)
+		}
+		ck.t = ck.t.Add(5 * time.Second)
+	}
+	if refusals.n != 3 || inner.calls() != 0 {
+		t.Fatalf("budget asked %d times, upstream %d; want 3 and 0", refusals.n, inner.calls())
+	}
+	limit = 2 // raised in Settings
+	tr.Tick(t.Context())
+	if inner.calls() != 1 {
+		t.Errorf("a raised cap must reach upstream on the next tick: upstream %d", inner.calls())
+	}
+	for _, m := range *msgs {
+		if m == "AeroAPI lookup failing" {
+			t.Errorf("a budget refusal is not a failure: %v", *msgs)
+		}
+	}
+}
+
+type countingFlights struct {
+	inner flightstatus.FlightLookup
+	n     int
+}
+
+func (c *countingFlights) Flight(ctx context.Context, q flightstatus.Query) (flightstatus.Flight, bool, error) {
+	c.n++
+	return c.inner.Flight(ctx, q)
+}
+
+func TestPaidRoute_FiltersUseTheFreeRouteOnly(t *testing.T) {
+	rig := newPaidRig([]provider.Aircraft{airborne("a", "EZY12", 51.48, -0.45)}, false, true)
+	rig.src.f = mustFilter(t, "AGP", "", "")
+	rig.inner.fl, rig.inner.ok = flightstatus.Flight{Route: agpLGW, HasRoute: true}, true
+	if s := rig.tick(t); s.Found || rig.inner.calls() != 0 {
+		t.Errorf("a paid route must not let a filtered aircraft through: %+v calls=%d", s, rig.inner.calls())
+	}
+}
+
+func TestPaidRoute_RegistrationIdentKeepsDelayAcrossTicks(t *testing.T) {
+	ac := airborne("a", "", 51.48, -0.45)
+	ac.Reg, ac.Category = "EC-MKO", "A3"
+	rig := newPaidRig([]provider.Aircraft{ac}, true, true)
+	late := flightstatus.Status{Kind: flightstatus.KindLate, DelayMin: 15, Basis: "arrival"}
+	rig.inner.fl = flightstatus.Flight{Route: agpLGW, HasRoute: true, Status: late, HasStatus: true}
+	rig.inner.ok = true
+	for i := 1; i <= 2; i++ {
+		s := rig.tick(t)
+		if s.Origin != "AGP" || s.Delay == nil || s.Delay.DelayMin != 15 {
+			t.Fatalf("tick %d: route and delay must both show: %+v delay=%+v", i, s, s.Delay)
+		}
+		rig.ck.t = rig.ck.t.Add(5 * time.Second)
+	}
+	if rig.inner.calls() != 1 {
+		t.Errorf("one upstream call for both ticks, got %d: %+v", rig.inner.calls(), rig.inner.queries)
+	}
+}
+
+func TestPaidRoute_OffMeansNoCallForNoCallsign(t *testing.T) {
+	ac := airborne("a", "", 51.48, -0.45)
+	ac.Reg, ac.Category = "EC-MKO", "A3"
+	rig := newPaidRig([]provider.Aircraft{ac}, true, false)
+	rig.inner.fl = flightstatus.Flight{Route: agpLGW, HasRoute: true,
+		Status: flightstatus.Status{Kind: flightstatus.KindOnTime}, HasStatus: true}
+	rig.inner.ok = true
+	rig.tick(t)
+	rig.tick(t)
+	if rig.inner.calls() != 0 {
+		t.Errorf("paid_routes off: a registration ident must not be looked up: %+v", rig.inner.queries)
+	}
+}
+
+func TestPaidRoute_LightNoCallsignGetsNoDelayCall(t *testing.T) {
+	ac := airborne("a", "", 51.48, -0.45) // no category, no callsign: local GA
+	rig := newPaidRig([]provider.Aircraft{ac}, true, true)
+	rig.inner.fl, rig.inner.ok = flightstatus.Flight{Status: flightstatus.Status{Kind: flightstatus.KindOnTime}, HasStatus: true}, true
+	rig.tick(t)
+	if rig.inner.calls() != 0 {
+		t.Errorf("light aircraft must not be paid for via the delay path: %+v", rig.inner.queries)
+	}
+}
+
+// agpTFS is a free route whose airports are nowhere near home (Heathrow), as
+// a stale adsbdb route for a reused flight number is.
+var agpTFS = routes.Route{Airline: "Wizz Air", AirlineIATA: "W6", OriginIATA: "AGP", DestIATA: "TFS",
+	OriginName: "Malaga", DestName: "Tenerife",
+	HasCoords: true, OriginLat: 36.67, OriginLon: -4.49, DestLat: 28.04, DestLon: -16.57}
+
+func TestTick_ImplausibleFreeRouteIsDropped(t *testing.T) {
+	r := &fakeRoutes{byCallsign: map[string]routes.Route{"WZZ1": agpTFS}}
+	tr := newTracker(&fakeProvider{acs: []provider.Aircraft{airborne("a", "WZZ1", 51.48, -0.45)}}, r, filter.Filter{}, &clock{t: time.Now()})
+	tr.Tick(t.Context())
+	s, _ := tr.Current()
+	if s.Origin != "" || s.Dest != "" || s.OriginName != "" || s.DestName != "" {
+		t.Errorf("route the aircraft cannot be flying must be dropped: %+v", s)
+	}
+	if s.Airline != "Wizz Air" || s.AirlineIATA != "W6" {
+		t.Errorf("airline comes from the callsign and must stay: %+v", s)
+	}
+}
+
+func TestPaidRoute_ImplausibleFreeRouteGoesToFlightAware(t *testing.T) {
+	rig := newPaidRig([]provider.Aircraft{airborne("a", "WZZ1", 51.48, -0.45)}, false, true)
+	rig.rts.byCallsign["WZZ1"] = agpTFS
+	rig.tr.o.BoardRoute = &fakeBoardRoute{}
+	rig.inner.fl, rig.inner.ok = flightstatus.Flight{Route: agpLGW, HasRoute: true}, true
+	s := rig.tick(t)
+	if s.Origin != "AGP" || s.Dest != "LGW" || rig.inner.calls() != 1 {
+		t.Errorf("an implausible route the board cannot replace goes to AeroAPI: calls=%d %+v", rig.inner.calls(), s)
+	}
+}
+
+// lhrBUD is a free route that is plausible from home but stale: the board,
+// which has today's times, says the flight goes elsewhere.
+var lhrBUD = routes.Route{Airline: "Wizz Air", AirlineIATA: "W6", OriginIATA: "LHR", DestIATA: "BUD",
+	OriginName: "London", DestName: "Budapest",
+	HasCoords: true, OriginLat: 51.47, OriginLon: -0.46, DestLat: 47.43, DestLon: 19.26}
+
+func TestTick_BoardRouteOverridesFreeRoute(t *testing.T) {
+	r := &fakeRoutes{byCallsign: map[string]routes.Route{"WZZ1": lhrBUD}}
+	tr := newTracker(&fakeProvider{acs: []provider.Aircraft{airborne("a", "WZZ1", 51.48, -0.45)}}, r, filter.Filter{}, &clock{t: time.Now()})
+	tr.o.BoardRoute = &fakeBoardRoute{r: flightstatus.FlightRoute{OriginIATA: "LHR", OriginICAO: "EGLL", DestIATA: "WAW", DestICAO: "EPWA"}, ok: true}
+	tr.Tick(t.Context())
+	s, _ := tr.Current()
+	if s.Origin != "LHR" || s.Dest != "WAW" || s.DestName != "Warsaw" {
+		t.Errorf("board route must win, named from the airport table, not the free route: %+v", s)
+	}
+	if s.Airline != "Wizz Air" || s.AirlineIATA != "W6" {
+		t.Errorf("airline must stay: %+v", s)
+	}
+}
+
+func TestTick_BoardAgreeingKeepsCityNames(t *testing.T) {
+	r := &fakeRoutes{byCallsign: map[string]routes.Route{"WZZ1": lhrBUD}}
+	tr := newTracker(&fakeProvider{acs: []provider.Aircraft{airborne("a", "WZZ1", 51.48, -0.45)}}, r, filter.Filter{}, &clock{t: time.Now()})
+	tr.o.BoardRoute = &fakeBoardRoute{r: flightstatus.FlightRoute{OriginIATA: "LHR", OriginICAO: "EGLL", DestIATA: "BUD", DestICAO: "LHBP"}, ok: true}
+	tr.Tick(t.Context())
+	s, _ := tr.Current()
+	if s.Origin != "LHR" || s.Dest != "BUD" || s.OriginName != "London" || s.DestName != "Budapest" {
+		t.Errorf("a board that agrees must keep the city names: %+v", s)
+	}
+}
+
+func TestTick_BoardRouteBeatsImplausibleCheckAndOutage(t *testing.T) {
+	r := &fakeRoutes{byCallsign: map[string]routes.Route{"WZZ1": agpTFS}, errFor: map[string]bool{"WZZ2": true}}
+	p := &fakeProvider{acs: []provider.Aircraft{airborne("a", "WZZ1", 51.48, -0.45), airborne("b", "WZZ2", 51.49, -0.45)}}
+	tr := newTracker(p, r, filter.Filter{}, &clock{t: time.Now()})
+	tr.o.BoardRoute = &fakeBoardRoute{r: flightstatus.FlightRoute{OriginIATA: "LHR", DestIATA: "WAW"}, ok: true}
+	tr.Tick(t.Context())
+	l, _ := tr.List()
+	for _, s := range l {
+		if s.Origin != "LHR" || s.Dest != "WAW" {
+			t.Errorf("board route must apply to every listed aircraft, even when adsbdb fails: %+v", s)
+		}
+	}
+}
+
+func TestTick_FilterSeesBoardRoute(t *testing.T) {
+	f, err := filter.Parse("", "WAW", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &fakeRoutes{byCallsign: map[string]routes.Route{"WZZ1": lhrBUD}}
+	tr := newTracker(&fakeProvider{acs: []provider.Aircraft{airborne("a", "WZZ1", 51.48, -0.45)}}, r, f, &clock{t: time.Now()})
+	tr.o.BoardRoute = &fakeBoardRoute{r: flightstatus.FlightRoute{OriginIATA: "LHR", DestIATA: "WAW"}, ok: true}
+	tr.Tick(t.Context())
+	if s, _ := tr.Current(); !s.Found || s.Dest != "WAW" {
+		t.Errorf("the filter must judge the board's route, not the stale one: %+v", s)
+	}
+}
+
+func TestPaidRoute_RememberedBoardRouteBeatsFreeRoute(t *testing.T) {
+	rig := newPaidRig([]provider.Aircraft{airborne("a", "WZZ1", 51.48, -0.45)}, false, true)
+	rig.rts.byCallsign["WZZ1"] = lhrBUD
+	brd := &fakeBoardRoute{r: flightstatus.FlightRoute{OriginIATA: "LHR", DestIATA: "WAW"}, ok: true}
+	rig.tr.o.BoardRoute = brd
+	rig.tick(t)
+	// The row ages out of the board mid-pass: the stale free route must not come back.
+	brd.ok = false
+	rig.ck.t = rig.ck.t.Add(time.Minute)
+	if s := rig.tick(t); s.Dest != "WAW" || rig.inner.calls() != 0 {
+		t.Errorf("remembered board route must win: calls=%d %+v", rig.inner.calls(), s)
+	}
+}
+
+func TestPaidRoute_RememberedAeroAPIRouteBeatsLaterBoardRow(t *testing.T) {
+	rig := newPaidRig([]provider.Aircraft{airborne("a", "WZZ1", 51.48, -0.45)}, false, true)
+	brd := &fakeBoardRoute{}
+	rig.tr.o.BoardRoute = brd
+	rig.inner.fl, rig.inner.ok = flightstatus.Flight{Route: agpLGW, HasRoute: true}, true
+	rig.tick(t)
+	// Another leg under the same callsign shows up on the board mid-pass.
+	brd.r, brd.ok = flightstatus.FlightRoute{OriginIATA: "LHR", DestIATA: "WAW"}, true
+	rig.ck.t = rig.ck.t.Add(time.Minute)
+	if s := rig.tick(t); s.Origin != "AGP" || s.Dest != "LGW" || rig.inner.calls() != 1 {
+		t.Errorf("the route found this pass must not flap: calls=%d %+v", rig.inner.calls(), s)
+	}
+}
+
+func TestPaidRoute_UnknownFlightCostsOneCallPerPassWithDelayOn(t *testing.T) {
+	rig := newPaidRig([]provider.Aircraft{airborne("a", "PRIV9", 51.48, -0.45)}, true, true)
+	rig.inner.ok = false // AeroAPI has no such flight
+	rig.tick(t)
+	for i := 0; i < 20; i++ { // seen every minute, past the 15-minute cache
+		rig.ck.t = rig.ck.t.Add(time.Minute)
+		rig.tick(t)
+	}
+	if rig.inner.calls() != 1 {
+		t.Errorf("a flight AeroAPI does not know costs one call per pass, got %d", rig.inner.calls())
+	}
+}
+
+// lhrWAW is a hexdb-style route: codes and coordinates, no airline or names.
+var lhrWAW = routes.Route{OriginIATA: "LHR", OriginICAO: "EGLL", DestIATA: "WAW", DestICAO: "EPWA",
+	HasCoords: true, OriginLat: 51.47, OriginLon: -0.46, DestLat: 52.17, DestLon: 20.97}
+
+func fallbackTracker(free, fb *fakeRoutes, f filter.Filter) *Tracker {
+	tr := newTracker(&fakeProvider{acs: []provider.Aircraft{airborne("a", "WZZ1", 51.48, -0.45)}}, free, f, &clock{t: time.Now()})
+	tr.o.FallbackRoutes = fb
+	return tr
+}
+
+func TestTick_FallbackFillsUnknownRoute(t *testing.T) {
+	fb := &fakeRoutes{byCallsign: map[string]routes.Route{"WZZ1": lhrWAW}}
+	tr := fallbackTracker(&fakeRoutes{}, fb, filter.Filter{})
+	tr.Tick(t.Context())
+	s, _ := tr.Current()
+	// hexdb sends no city names; the embedded airport table names the ends.
+	if s.Origin != "LHR" || s.Dest != "WAW" || s.OriginName != "London" || s.DestName != "Warsaw" {
+		t.Errorf("fallback route must fill an unknown one, named from the airport table: %+v", s)
+	}
+}
+
+func TestTick_FallbackFillsAfterImplausibleDrop(t *testing.T) {
+	fb := &fakeRoutes{byCallsign: map[string]routes.Route{"WZZ1": lhrWAW}}
+	tr := fallbackTracker(&fakeRoutes{byCallsign: map[string]routes.Route{"WZZ1": agpTFS}}, fb, filter.Filter{})
+	tr.Tick(t.Context())
+	s, _ := tr.Current()
+	if s.Origin != "LHR" || s.Dest != "WAW" || s.DestName != "Warsaw" {
+		t.Errorf("fallback route must replace an implausible one: %+v", s)
+	}
+	if s.Airline != "Wizz Air" || s.AirlineIATA != "W6" {
+		t.Errorf("airline from the free route must stay: %+v", s)
+	}
+}
+
+func TestTick_FallbackImplausibleNotShown(t *testing.T) {
+	far := agpTFS
+	far.Airline, far.AirlineIATA, far.OriginName, far.DestName = "", "", "", ""
+	fb := &fakeRoutes{byCallsign: map[string]routes.Route{"WZZ1": far}}
+	tr := fallbackTracker(&fakeRoutes{byCallsign: map[string]routes.Route{"WZZ1": agpTFS}}, fb, filter.Filter{})
+	tr.Tick(t.Context())
+	s, _ := tr.Current()
+	if s.Origin != "" || s.Dest != "" {
+		t.Errorf("an implausible fallback route must not be shown: %+v", s)
+	}
+	if s.Airline != "Wizz Air" {
+		t.Errorf("airline must stay: %+v", s)
+	}
+}
+
+// The fallback is asked for every aircraft (for the source log), but a
+// plausible free route still decides what is shown.
+func TestTick_PlausibleFreeRouteBeatsFallback(t *testing.T) {
+	fb := &fakeRoutes{byCallsign: map[string]routes.Route{"WZZ1": lhrWAW}}
+	tr := fallbackTracker(&fakeRoutes{byCallsign: map[string]routes.Route{"WZZ1": lhrBUD}}, fb, filter.Filter{})
+	tr.Tick(t.Context())
+	if s, _ := tr.Current(); s.Dest != "BUD" {
+		t.Errorf("a plausible free route must win over the fallback: %+v", s)
+	}
+}
+
+func TestTick_BoardBeatsFallback(t *testing.T) {
+	fb := &fakeRoutes{byCallsign: map[string]routes.Route{"WZZ1": lhrWAW}}
+	tr := fallbackTracker(&fakeRoutes{}, fb, filter.Filter{})
+	tr.o.BoardRoute = &fakeBoardRoute{r: flightstatus.FlightRoute{OriginIATA: "LHR", DestIATA: "BUD"}, ok: true}
+	tr.Tick(t.Context())
+	if s, _ := tr.Current(); s.Dest != "BUD" {
+		t.Errorf("the board must win over the fallback: %+v", s)
+	}
+}
+
+func TestTick_FallbackErrorDoesNotFlipRouteFailing(t *testing.T) {
+	fb := &fakeRoutes{errFor: map[string]bool{"WZZ1": true}}
+	tr := fallbackTracker(&fakeRoutes{}, fb, filter.Filter{})
+	tr.Tick(t.Context())
+	if tr.routeFailing || fb.calls != 1 {
+		t.Errorf("a fallback outage must not mark route lookup failing: calls=%d", fb.calls)
+	}
+	if s, _ := tr.Current(); !s.Found || s.Origin != "" {
+		t.Errorf("aircraft must still show, without a route: %+v", s)
+	}
+}
+
+func TestTick_FilterSeesFallbackRoute(t *testing.T) {
+	f, err := filter.Parse("", "WAW", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fb := &fakeRoutes{byCallsign: map[string]routes.Route{"WZZ1": lhrWAW}}
+	tr := fallbackTracker(&fakeRoutes{}, fb, f)
+	tr.Tick(t.Context())
+	if s, _ := tr.Current(); !s.Found || s.Dest != "WAW" {
+		t.Errorf("the filter must judge the fallback route: %+v", s)
+	}
+}
+
+// blockingRoutes stalls until the caller gives up, like an upstream that
+// accepts connections but never answers.
+type blockingRoutes struct{ calls atomic.Int32 }
+
+func (b *blockingRoutes) Route(ctx context.Context, cs string) (routes.Route, bool, error) {
+	b.calls.Add(1)
+	<-ctx.Done()
+	return routes.Route{}, false, ctx.Err()
+}
+
+func TestTick_StalledFallbackCostsOneTimeoutPerTick(t *testing.T) {
+	var acs []provider.Aircraft
+	for i := range 10 {
+		acs = append(acs, airborne(fmt.Sprintf("h%d", i), fmt.Sprintf("WZZ%d", i), 51.48+float64(i)*0.001, -0.45))
+	}
+	tr := newTracker(&fakeProvider{acs: acs}, &fakeRoutes{}, filter.Filter{}, &clock{t: time.Now()})
+	tr.o.RouteTimeout = 50 * time.Millisecond
+	fb := &blockingRoutes{}
+	tr.o.FallbackRoutes = fb
+	start := time.Now()
+	tr.Tick(t.Context())
+	if d := time.Since(start); d > 3*tr.o.RouteTimeout {
+		t.Errorf("a stalled fallback must share one deadline per tick, took %v (%d calls)", d, fb.calls.Load())
+	}
+	if l, _ := tr.List(); len(l) != 10 {
+		t.Errorf("every aircraft must still be listed: %d", len(l))
+	}
+}
+
+// stallOnce blocks for one callsign until the caller gives up and answers
+// the rest from its map, so a real routes.Cache can be warmed around it.
+type stallOnce struct {
+	stall string
+	byCs  map[string]routes.Route
+}
+
+func (s *stallOnce) Route(ctx context.Context, cs string) (routes.Route, bool, error) {
+	if cs == s.stall {
+		<-ctx.Done()
+		return routes.Route{}, false, ctx.Err()
+	}
+	r, ok := s.byCs[cs]
+	return r, ok, nil
+}
+
+func TestTick_SpentFallbackBudgetKeepsCachedRoutes(t *testing.T) {
+	ck := &clock{t: time.Now()}
+	inner := &stallOnce{byCs: map[string]routes.Route{"WZZ2": lhrWAW}}
+	fb := routes.NewCache(inner, time.Hour, time.Hour, time.Minute, ck.now)
+	if _, ok, err := fb.Route(t.Context(), "WZZ2"); !ok || err != nil {
+		t.Fatal("warm-up failed")
+	}
+	inner.stall = "WZZ1"
+	f, err := filter.Parse("", "WAW", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &fakeProvider{acs: []provider.Aircraft{airborne("a", "WZZ1", 51.48, -0.45), airborne("b", "WZZ2", 51.49, -0.45)}}
+	tr := newTracker(p, &fakeRoutes{}, f, ck)
+	tr.o.RouteTimeout = 30 * time.Millisecond
+	tr.o.FallbackRoutes = fb
+	tr.Tick(t.Context())
+	l, _ := tr.List()
+	if len(l) != 1 || l[0].Callsign != "WZZ2" || l[0].Dest != "WAW" {
+		t.Errorf("a cached fallback route must survive a spent tick budget: %+v", l)
+	}
+}
+
+func TestTick_SlowPrimaryDoesNotSpendFallbackBudget(t *testing.T) {
+	ck := &clock{t: time.Now()}
+	tr := newTracker(&fakeProvider{acs: []provider.Aircraft{airborne("a", "WZZ1", 51.48, -0.45)}}, &stallOnce{stall: "WZZ1"}, filter.Filter{}, ck)
+	tr.o.RouteTimeout = 30 * time.Millisecond
+	tr.o.FallbackRoutes = routes.NewCache(&fakeRoutes{byCallsign: map[string]routes.Route{"WZZ1": lhrWAW}}, time.Hour, time.Hour, time.Minute, ck.now)
+	tr.Tick(t.Context())
+	if s, _ := tr.Current(); s.Dest != "WAW" {
+		t.Errorf("a stalled primary source must leave the fallback its own budget: %+v", s)
+	}
+}
+
+type recorderSpy struct{ batches [][]PassRecord }
+
+func (r *recorderSpy) Record(recs []PassRecord) { r.batches = append(r.batches, recs) }
+
+func (r *recorderSpy) last(t *testing.T) []PassRecord {
+	t.Helper()
+	if len(r.batches) == 0 {
+		t.Fatal("nothing recorded")
+	}
+	return r.batches[len(r.batches)-1]
+}
+
+func TestRecord_OneRecordPerListedAircraft(t *testing.T) {
+	p := &fakeProvider{acs: []provider.Aircraft{airborne("a", "WZZ1", 51.50, -0.45), airborne("b", "WZZ2", 51.48, -0.45)}}
+	tr := newTracker(p, &fakeRoutes{byCallsign: map[string]routes.Route{"WZZ2": lhrBUD}}, filter.Filter{}, &clock{t: time.Now()})
+	spy := &recorderSpy{}
+	tr.o.Recorder = spy
+	tr.Tick(t.Context())
+	recs := spy.last(t)
+	if len(recs) != 2 || recs[0].Hex != "b" || !recs[0].Nearest || recs[1].Nearest {
+		t.Fatalf("one record per aircraft, nearest first and only it marked: %+v", recs)
+	}
+	r := recs[0]
+	if r.FirstSeen.IsZero() || r.LastSeen.IsZero() || r.Callsign != "WZZ2" || r.Airline != "Wizz Air" {
+		t.Errorf("pass identity and context must be filled: %+v", r)
+	}
+	if r.ADSBDB != (SourceAnswer{StatusHit, "LHR-BUD"}) || r.Board.Status != StatusOff || r.HexDB.Status != StatusOff ||
+		r.AeroAPI.Status != StatusOff || r.ShownSource != SourceADSBDB || r.ShownRoute != "LHR-BUD" {
+		t.Errorf("adsbdb shown, other sources off: %+v", r)
+	}
+	if recs[1].ADSBDB.Status != StatusUnknown || recs[1].ShownSource != SourceNone || recs[1].ShownRoute != "" {
+		t.Errorf("an unknown route is recorded as such: %+v", recs[1])
+	}
+}
+
+func TestRecord_EverySourceAnswerAndTheShownOne(t *testing.T) {
+	fb := &fakeRoutes{byCallsign: map[string]routes.Route{"WZZ1": lhrWAW}}
+	tr := fallbackTracker(&fakeRoutes{byCallsign: map[string]routes.Route{"WZZ1": agpTFS}}, fb, filter.Filter{})
+	tr.o.BoardRoute = &fakeBoardRoute{}
+	spy := &recorderSpy{}
+	tr.o.Recorder = spy
+	tr.Tick(t.Context())
+	r := spy.last(t)[0]
+	if r.ADSBDB != (SourceAnswer{StatusImplausible, "AGP-TFS"}) || r.Board.Status != StatusMiss ||
+		r.HexDB != (SourceAnswer{StatusHit, "LHR-WAW"}) || r.ShownSource != SourceHexDB || r.ShownRoute != "LHR-WAW" {
+		t.Errorf("implausible adsbdb, board miss, hexdb shown: %+v", r)
+	}
+}
+
+func TestRecord_SourceStatuses(t *testing.T) {
+	far := agpTFS
+	far.Airline, far.AirlineIATA = "", ""
+	cases := []struct {
+		name  string
+		free  *fakeRoutes
+		fb    *fakeRoutes
+		cs    string
+		check func(PassRecord) bool
+	}{
+		{"no callsign", &fakeRoutes{}, &fakeRoutes{}, "",
+			func(r PassRecord) bool {
+				return r.ADSBDB.Status == StatusNone && r.Board.Status == StatusNone && r.HexDB.Status == StatusNone
+			}},
+		{"adsbdb error", &fakeRoutes{errFor: map[string]bool{"WZZ1": true}}, &fakeRoutes{}, "WZZ1",
+			func(r PassRecord) bool { return r.ADSBDB.Status == StatusError && r.HexDB.Status == StatusUnknown }},
+		{"hexdb error", &fakeRoutes{}, &fakeRoutes{errFor: map[string]bool{"WZZ1": true}}, "WZZ1",
+			func(r PassRecord) bool { return r.HexDB.Status == StatusError }},
+		{"adsbdb cooldown", &fakeRoutes{errAll: routes.ErrCooldown}, &fakeRoutes{}, "WZZ1",
+			func(r PassRecord) bool { return r.ADSBDB.Status == StatusCooldown }},
+		{"adsbdb gate closed", &fakeRoutes{errAll: routes.ErrRateLimited}, &fakeRoutes{}, "WZZ1",
+			func(r PassRecord) bool { return r.ADSBDB.Status == StatusCooldown }},
+		{"hexdb cooldown", &fakeRoutes{}, &fakeRoutes{errAll: routes.ErrCooldown}, "WZZ1",
+			func(r PassRecord) bool { return r.HexDB.Status == StatusCooldown }},
+		{"adsbdb cap reached", &fakeRoutes{errAll: usage.ErrCapReached}, &fakeRoutes{}, "WZZ1",
+			func(r PassRecord) bool { return r.ADSBDB.Status == StatusSkipped }},
+		{"hexdb cap reached", &fakeRoutes{}, &fakeRoutes{errAll: usage.ErrCapReached}, "WZZ1",
+			func(r PassRecord) bool { return r.HexDB.Status == StatusSkipped }},
+		{"hexdb implausible", &fakeRoutes{}, &fakeRoutes{byCallsign: map[string]routes.Route{"WZZ1": far}}, "WZZ1",
+			func(r PassRecord) bool {
+				return r.HexDB == SourceAnswer{StatusImplausible, "AGP-TFS"} && r.ShownSource == SourceNone
+			}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ac := airborne("a", tc.cs, 51.48, -0.45)
+			tr := newTracker(&fakeProvider{acs: []provider.Aircraft{ac}}, tc.free, filter.Filter{}, &clock{t: time.Now()})
+			tr.o.FallbackRoutes = tc.fb
+			tr.o.BoardRoute = &fakeBoardRoute{}
+			spy := &recorderSpy{}
+			tr.o.Recorder = spy
+			tr.Tick(t.Context())
+			if r := spy.last(t)[0]; !tc.check(r) {
+				t.Errorf("unexpected record: %+v", r)
+			}
+		})
+	}
+}
+
+func TestRecord_SpentFallbackBudgetIsSkipped(t *testing.T) {
+	ck := &clock{t: time.Now()}
+	p := &fakeProvider{acs: []provider.Aircraft{airborne("a", "WZZ1", 51.48, -0.45), airborne("b", "WZZ2", 51.49, -0.45)}}
+	tr := newTracker(p, &fakeRoutes{}, filter.Filter{}, ck)
+	tr.o.RouteTimeout = 20 * time.Millisecond
+	tr.o.FallbackRoutes = routes.NewCache(&stallOnce{stall: "WZZ1"}, time.Hour, time.Hour, time.Minute, ck.now)
+	spy := &recorderSpy{}
+	tr.o.Recorder = spy
+	tr.Tick(t.Context())
+	recs := spy.last(t)
+	if recs[0].HexDB.Status != StatusSkipped || recs[1].HexDB.Status != StatusSkipped {
+		t.Errorf("the stalled lookup and the one after it ran out of budget: %+v", recs)
+	}
+}
+
+func TestRecord_PaidRouteAndItsMemo(t *testing.T) {
+	rig := newPaidRig([]provider.Aircraft{airborne("a", "WZZ1", 51.48, -0.45)}, false, true)
+	spy := &recorderSpy{}
+	rig.tr.o.Recorder = spy
+	rig.inner.fl, rig.inner.ok = flightstatus.Flight{Route: agpLGW, HasRoute: true}, true
+	rig.tick(t)
+	r := spy.last(t)[0]
+	if r.AeroAPI != (SourceAnswer{StatusHit, "AGP-LGW"}) || r.ShownSource != SourceAeroAPI || r.ShownRoute != "AGP-LGW" {
+		t.Errorf("paid route recorded and shown: %+v", r)
+	}
+	rig.ck.t = rig.ck.t.Add(time.Minute)
+	rig.tick(t)
+	r = spy.last(t)[0]
+	if r.AeroAPI.Status != StatusHit || r.ShownSource != SourceAeroAPI || rig.inner.calls() != 1 {
+		t.Errorf("a remembered paid route keeps its source: calls=%d %+v", rig.inner.calls(), r)
+	}
+}
+
+func TestRecord_PaidUnknownAndNotAsked(t *testing.T) {
+	rig := newPaidRig([]provider.Aircraft{airborne("a", "WZZ1", 51.48, -0.45), airborne("b", "WZZ2", 51.50, -0.45)}, false, true)
+	spy := &recorderSpy{}
+	rig.tr.o.Recorder = spy
+	rig.tick(t)
+	recs := spy.last(t)
+	if recs[0].AeroAPI.Status != StatusUnknown || recs[1].AeroAPI.Status != StatusNotAsked {
+		t.Errorf("nearest asked and unknown, the other not asked: %+v", recs)
+	}
+}
+
+func TestRecord_BoardRouteShownAndRemembered(t *testing.T) {
+	rig := newPaidRig([]provider.Aircraft{airborne("a", "WZZ1", 51.48, -0.45)}, false, true)
+	brd := &fakeBoardRoute{r: flightstatus.FlightRoute{OriginIATA: "LHR", DestIATA: "WAW"}, ok: true}
+	rig.tr.o.BoardRoute = brd
+	spy := &recorderSpy{}
+	rig.tr.o.Recorder = spy
+	rig.tick(t)
+	brd.ok = false
+	rig.ck.t = rig.ck.t.Add(time.Minute)
+	rig.tick(t)
+	r := spy.last(t)[0]
+	if r.Board.Status != StatusMiss || r.ShownSource != SourceBoard || r.ShownRoute != "LHR-WAW" {
+		t.Errorf("a remembered board route keeps its source while the board now misses: %+v", r)
+	}
+}
+
+func TestTick_ComparisonLookupDoesNotStarveNeededOne(t *testing.T) {
+	ck := &clock{t: time.Now()}
+	// "a" is named by a plausible adsbdb route, so its hexdb answer is only
+	// for the log; it stalls. "b" needs hexdb and must still get it.
+	p := &fakeProvider{acs: []provider.Aircraft{airborne("a", "WZZ1", 51.48, -0.45), airborne("b", "WZZ2", 51.49, -0.45)}}
+	tr := newTracker(p, &fakeRoutes{byCallsign: map[string]routes.Route{"WZZ1": lhrBUD}}, filter.Filter{}, ck)
+	tr.o.RouteTimeout = 30 * time.Millisecond
+	tr.o.FallbackRoutes = routes.NewCache(&stallOnce{stall: "WZZ1", byCs: map[string]routes.Route{"WZZ2": lhrWAW}}, time.Hour, time.Hour, time.Minute, ck.now)
+	tr.Tick(t.Context())
+	l, _ := tr.List()
+	if len(l) != 2 || l[0].Dest != "BUD" || l[1].Dest != "WAW" {
+		t.Errorf("a stalled comparison-only lookup must not spend the budget a needed one relies on: %+v", l)
+	}
+}
+
+func TestTick_ComparisonStallBetweenNeededLookupsCostsNothing(t *testing.T) {
+	// A needs hexdb (fast), B only compares (stalls), C needs hexdb and is
+	// nearest: C must get its free route and no paid call may happen.
+	rig := newPaidRig([]provider.Aircraft{
+		airborne("c", "WZZ3", 51.471, -0.45),
+		airborne("a", "WZZ1", 51.48, -0.45),
+		airborne("b", "WZZ2", 51.49, -0.45),
+	}, false, true)
+	rig.rts.byCallsign["WZZ2"] = lhrBUD
+	rig.tr.o.RouteTimeout = 30 * time.Millisecond
+	rig.tr.o.Recorder = &recorderSpy{}
+	// Provider order puts "c" first; make A and B come before C in the loop.
+	p := rig.tr.o.Provider.(*fakeProvider)
+	p.acs = []provider.Aircraft{p.acs[1], p.acs[2], p.acs[0]}
+	rig.tr.o.FallbackRoutes = routes.NewCache(&stallOnce{stall: "WZZ2",
+		byCs: map[string]routes.Route{"WZZ1": lhrWAW, "WZZ3": lhrWAW}}, time.Hour, time.Hour, time.Minute, rig.ck.now)
+	s := rig.tick(t)
+	if s.Callsign != "WZZ3" || s.Dest != "WAW" || rig.inner.calls() != 0 {
+		t.Errorf("the nearest aircraft must get its free route without a paid call: calls=%d %+v", rig.inner.calls(), s)
+	}
+}
+
+func TestTick_NoComparisonLookupsWithoutRecorder(t *testing.T) {
+	fb := &fakeRoutes{byCallsign: map[string]routes.Route{"WZZ1": lhrWAW}}
+	tr := fallbackTracker(&fakeRoutes{byCallsign: map[string]routes.Route{"WZZ1": lhrBUD}}, fb, filter.Filter{})
+	tr.Tick(t.Context())
+	if fb.calls != 0 {
+		t.Errorf("without a source log, an aircraft with a route must not cost a fallback lookup: %d", fb.calls)
+	}
+}
+
+func TestRecord_AeroAPIRouteFromDelayLookup(t *testing.T) {
+	rig := newPaidRig([]provider.Aircraft{airborne("a", "WZZ1", 51.48, -0.45)}, true, true)
+	rig.rts.byCallsign["WZZ1"] = lhrBUD
+	spy := &recorderSpy{}
+	rig.tr.o.Recorder = spy
+	late := 20 * 60
+	rig.inner.fl, rig.inner.ok = flightstatus.Flight{Route: agpLGW, HasRoute: true, Status: flightstatus.Classify(late/60, "arrival"), HasStatus: true}, true
+	s := rig.tick(t)
+	r := spy.last(t)[0]
+	if s.Dest != "BUD" || r.ShownSource != SourceADSBDB || rig.inner.calls() != 1 {
+		t.Fatalf("display unchanged, one paid call for the delay: calls=%d %+v", rig.inner.calls(), s)
+	}
+	if r.AeroAPI != (SourceAnswer{StatusHit, "AGP-LGW"}) {
+		t.Errorf("the route the delay lookup paid for must be recorded: %+v", r.AeroAPI)
+	}
+}
+
+func TestTick_AgreeingBoardKeepsNamesOfImplausibleFreeRoute(t *testing.T) {
+	r := &fakeRoutes{byCallsign: map[string]routes.Route{"WZZ1": agpTFS}}
+	tr := newTracker(&fakeProvider{acs: []provider.Aircraft{airborne("a", "WZZ1", 51.48, -0.45)}}, r, filter.Filter{}, &clock{t: time.Now()})
+	tr.o.BoardRoute = &fakeBoardRoute{r: flightstatus.FlightRoute{OriginIATA: "AGP", DestIATA: "TFS"}, ok: true}
+	tr.Tick(t.Context())
+	if s, _ := tr.Current(); s.Origin != "AGP" || s.OriginName != "Malaga" || s.DestName != "Tenerife" {
+		t.Errorf("a board route that agrees must keep adsbdb's city names: %+v", s)
+	}
+}
+
+func TestRecord_FailedDelayLookupIsRecorded(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want string
+	}{{errors.New("down"), StatusError}, {flightstatus.ErrBudget, StatusSkipped},
+		{flightstatus.ErrCooldown, StatusCooldown}} {
+		rig := newPaidRig([]provider.Aircraft{airborne("a", "WZZ1", 51.48, -0.45)}, true, true)
+		rig.rts.byCallsign["WZZ1"] = lhrBUD
+		spy := &recorderSpy{}
+		rig.tr.o.Recorder = spy
+		rig.inner.err = tc.err
+		rig.tick(t)
+		if r := spy.last(t)[0]; r.AeroAPI.Status != tc.want || rig.inner.calls() != 1 {
+			t.Errorf("%v: delay lookup outcome must be recorded as %s: calls=%d %+v", tc.err, tc.want, rig.inner.calls(), r.AeroAPI)
+		}
+	}
+}
+
+// The route-only paid call (no delay wanted) records a cooldown as such.
+func TestRecord_PaidRouteCooldownIsNotAnError(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want string
+	}{{errors.New("down"), StatusError}, {flightstatus.ErrCooldown, StatusCooldown}, {flightstatus.ErrBudget, StatusSkipped}} {
+		rig := newPaidRig([]provider.Aircraft{airborne("a", "WZZ1", 51.48, -0.45)}, false, true)
+		spy := &recorderSpy{}
+		rig.tr.o.Recorder = spy
+		rig.inner.err = tc.err
+		rig.tick(t)
+		if r := spy.last(t)[0]; r.AeroAPI.Status != tc.want || rig.inner.calls() != 1 {
+			t.Errorf("%v: want %s, calls=%d %+v", tc.err, tc.want, rig.inner.calls(), r.AeroAPI)
+		}
+	}
+}
+
+func TestPositionFailureHookOnlyForBadBody(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want int
+	}{{fmt.Errorf("%w: quota", provider.ErrBadBody), 1}, {errors.New("provider: status 503"), 0}} {
+		var got []string
+		tr := newTracker(&fakeProvider{err: tc.err}, &fakeRoutes{}, filter.Filter{}, &clock{t: time.Now()})
+		tr.o.PositionFailure = func(msg string) { got = append(got, msg) }
+		tr.Tick(t.Context())
+		if len(got) != tc.want {
+			t.Errorf("%v: hook calls = %v, want %d", tc.err, got, tc.want)
+		}
+	}
+}
+
+// A spent daily cap is not an outage: it must not flip route health to
+// failing, which would also log a false "recovered" when the cap resets.
+func TestCapRefusalIsNotRouteFailure(t *testing.T) {
+	h, msgs := newRecordingHandler()
+	tr := newTracker(&fakeProvider{acs: []provider.Aircraft{airborne("a", "WZZ1", 51.48, -0.45)}},
+		&fakeRoutes{errAll: usage.ErrCapReached}, filter.Filter{}, &clock{t: time.Now()})
+	tr.o.Logger = slog.New(h)
+	for i := 0; i < 3; i++ {
+		tr.Tick(t.Context())
+	}
+	for _, m := range *msgs {
+		if strings.Contains(m, "failing") {
+			t.Fatalf("cap refusal logged as a failure: %v", *msgs)
+		}
 	}
 }

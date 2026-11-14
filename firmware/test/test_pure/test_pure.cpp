@@ -22,7 +22,22 @@ static const char* FOUND =
   "\"alt_ft\":3525,\"gs_kt\":267,\"track\":216,\"dist_km\":3.4,\"bearing\":112,"
   "\"age_s\":2,\"nearby\":3,\"radius_km\":10}";
 
+// A named aircraft with no route: formatRoute shows the airline on row 2, so
+// row 3 must carry only the model.
+static const char* FOUND_NAMED =
+  "{\"found\":true,\"callsign\":\"SCA12\",\"type\":\"C56X\",\"type_name\":\"Citation XLS\","
+  "\"reg\":\"N123AB\",\"airline\":\"Silver Cloud Air\","
+  "\"alt_ft\":9000,\"gs_kt\":300,\"track\":10,\"dist_km\":5.0,\"bearing\":45,"
+  "\"age_s\":1,\"nearby\":1,\"radius_km\":10}";
+
 static const char* EMPTY = "{\"found\":false,\"age_s\":45,\"nearby\":0,\"radius_km\":12.5}";
+
+void test_parses_type_name() {
+  Nearest n;
+  TEST_ASSERT_TRUE(parseNearest(FOUND_NAMED, n));
+  TEST_ASSERT_EQUAL_STRING("C56X", n.type);
+  TEST_ASSERT_EQUAL_STRING("Citation XLS", n.typeName);
+}
 
 void test_parses_found_body() {
   Nearest n;
@@ -30,6 +45,7 @@ void test_parses_found_body() {
   TEST_ASSERT_TRUE(n.found);
   TEST_ASSERT_EQUAL_STRING("BAW466", n.callsign);
   TEST_ASSERT_EQUAL_STRING("A319", n.type);
+  TEST_ASSERT_EQUAL_STRING("A319", n.typeName);   // older service: falls back to type
   TEST_ASSERT_EQUAL_STRING("G-EUPG", n.reg);
   TEST_ASSERT_EQUAL_STRING("British Airways", n.airline);
   TEST_ASSERT_EQUAL_STRING("LHR", n.origin);
@@ -83,8 +99,8 @@ void test_malformed_and_missing_found() {
 // plan 4b). A 768-byte document ran out of room on this exact body on the
 // live T-Display; this test pins the capacity that fixed it.
 static const char* WORST_CASE =
-  "{\"found\":true,\"callsign\":\"ABCDEFGH\",\"hex\":\"~abcdef\",\"index\":12,\"type\":\"B38M\",\"reg\":\"EC-MNOP\","
-  "\"airline\":\"An Airline With A Very Long Name Ltd\",\"airline_iata\":\"XX\",\"logo\":\"XX\",\"origin\":\"EGLL\",\"dest\":\"LEMG\","
+  "{\"found\":true,\"callsign\":\"ABCDEFGH\",\"hex\":\"~abcdef\",\"index\":12,\"type\":\"B38M\",\"type_name\":\"ABCDEFGHIJKLMNO\",\"reg\":\"EC-MNOP\","
+  "\"airline\":\"Flight Inspection Center of the General Administration of Civil Aviation in Chin\",\"airline_iata\":\"XX\",\"logo\":\"XX\",\"origin\":\"EGLL\",\"dest\":\"LEMG\","
   "\"origin_label\":\"Palma de Mallorca Balea\",\"dest_label\":\"Frankfurt am Main Hesse\","
   "\"alt_ft\":12345,\"gs_kt\":456,\"track\":359,\"dist_km\":123.4,\"bearing\":359,"
   "\"age_s\":12,\"nearby\":12,\"radius_km\":250,"
@@ -138,10 +154,23 @@ void test_row_formats() {
   formatDist(n, out, sizeof out);
   TEST_ASSERT_EQUAL_STRING("3.4 km  1/3", out);
 
-  n.type[0] = 0;
+  // Route known but no model: the airline still fills the row.
+  n.type[0] = 0; n.typeName[0] = 0;
   formatTypeAirline(n, out, sizeof out);
   TEST_ASSERT_EQUAL_STRING("British Airways", out);
   n.airline[0] = 0;
+  formatTypeAirline(n, out, sizeof out);
+  TEST_ASSERT_EQUAL_STRING("", out);
+
+  // No route: row 2 already shows the airline, so row 3 is the model only.
+  parseNearest(FOUND_NAMED, n);
+  formatTypeAirline(n, out, sizeof out);
+  TEST_ASSERT_EQUAL_STRING("Citation XLS", out);
+  parseNearest(FOUND, n);
+  n.originLabel[0] = 0; n.destLabel[0] = 0;
+  formatTypeAirline(n, out, sizeof out);
+  TEST_ASSERT_EQUAL_STRING("A319", out);
+  n.typeName[0] = 0;
   formatTypeAirline(n, out, sizeof out);
   TEST_ASSERT_EQUAL_STRING("", out);
 }
@@ -494,6 +523,7 @@ void test_battery_colour_bands() {
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_parses_found_body);
+  RUN_TEST(test_parses_type_name);
   RUN_TEST(test_parses_empty_body);
   RUN_TEST(test_truncates_long_strings);
   RUN_TEST(test_malformed_and_missing_found);

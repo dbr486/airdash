@@ -13,12 +13,15 @@ type fakeLookup struct {
 	calls int
 	st    Status
 	ok    bool
+	route FlightRoute
+	hasRt bool
 	err   error
 }
 
-func (f *fakeLookup) Status(ctx context.Context, q Query) (Status, bool, error) {
+func (f *fakeLookup) Flight(ctx context.Context, q Query) (Flight, bool, error) {
 	f.calls++
-	return f.st, f.ok, f.err
+	fl := Flight{Status: f.st, HasStatus: f.ok, Route: f.route, HasRoute: f.hasRt}
+	return fl, f.ok || f.hasRt, f.err
 }
 
 type clock struct{ t time.Time }
@@ -172,11 +175,101 @@ func TestCached_HitDoesNotConsumeBudget(t *testing.T) {
 	if used, _ := b.Today(); used != 1 || inner.calls != 1 {
 		t.Errorf("used=%d inner=%d, want 1/1", used, inner.calls)
 	}
-	// A second callsign exceeds the cap of 1: ErrBudget, cached as a cooldown.
-	if _, _, err := c.Status(t.Context(), Query{Callsign: "OTHER1"}); !errors.Is(err, ErrBudget) {
-		t.Errorf("expected ErrBudget, got %v", err)
+	// A second callsign exceeds the cap of 1: ErrBudget every time, never
+	// cached as a cooldown (which the source log would read as an error).
+	for i := 0; i < 2; i++ {
+		if _, _, err := c.Status(t.Context(), Query{Callsign: "OTHER1"}); !errors.Is(err, ErrBudget) {
+			t.Errorf("ask %d: expected ErrBudget, got %v", i, err)
+		}
 	}
-	if _, _, err := c.Status(t.Context(), Query{Callsign: "OTHER1"}); !errors.Is(err, ErrCooldown) {
-		t.Errorf("budget refusal should enter cooldown, got %v", err)
+}
+
+func TestCache_FlightThenStatusIsOneInnerCall(t *testing.T) {
+	ck := &clock{t: time.Now()}
+	inner := &fakeLookup{st: Status{Kind: KindOnTime}, ok: true, route: FlightRoute{OriginIATA: "CDG"}, hasRt: true}
+	c := NewCache(inner, 15*time.Minute, 15*time.Minute, time.Minute, ck.now)
+	f, ok, err := c.Flight(t.Context(), Query{Callsign: "EJU1848"})
+	if err != nil || !ok || !f.HasRoute || f.Route.OriginIATA != "CDG" {
+		t.Fatalf("flight=%+v ok=%v err=%v", f, ok, err)
+	}
+	if _, ok, _ := c.Status(t.Context(), Query{Callsign: "EJU1848"}); !ok {
+		t.Error("Status should be served from the same entry")
+	}
+	if inner.calls != 1 {
+		t.Errorf("inner calls = %d, want 1", inner.calls)
+	}
+}
+
+func TestCache_RouteOnlyStatusNotOk(t *testing.T) {
+	ck := &clock{t: time.Now()}
+	inner := &fakeLookup{route: FlightRoute{OriginIATA: "CDG"}, hasRt: true}
+	c := NewCache(inner, 15*time.Minute, 15*time.Minute, time.Minute, ck.now)
+	if _, ok, _ := c.Flight(t.Context(), Query{Callsign: "A"}); !ok {
+		t.Error("Flight should be ok with a route")
+	}
+	if _, ok, _ := c.Status(t.Context(), Query{Callsign: "A"}); ok {
+		t.Error("Status must not be ok for a route-only flight")
+	}
+}
+
+func TestBudgeted_OneUnitPerInnerCallForEitherMethod(t *testing.T) {
+	ck := &clock{t: time.Now()}
+	b := NewBudget(func() int { return 10 }, ck.now, quiet())
+	bl := NewBudgeted(&fakeLookup{st: Status{Kind: KindOnTime}, ok: true}, b)
+	_, _, _ = bl.Flight(t.Context(), Query{Callsign: "A"})
+	_, _, _ = bl.Status(t.Context(), Query{Callsign: "A"})
+	if used, _ := b.Today(); used != 2 {
+		t.Errorf("used = %d, want 2 (one per inner call)", used)
+	}
+}
+
+// The answer depends on when the aircraft was first seen (a just-departed
+// instance is dated against it), so a new pass must not replay an answer
+// chosen for another; one pass still shares one entry between readers.
+func TestCache_KeyedByPass(t *testing.T) {
+	ck := &clock{t: time.Date(2026, 10, 30, 17, 0, 0, 0, time.UTC)}
+	inner := &fakeLookup{}
+	c := NewCache(inner, 15*time.Minute, 15*time.Minute, time.Minute, ck.now)
+	pass1 := Query{Callsign: "EWG8ZR", Seen: ck.t}
+	c.Flight(t.Context(), pass1)
+	c.Status(t.Context(), pass1)
+	if inner.calls != 1 {
+		t.Fatalf("one pass shares one entry, calls=%d", inner.calls)
+	}
+	ck.advance(5 * time.Minute)
+	c.Flight(t.Context(), Query{Callsign: "EWG8ZR", Seen: ck.t})
+	if inner.calls != 2 {
+		t.Errorf("a new pass must ask again, calls=%d", inner.calls)
+	}
+}
+
+func TestCache_ErrorCooldownSpansPasses(t *testing.T) {
+	ck := &clock{t: time.Date(2026, 10, 30, 17, 0, 0, 0, time.UTC)}
+	inner := &fakeLookup{err: ErrAuth}
+	c := NewCache(inner, 15*time.Minute, 15*time.Minute, time.Minute, ck.now)
+	c.Flight(t.Context(), Query{Callsign: "EWG8ZR", Seen: ck.t})
+	ck.advance(5 * time.Minute)
+	if _, _, err := c.Flight(t.Context(), Query{Callsign: "EWG8ZR", Seen: ck.t}); !errors.Is(err, ErrCooldown) || inner.calls != 1 {
+		t.Errorf("a bad key must stay in cooldown across passes: calls=%d err=%v", inner.calls, err)
+	}
+}
+
+func TestCache_CachedNeverCallsUpstream(t *testing.T) {
+	ck := &clock{t: time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)}
+	inner := &fakeLookup{route: FlightRoute{OriginIATA: "AGP"}, hasRt: true}
+	c := NewCache(inner, 15*time.Minute, 15*time.Minute, time.Minute, ck.now)
+	q := Query{Callsign: "RYR5EL", Seen: ck.t}
+	if _, _, found := c.Cached(q); found || inner.calls != 0 {
+		t.Fatalf("an empty cache has nothing and must not ask upstream: calls=%d", inner.calls)
+	}
+	if _, _, err := c.Flight(t.Context(), q); err != nil {
+		t.Fatal(err)
+	}
+	fl, ok, found := c.Cached(q)
+	if !found || !ok || fl.Route.OriginIATA != "AGP" || inner.calls != 1 {
+		t.Errorf("a cached answer is returned as is: found=%v ok=%v %+v calls=%d", found, ok, fl, inner.calls)
+	}
+	if _, _, found := c.Cached(Query{Callsign: "RYR5EL", Seen: ck.t.Add(time.Hour)}); found {
+		t.Error("another pass's entry must not be returned")
 	}
 }

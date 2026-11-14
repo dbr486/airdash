@@ -15,11 +15,20 @@ import (
 // waiting for the normal consecutive-failure threshold.
 var ErrRateLimited = errors.New("provider: rate limited")
 
+// ErrBadBody marks an answer whose body is not a usable aircraft list,
+// such as an {"error":"..."} envelope sent with a 200: the transport saw a
+// clean call, so the tracker reports it as the feed's error.
+var ErrBadBody = errors.New("provider: bad response body")
+
 type Aircraft struct {
 	Hex      string
 	Callsign string
 	Type     string
 	Reg      string
+	// Category is the ADS-B emitter category ("A1" light … "A7" rotorcraft),
+	// empty when the feed lacks it; it lets callers skip paid lookups for
+	// light aircraft that never carry a scheduled route.
+	Category string
 	Lat, Lon float64
 	HasPos   bool
 	AltFt    int

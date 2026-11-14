@@ -11,6 +11,7 @@ without warranty of any kind.
   - adsb.fi open data: personal, non-commercial use;
   - adsb.lol: its API terms and rate limits;
   - adsbdb: its fair-use terms;
+  - VRS standing data (embedded airline list): CC0, no terms to follow;
   - OpenStreetMap Nominatim: the [usage policy](https://operations.osmfoundation.org/policies/nominatim/)
     (at most one request per second, which AirDash enforces);
   - FlightAware AeroAPI and AirLabs: your plan's limits **and costs**. The

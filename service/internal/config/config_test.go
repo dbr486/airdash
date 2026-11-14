@@ -39,8 +39,8 @@ func TestLoad_Defaults(t *testing.T) {
 	if c.Origin != "" || c.Dest != "" || c.Airport != "" {
 		t.Errorf("filters should be empty by default")
 	}
-	if c.SettingsFile != "" {
-		t.Errorf("SettingsFile = %q", c.SettingsFile)
+	if c.SettingsFile != "" || c.SourceLogFile != "" {
+		t.Errorf("SettingsFile = %q, SourceLogFile = %q", c.SettingsFile, c.SourceLogFile)
 	}
 	if c.AeroAPIKey != "" {
 		t.Errorf("AeroAPIKey = %q", c.AeroAPIKey)
@@ -62,6 +62,7 @@ func TestLoad_Overrides(t *testing.T) {
 		"AIRDASH_DEST":              "BCN",
 		"AIRDASH_AIRPORT":           "EGLL",
 		"AIRDASH_SETTINGS_FILE":     "/data/settings.json",
+		"AIRDASH_SOURCE_LOG_FILE":   "/data/sources.db",
 		"AIRDASH_ROUTE_CACHE_HOURS": "2",
 		"AIRDASH_AEROAPI_KEY":       "k123",
 		"AIRDASH_AEROAPI_URL":       "http://127.0.0.1:1",
@@ -71,7 +72,7 @@ func TestLoad_Overrides(t *testing.T) {
 	}
 	if c.RadiusKm != 25.5 || c.Poll != 7*time.Second || c.Listen != "127.0.0.1:9000" ||
 		c.Provider != "adsblol" || c.Origin != "LHR,LGW" || c.Dest != "BCN" ||
-		c.Airport != "EGLL" || c.SettingsFile != "/data/settings.json" || c.RouteCacheTTL != 2*time.Hour {
+		c.Airport != "EGLL" || c.SettingsFile != "/data/settings.json" || c.SourceLogFile != "/data/sources.db" || c.RouteCacheTTL != 2*time.Hour {
 		t.Errorf("unexpected config: %+v", c)
 	}
 	if c.AeroAPIKey != "k123" || c.AeroAPIURL != "http://127.0.0.1:1" {
@@ -122,15 +123,17 @@ func TestLoad_Rejects(t *testing.T) {
 
 func TestLoad_BoardDefaultsAndOverrides(t *testing.T) {
 	c, err := Load(env(map[string]string{"AIRDASH_LAT": "1", "AIRDASH_LON": "2"}))
-	if err != nil || c.BoardAirport != "" || c.BoardRefresh != 100*time.Minute || c.BoardCallsPerMonth != 900 || c.AirLabsKey != "" {
+	if err != nil || c.BoardAirport != "" || c.BoardRefreshIgnored || c.BoardCallsPerMonth != 900 || c.AirLabsKey != "" {
 		t.Errorf("defaults: %+v err=%v", c, err)
 	}
 	c, err = Load(env(map[string]string{"AIRDASH_LAT": "1", "AIRDASH_LON": "2", "AIRDASH_AIRLABS_KEY": "k",
 		"AIRDASH_BOARD_AIRPORT": "agp", "AIRDASH_BOARD_REFRESH_MINUTES": "30", "AIRDASH_BOARD_CALLS_PER_MONTH": "5000"}))
-	if err != nil || c.BoardAirport != "AGP" || c.BoardRefresh != 30*time.Minute || c.BoardCallsPerMonth != 5000 || c.AirLabsKey != "k" {
+	// The refresh interval is automatic now: the old variable is only noted
+	// so the service can warn that it is ignored.
+	if err != nil || c.BoardAirport != "AGP" || !c.BoardRefreshIgnored || c.BoardCallsPerMonth != 5000 || c.AirLabsKey != "k" {
 		t.Errorf("overrides: %+v err=%v", c, err)
 	}
-	for _, bad := range []map[string]string{{"AIRDASH_BOARD_REFRESH_MINUTES": "4"}, {"AIRDASH_BOARD_CALLS_PER_MONTH": "0"}, {"AIRDASH_BOARD_AIRPORT": "A"}} {
+	for _, bad := range []map[string]string{{"AIRDASH_BOARD_CALLS_PER_MONTH": "0"}, {"AIRDASH_BOARD_AIRPORT": "A"}} {
 		m := map[string]string{"AIRDASH_LAT": "1", "AIRDASH_LON": "2"}
 		for k, v := range bad {
 			m[k] = v

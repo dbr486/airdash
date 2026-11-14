@@ -12,24 +12,29 @@ import (
 )
 
 type Config struct {
-	Lat, Lon      float64
-	RadiusKm      float64
-	Poll          time.Duration
-	Listen        string
-	Provider      string
-	Origin        string
-	Dest          string
-	Airport       string
-	SettingsFile  string
+	Lat, Lon     float64
+	RadiusKm     float64
+	Poll         time.Duration
+	Listen       string
+	Provider     string
+	Origin       string
+	Dest         string
+	Airport      string
+	SettingsFile string
+	// SourceLogFile is the SQLite file recording what each route source
+	// answered per pass; empty turns the log off.
+	SourceLogFile string
 	RouteCacheTTL time.Duration
 	AeroAPIKey    string
 	AeroAPIURL    string
-	// Airport board (AirLabs): key, airport, refresh interval and the
-	// monthly call cap the service enforces on itself.
-	AirLabsKey         string
-	BoardAirport       string
-	BoardRefresh       time.Duration
-	BoardCallsPerMonth int
+	// Airport board (AirLabs): key, airport and the monthly call cap that
+	// seeds the Settings value. The refresh interval is worked out from the
+	// cap, so AIRDASH_BOARD_REFRESH_MINUTES is only noted to warn it is
+	// ignored.
+	AirLabsKey          string
+	BoardAirport        string
+	BoardRefreshIgnored bool
+	BoardCallsPerMonth  int
 }
 
 var providers = map[string]bool{"adsblol": true, "adsbfi": true}
@@ -79,6 +84,7 @@ func Load(getenv func(string) string) (Config, error) {
 	c.Dest = getenv("AIRDASH_DEST")
 	c.Airport = getenv("AIRDASH_AIRPORT")
 	c.SettingsFile = getenv("AIRDASH_SETTINGS_FILE")
+	c.SourceLogFile = getenv("AIRDASH_SOURCE_LOG_FILE")
 
 	c.AeroAPIKey = getenv("AIRDASH_AEROAPI_KEY")
 	c.AeroAPIURL = getenv("AIRDASH_AEROAPI_URL")
@@ -93,14 +99,7 @@ func Load(getenv func(string) string) (Config, error) {
 	if c.BoardAirport != "" && (len(c.BoardAirport) < 3 || len(c.BoardAirport) > 4) {
 		return c, fmt.Errorf("AIRDASH_BOARD_AIRPORT must be a 3-letter IATA or 4-letter ICAO code")
 	}
-	c.BoardRefresh = 100 * time.Minute // 2 calls per refresh ≈ 890/month, under the 900 cap
-	if v := getenv("AIRDASH_BOARD_REFRESH_MINUTES"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n < 5 {
-			return c, fmt.Errorf("AIRDASH_BOARD_REFRESH_MINUTES must be an integer of at least 5")
-		}
-		c.BoardRefresh = time.Duration(n) * time.Minute
-	}
+	c.BoardRefreshIgnored = getenv("AIRDASH_BOARD_REFRESH_MINUTES") != ""
 	c.BoardCallsPerMonth = 900
 	if v := getenv("AIRDASH_BOARD_CALLS_PER_MONTH"); v != "" {
 		n, err := strconv.Atoi(v)

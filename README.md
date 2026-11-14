@@ -2,6 +2,10 @@
 
 A tiny desk display that shows the aircraft flying closest to your home:
 callsign, airline logo, route, altitude, distance and whether it's on time.
+The same live screen also works as a **Home Assistant dashboard widget**,
+with or without the hardware.
+The same live screen also works as a **Home Assistant dashboard widget**,
+with or without the hardware.
 
 [![ci](https://github.com/dbr486/airdash/actions/workflows/ci.yml/badge.svg)](https://github.com/dbr486/airdash/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -16,7 +20,8 @@ callsign, airline logo, route, altitude, distance and whether it's on time.
 - Route as airport codes or city names, with the airline's logo
 - Optional on-time / delayed status (FlightAware AeroAPI and/or an AirLabs airport board)
 - A web page that mirrors the display and edits every setting live, including an address lookup for home
-- A Home Assistant widget and REST sensor snippet
+- A Home Assistant widget: the live screen in a dashboard card (optionally
+  with Refresh / Next buttons), plus a REST sensor for automations
 - Two boards from one codebase: LILYGO T-Display and M5Stack StickS3
 
 ## Hardware
@@ -48,6 +53,10 @@ settings. Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 Open `http://<server>:3000`. The page shows what the display will show,
 and lets you set home (with an address search), radius and filters.
+`http://<server>:3000/sources.html` shows what each route source (airport
+board, adsbdb, hexdb, FlightAware) answered for every aircraft that passed,
+which answer went on screen, and where the sources disagreed, from the log
+kept by `AIRDASH_SOURCE_LOG_FILE`.
 
 **2. Give the server a fixed LAN address.** Use a DHCP reservation on
 your router (or a static IP) so the display's URL keeps working.
@@ -100,12 +109,12 @@ overrides them at runtime.
 | `AIRDASH_AEROAPI_KEY` | empty | Enables per-flight delay status (see below) |
 | `AIRDASH_AIRLABS_KEY` | empty | Enables the airport-board delay source (see below) |
 | `AIRDASH_BOARD_AIRPORT` | empty | Board airport (also editable on the page) |
-| `AIRDASH_BOARD_REFRESH_MINUTES` | `100` | Board refresh interval (min 5) |
-| `AIRDASH_BOARD_CALLS_PER_MONTH` | `900` | Monthly AirLabs call cap the service enforces |
+| `AIRDASH_BOARD_CALLS_PER_MONTH` | `900` | Initial monthly AirLabs call cap (then edited on the Settings page; the refresh interval follows it) |
 | `AIRDASH_PORT` | `8080` | Host port for the service (docker compose) |
 | `AIRDASH_UI_PORT` | `3000` | Host port for the web UI (docker compose) |
 | `AIRDASH_LISTEN` | `:8080` | Listen address, standalone binary only |
 | `AIRDASH_SETTINGS_FILE` | empty | Where runtime settings persist, standalone binary only (compose sets `/data/settings.json`) |
+| `AIRDASH_SOURCE_LOG_FILE` | empty | SQLite file recording what each route source answered per aircraft pass, kept 90 days; empty turns it off (compose sets `/data/sources.db`) |
 
 The display's settings live in `firmware/include/config.h`: `WIFI_SSID`,
 `WIFI_PASS`, `AIRDASH_URL` and `POLL_MS` (default 3000).
@@ -117,12 +126,18 @@ https://www.flightaware.com/commercial/aeroapi/ (Personal tier, $5 free
 credit ≈ 1000 lookups/month) and set `AIRDASH_AEROAPI_KEY`. The service
 looks up on-time / delayed status only for the aircraft currently on
 screen, caches each result for 15 minutes, and caps lookups per UTC day
-via `delay_lookups_per_day` (default 30, editable on the page). Even in
-the worst case (the cap hit every day) the default cap of 30/day cannot
-exceed the $5 credit; the cache keeps real usage far lower. The counter
-resets on restart. A `show_delay:false` saved to the settings file before
-a key existed stays off after the key is added, until you tick the box on
-the page.
+via `delay_lookups_per_day` (default 65, editable on the page). The same
+key and cap also fill a missing route: when the airport board does not
+list the flight and adsbdb has no route the aircraft could be flying and `paid_routes` is on (default
+on with a key), one AeroAPI call names its origin and destination; that
+call also answers the delay, so one aircraft never costs two. Light
+aircraft are skipped, and an unknown answer is not retried while the
+aircraft stays in range. Even in the worst case (the cap hit every day)
+the default cap of 65/day stays near $10 a month (65 × 31 × $0.005), about
+$5 a month beyond the free credit; the cache keeps real usage far lower. The counter
+resets on restart. A `show_delay:false` or `paid_routes:false` saved to
+the settings file before a key existed stays off after the key is added,
+until you tick the box on the page.
 
 **AirLabs airport board.** With `AIRDASH_AIRLABS_KEY` set (free tier:
 1,000 calls/month, https://airlabs.co), the service downloads the
@@ -142,14 +157,33 @@ You are responsible for any charges on your keys; see
 
 ## Home Assistant
 
-`/widget` (on the UI port) is the screen alone, sized to whatever box it
-is given, for Home Assistant's Webpage (iframe) card. The settings page's
-"Home Assistant" section shows the card YAML for your deployment with a
-copy button, plus an optional REST sensor snippet exposing the nearest
-aircraft's fields as attributes. `?controls=1` adds the Refresh and Next
-buttons under the screen (give the card a little extra height then; the
-aspect ratio only covers the screen). An HTTPS Home Assistant cannot
-embed an HTTP iframe; use the sensor then.
+AirDash can show the same screen on a Home Assistant dashboard. You only
+need the service and web UI running; the physical display is optional.
+
+**Widget card.** `http://<server>:3000/widget` is the screen on its own,
+scaled to fit whatever box it is given. Open the settings page, scroll to
+its "Home Assistant" section and press **Copy card YAML**. Then in Home
+Assistant go to Edit dashboard → Add card → Manual and paste it. The
+snippet uses your deployment's address and looks like this:
+
+    type: iframe
+    url: http://<server>:3000/widget
+    aspect_ratio: 56.25%
+    title: AirDash
+
+Add `?controls=1` to the URL for Refresh and Next buttons under the
+screen. Give the card some extra height if you do (for example
+`aspect_ratio: 70%`), because 56.25% only fits the screen.
+
+**REST sensor.** The same section has a **Copy sensor YAML** button for a
+`rest:` sensor in `configuration.yaml`. It polls `/api/nearest` every 10 s.
+Its state is the nearest aircraft's callsign (or `none`) and its
+attributes are airline, origin, dest, alt_ft, gs_kt, dist_km, bearing,
+nearby and delay. Use it in automations, templates or a Markdown card.
+
+**HTTPS.** A Home Assistant served over HTTPS can't embed the HTTP widget
+because the browser blocks mixed content. Use the REST sensor there
+instead, or serve AirDash behind an HTTPS reverse proxy.
 
 ## Running without Docker
 
@@ -233,16 +267,17 @@ unknown or the delay feature is off.
 
     PUT /api/settings   {"lat":51.47,"lon":-0.45,
                           "origin":"","dest":"","airport":"LHR","radius_km":10,
-                          "show_delay":true,"delay_lookups_per_day":30,
+                          "show_delay":true,"delay_lookups_per_day":65,"paid_routes":true,
                           "show_names":false,"show_logos":true,
                           "board_airport":"LHR"}
 
 All keys are optional on PUT; codes are comma-separated IATA or ICAO. 400
 on a bad code or radius. `show_delay` toggles the delay feature (no effect
-without `AIRDASH_AEROAPI_KEY`); `delay_lookups_per_day` caps AeroAPI calls
-per UTC day (0–1000). `show_names` makes `origin_label`/`dest_label`
-carry city names instead of airport codes where adsbdb knows the
-municipality. `show_logos` turns airline logos on or off. `lat`/`lon`
+without `AIRDASH_AEROAPI_KEY`); `paid_routes` lets AeroAPI fill a route
+the free sources lack; `delay_lookups_per_day` caps all AeroAPI calls, delay
+and route together, per UTC day (0–1000; 0 turns both off). `show_names` makes `origin_label`/`dest_label`
+carry city names instead of airport codes: the route source's name when
+it sends one (adsbdb, AeroAPI), else the embedded OurAirports table. `show_logos` turns airline logos on or off. `lat`/`lon`
 move the home position (defaults from `AIRDASH_LAT`/`AIRDASH_LON`).
 
 ### Other endpoints
@@ -254,7 +289,7 @@ move the home position (defaults from `AIRDASH_LAT`/`AIRDASH_LON`).
   `N.rgb565` forms are still served.
 - `GET /api/geocode?q=<address>` → `{"lat","lon","name"}`, backed by
   OpenStreetMap Nominatim (one lookup per second, cached a day).
-- `GET /api/stats` → `{"delay_enabled":true,"delay_lookups_today":12,"delay_lookups_cap":30,"delay_source":"aeroapi"}`,
+- `GET /api/stats` → `{"delay_enabled":true,"delay_lookups_today":12,"delay_lookups_cap":65,"delay_source":"aeroapi","paid_routes_enabled":true}`,
   plus `board_*` fields when the AirLabs board is enabled.
 - `GET /healthz`: liveness.
 
@@ -296,7 +331,9 @@ Tests and conventions: [CONTRIBUTING.md](CONTRIBUTING.md).
 
 - Aircraft positions: [adsb.fi](https://adsb.fi) open data (personal,
   non-commercial use) or [adsb.lol](https://adsb.lol)
-- Routes and airlines: [adsbdb](https://www.adsbdb.com)
+- Routes and airlines: [adsbdb](https://www.adsbdb.com), with [hexdb](https://hexdb.io) as a free fallback for routes
+- Airline names: [VRS standing data](https://github.com/vradarserver/standing-data) (CC0), refreshed with scripts/update-standing-data.sh
+- Airport city names: [OurAirports](https://ourairports.com/data/) (public domain), refreshed by the same script
 - Airport boards: [AirLabs](https://airlabs.co) schedules API
 - Flight status: [FlightAware AeroAPI](https://www.flightaware.com/commercial/aeroapi/)
 - Address lookup: [OpenStreetMap Nominatim](https://nominatim.org), © OpenStreetMap contributors

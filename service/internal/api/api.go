@@ -19,7 +19,9 @@ import (
 	"airdash/internal/geocode"
 	"airdash/internal/logos"
 	"airdash/internal/settings"
+	"airdash/internal/sourcelog"
 	"airdash/internal/tracker"
+	"airdash/internal/usage"
 )
 
 type Source interface {
@@ -37,12 +39,24 @@ type SettingsStore interface {
 // settings page can show today's usage without exposing the budget type.
 type StatsSource interface {
 	DelayEnabled() bool
+	// PaidRoutesEnabled is paid_routes with a key and a non-zero cap.
+	PaidRoutesEnabled() bool
 	DelayToday() (used, limit int)
 	DelaySource() string
 	// Board reports the airport board feeding delay status: airport ("" when
 	// off), rows, age in seconds (-1 before the first fetch), this month's
 	// calls and cap, and the source name ("" when no board is configured).
 	Board() (airport string, flights, ageS, callsMonth, callsCap int, source string)
+}
+
+// SourceLog answers the route source history for the dashboard. The store
+// clamps days and limit itself, so only malformed values are rejected here.
+type SourceLog interface {
+	Summary(ctx context.Context, days int) (sourcelog.Summary, error)
+	Passes(ctx context.Context, limit int, before time.Time, beforeHex string) ([]sourcelog.Pass, error)
+	Disagreements(ctx context.Context, days, limit int) ([]sourcelog.Pass, error)
+	Responses(ctx context.Context, source, subject string, before time.Time, limit int) ([]sourcelog.ResponseMeta, error)
+	Response(ctx context.Context, id int64) (sourcelog.ResponseMeta, []byte, bool, error)
 }
 
 // LogoSource serves airline logos by IATA code; nil disables the endpoint.
@@ -58,7 +72,12 @@ type handler struct {
 	now   func() time.Time
 
 	geocoder geocode.Lookup // nil = address lookup disabled
+	sources  SourceLog      // nil = route source log disabled
+	limits   LimitsSource   // nil = /api/limits lists nothing
 }
+
+// LimitsSource reports every outside service's cap, usage and errors.
+type LimitsSource interface{ Report() []usage.Service }
 
 // Option configures optional handler dependencies.
 type Option func(*handler)
@@ -66,6 +85,12 @@ type Option func(*handler)
 // WithGeocoder enables GET /api/geocode for the settings page's address
 // lookup; without it the route answers 503.
 func WithGeocoder(g geocode.Lookup) Option { return func(h *handler) { h.geocoder = g } }
+
+// WithSourceLog enables GET /api/sources/*; without it those routes answer 404.
+func WithSourceLog(l SourceLog) Option { return func(h *handler) { h.sources = l } }
+
+// WithLimits enables the rows of GET /api/limits.
+func WithLimits(l LimitsSource) Option { return func(h *handler) { h.limits = l } }
 
 func NewHandler(src Source, st SettingsStore, stats StatsSource, logos LogoSource, now func() time.Time, opts ...Option) http.Handler {
 	h := &handler{src: src, st: st, stats: stats, logos: logos, now: now}
@@ -80,13 +105,20 @@ func NewHandler(src Source, st SettingsStore, stats StatsSource, logos LogoSourc
 	mux.HandleFunc("GET /api/settings", h.getSettings)
 	mux.HandleFunc("PUT /api/settings", h.putSettings)
 	mux.HandleFunc("GET /api/stats", h.getStats)
+	mux.HandleFunc("GET /api/limits", h.getLimits)
+	mux.HandleFunc("GET /api/sources/summary", h.sourcesSummary)
+	mux.HandleFunc("GET /api/sources/passes", h.sourcesPasses)
+	mux.HandleFunc("GET /api/sources/disagreements", h.sourcesDisagreements)
+	mux.HandleFunc("GET /api/sources/responses", h.sourcesResponses)
+	mux.HandleFunc("GET /api/sources/responses/{id}", h.sourcesResponse)
+	mux.HandleFunc("GET /api/sources/responses/{id}/raw", h.sourcesResponseRaw)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		_, _ = w.Write([]byte("ok"))
 	})
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
-		_, _ = w.Write([]byte("airdash: GET /api/nearest for the closest aircraft, GET/PUT /api/settings for filters, GET /api/stats for delay lookup usage\n"))
+		_, _ = w.Write([]byte("airdash: GET /api/nearest for the closest aircraft, GET/PUT /api/settings for filters, GET /api/stats for delay lookup usage, GET /api/limits for every service's cap, usage and errors, GET /api/sources/{summary,passes,disagreements,responses} for the route source log\n"))
 	})
 	return mux
 }
@@ -98,6 +130,7 @@ type foundResponse struct {
 	Callsign    string `json:"callsign"`
 	Hex         string `json:"hex"`
 	Type        string `json:"type"`
+	TypeName    string `json:"type_name"`
 	Reg         string `json:"reg"`
 	Airline     string `json:"airline"`
 	AirlineIATA string `json:"airline_iata"`
@@ -200,7 +233,7 @@ func (h *handler) nearest(w http.ResponseWriter, r *http.Request) {
 	if snap.Found {
 		st := h.st.Settings()
 		body = foundResponse{
-			Found: true, Callsign: snap.Callsign, Hex: snap.Hex, Index: snap.Index, Type: snap.Type, Reg: snap.Reg,
+			Found: true, Callsign: snap.Callsign, Hex: snap.Hex, Index: snap.Index, Type: snap.Type, TypeName: snap.TypeName, Reg: snap.Reg,
 			Airline: snap.Airline, AirlineIATA: snap.AirlineIATA, Origin: snap.Origin, Dest: snap.Dest,
 			OriginLabel: label(snap.Origin, snap.OriginName, st.ShowNames),
 			DestLabel:   label(snap.Dest, snap.DestName, st.ShowNames),
@@ -232,6 +265,11 @@ type settingsPatch struct {
 	ShowNames          *bool    `json:"show_names"`
 	ShowLogos          *bool    `json:"show_logos"`
 	BoardAirport       *string  `json:"board_airport"`
+	PaidRoutes         *bool    `json:"paid_routes"`
+
+	AirLabsCallsPerMonth *int `json:"airlabs_calls_per_month"`
+	ADSBDBCallsPerDay    *int `json:"adsbdb_calls_per_day"`
+	HexDBCallsPerDay     *int `json:"hexdb_calls_per_day"`
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
@@ -286,6 +324,15 @@ func (h *handler) putSettings(w http.ResponseWriter, r *http.Request) {
 		if p.DelayLookupsPerDay != nil {
 			cur.DelayLookupsPerDay = *p.DelayLookupsPerDay
 		}
+		if p.AirLabsCallsPerMonth != nil {
+			cur.AirLabsCallsPerMonth = *p.AirLabsCallsPerMonth
+		}
+		if p.ADSBDBCallsPerDay != nil {
+			cur.ADSBDBCallsPerDay = *p.ADSBDBCallsPerDay
+		}
+		if p.HexDBCallsPerDay != nil {
+			cur.HexDBCallsPerDay = *p.HexDBCallsPerDay
+		}
 		if p.ShowNames != nil {
 			cur.ShowNames = *p.ShowNames
 		}
@@ -294,6 +341,9 @@ func (h *handler) putSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		if p.BoardAirport != nil {
 			cur.BoardAirport = *p.BoardAirport
+		}
+		if p.PaidRoutes != nil {
+			cur.PaidRoutes = *p.PaidRoutes
 		}
 		return cur
 	})
@@ -316,6 +366,7 @@ type statsResponse struct {
 	DelayLookupsToday int    `json:"delay_lookups_today"`
 	DelayLookupsCap   int    `json:"delay_lookups_cap"`
 	DelaySource       string `json:"delay_source"`
+	PaidRoutesEnabled bool   `json:"paid_routes_enabled"`
 	BoardAirport      string `json:"board_airport"`
 	BoardFlights      int    `json:"board_flights"`
 	BoardAgeS         int    `json:"board_age_s"`
@@ -324,12 +375,21 @@ type statsResponse struct {
 	BoardSource       string `json:"board_source"`
 }
 
+func (h *handler) getLimits(w http.ResponseWriter, r *http.Request) {
+	svcs := []usage.Service{}
+	if h.limits != nil {
+		svcs = h.limits.Report()
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"services": svcs})
+}
+
 func (h *handler) getStats(w http.ResponseWriter, r *http.Request) {
 	used, limit := h.stats.DelayToday()
 	airport, flights, age, calls, cap, source := h.stats.Board()
 	writeJSON(w, http.StatusOK, statsResponse{
 		DelayEnabled: h.stats.DelayEnabled(), DelayLookupsToday: used, DelayLookupsCap: limit, DelaySource: h.stats.DelaySource(),
-		BoardAirport: airport, BoardFlights: flights, BoardAgeS: age, BoardCallsMonth: calls, BoardCallsCap: cap, BoardSource: source,
+		PaidRoutesEnabled: h.stats.PaidRoutesEnabled(),
+		BoardAirport:      airport, BoardFlights: flights, BoardAgeS: age, BoardCallsMonth: calls, BoardCallsCap: cap, BoardSource: source,
 	})
 }
 
@@ -457,4 +517,185 @@ func (h *handler) getGeocode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"lat": res.Lat, "lon": res.Lon, "name": res.Name})
+}
+
+type passesResponse struct {
+	Passes []sourcelog.Pass `json:"passes"`
+}
+
+func passes(ps []sourcelog.Pass) passesResponse {
+	if ps == nil {
+		ps = []sourcelog.Pass{} // [] not null, so the dashboard can iterate
+	}
+	return passesResponse{Passes: ps}
+}
+
+// sourcesReady answers 404 when no log is configured, so the dashboard can
+// tell "turned off" from "no data yet".
+func (h *handler) sourcesReady(w http.ResponseWriter) bool {
+	if h.sources == nil {
+		writeError(w, http.StatusNotFound, "route source log is off")
+		return false
+	}
+	return true
+}
+
+// intParam reads an optional integer query parameter; ok is false (and a 400
+// already written) when the value is present but not an integer.
+func intParam(w http.ResponseWriter, r *http.Request, name string, def int) (int, bool) {
+	v := r.URL.Query().Get(name)
+	if v == "" {
+		return def, true
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, name+" must be an integer")
+		return 0, false
+	}
+	return n, true
+}
+
+func (h *handler) sourcesSummary(w http.ResponseWriter, r *http.Request) {
+	if !h.sourcesReady(w) {
+		return
+	}
+	days, ok := intParam(w, r, "days", 7)
+	if !ok {
+		return
+	}
+	sum, err := h.sources.Summary(r.Context(), days)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "source log unavailable")
+		return
+	}
+	writeJSON(w, http.StatusOK, sum)
+}
+
+func (h *handler) sourcesPasses(w http.ResponseWriter, r *http.Request) {
+	if !h.sourcesReady(w) {
+		return
+	}
+	limit, ok := intParam(w, r, "limit", 50)
+	if !ok {
+		return
+	}
+	beforeUnix, ok := intParam(w, r, "before", 0)
+	if !ok {
+		return
+	}
+	var before time.Time
+	if beforeUnix > 0 {
+		before = time.Unix(int64(beforeUnix), 0)
+	}
+	// before_hex continues a page that ended inside one second's passes.
+	ps, err := h.sources.Passes(r.Context(), limit, before, r.URL.Query().Get("before_hex"))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "source log unavailable")
+		return
+	}
+	writeJSON(w, http.StatusOK, passes(ps))
+}
+
+func (h *handler) sourcesDisagreements(w http.ResponseWriter, r *http.Request) {
+	if !h.sourcesReady(w) {
+		return
+	}
+	days, ok := intParam(w, r, "days", 7)
+	if !ok {
+		return
+	}
+	limit, ok := intParam(w, r, "limit", 50)
+	if !ok {
+		return
+	}
+	ps, err := h.sources.Disagreements(r.Context(), days, limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "source log unavailable")
+		return
+	}
+	writeJSON(w, http.StatusOK, passes(ps))
+}
+
+func (h *handler) sourcesResponses(w http.ResponseWriter, r *http.Request) {
+	if !h.sourcesReady(w) {
+		return
+	}
+	q := r.URL.Query()
+	source := q.Get("source")
+	if source == "" {
+		writeError(w, http.StatusBadRequest, "source is required")
+		return
+	}
+	limit, ok := intParam(w, r, "limit", 20)
+	if !ok {
+		return
+	}
+	beforeUnix, ok := intParam(w, r, "before", 0)
+	if !ok {
+		return
+	}
+	var before time.Time
+	if beforeUnix > 0 {
+		before = time.Unix(int64(beforeUnix), 0)
+	}
+	rs, err := h.sources.Responses(r.Context(), source, q.Get("subject"), before, limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "source log unavailable")
+		return
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Responses []sourcelog.ResponseMeta `json:"responses"`
+	}{rs})
+}
+
+// responseByID resolves the {id} path value to a stored response, writing the
+// error reply itself when it cannot.
+func (h *handler) responseByID(w http.ResponseWriter, r *http.Request) (sourcelog.ResponseMeta, []byte, bool) {
+	if !h.sourcesReady(w) {
+		return sourcelog.ResponseMeta{}, nil, false
+	}
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "id must be an integer")
+		return sourcelog.ResponseMeta{}, nil, false
+	}
+	meta, body, found, err := h.sources.Response(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "source log unavailable")
+		return sourcelog.ResponseMeta{}, nil, false
+	}
+	if !found {
+		writeError(w, http.StatusNotFound, "response not found")
+		return sourcelog.ResponseMeta{}, nil, false
+	}
+	return meta, body, true
+}
+
+func (h *handler) sourcesResponse(w http.ResponseWriter, r *http.Request) {
+	meta, body, ok := h.responseByID(w, r)
+	if !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, struct {
+		sourcelog.ResponseMeta
+		Body string `json:"body"`
+	}{meta, string(body)})
+}
+
+// sourcesResponseRaw is proxied onto the dashboard's own origin and upstream
+// can return HTML error pages, so anything that is not JSON is forced to
+// plain text and sandboxed; otherwise a stored page could run script there.
+func (h *handler) sourcesResponseRaw(w http.ResponseWriter, r *http.Request) {
+	meta, body, ok := h.responseByID(w, r)
+	if !ok {
+		return
+	}
+	ct := "text/plain; charset=utf-8"
+	if strings.Contains(strings.ToLower(meta.ContentType), "json") {
+		ct = "application/json"
+	}
+	w.Header().Set("Content-Type", ct)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Security-Policy", "sandbox")
+	_, _ = w.Write(body)
 }

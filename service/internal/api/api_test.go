@@ -18,7 +18,9 @@ import (
 	"airdash/internal/flightstatus"
 	"airdash/internal/geocode"
 	"airdash/internal/settings"
+	"airdash/internal/sourcelog"
 	"airdash/internal/tracker"
+	"airdash/internal/usage"
 )
 
 type fakeSource struct {
@@ -55,6 +57,7 @@ func store(radius float64) *fakeStore { return &fakeStore{s: settings.Settings{R
 
 type fakeStats struct {
 	enabled bool
+	paid    bool
 	used    int
 	limit   int
 	source  string
@@ -69,6 +72,7 @@ func (f *fakeStats) Board() (string, int, int, int, int, string) {
 }
 
 func (f *fakeStats) DelayEnabled() bool            { return f.enabled }
+func (f *fakeStats) PaidRoutesEnabled() bool       { return f.paid }
 func (f *fakeStats) DelayToday() (used, limit int) { return f.used, f.limit }
 func (f *fakeStats) DelaySource() string           { return f.source }
 
@@ -103,7 +107,7 @@ func TestNearest_Found(t *testing.T) {
 		t.Errorf("Cache-Control = %q", rec.Header().Get("Cache-Control"))
 	}
 	want := map[string]any{
-		"found": true, "callsign": "BAW466", "hex": "400877", "index": 0.0, "type": "A319", "reg": "G-EUPG",
+		"found": true, "callsign": "BAW466", "hex": "400877", "index": 0.0, "type": "A319", "type_name": "", "reg": "G-EUPG",
 		"airline": "British Airways", "airline_iata": "BA", "origin": "LHR", "dest": "BCN",
 		"origin_label": "LHR", "dest_label": "BCN", "logo": "",
 		"alt_ft": 3525.0, "gs_kt": 267.0, "track": 216.0, "dist_km": 3.4, "bearing": 112.0,
@@ -212,7 +216,7 @@ func TestSettings_GetReturnsCurrent(t *testing.T) {
 			t.Errorf("%s = %v want %v", k, body[k], v)
 		}
 	}
-	if len(body) != 11 {
+	if len(body) != 15 {
 		t.Errorf("unexpected keys: %v", body)
 	}
 }
@@ -352,7 +356,7 @@ func TestSettings_DelayKeysRoundTrip(t *testing.T) {
 	st := &fakeStore{s: settings.Settings{RadiusKm: 10, ShowDelay: true, DelayLookupsPerDay: 40}}
 	h := NewHandler(&fakeSource{at: time.Now()}, st, &fakeStats{}, nil, time.Now)
 	_, body := get(t, h, "/api/settings")
-	if body["show_delay"] != true || body["delay_lookups_per_day"] != 40.0 || len(body) != 11 {
+	if body["show_delay"] != true || body["delay_lookups_per_day"] != 40.0 || len(body) != 15 {
 		t.Errorf("GET = %v", body)
 	}
 	rec, body := put(t, h, `{"show_delay":false,"delay_lookups_per_day":5}`)
@@ -366,20 +370,20 @@ func TestSettings_DelayKeysRoundTrip(t *testing.T) {
 }
 
 func TestStats(t *testing.T) {
-	h := NewHandler(&fakeSource{at: time.Now()}, store(10), &fakeStats{enabled: true, used: 12, limit: 40, source: "aeroapi",
+	h := NewHandler(&fakeSource{at: time.Now()}, store(10), &fakeStats{enabled: true, paid: true, used: 12, limit: 40, source: "aeroapi",
 		boardAirport: "AGP", boardFlights: 187, boardAge: 720, boardCalls: 34, boardCap: 900, boardSource: "airlabs"}, nil, time.Now)
 	rec, body := get(t, h, "/api/stats")
 	if rec.Code != 200 || rec.Header().Get("Cache-Control") != "no-store" {
 		t.Fatalf("code=%d", rec.Code)
 	}
-	want := map[string]any{"delay_enabled": true, "delay_lookups_today": 12.0, "delay_lookups_cap": 40.0, "delay_source": "aeroapi",
+	want := map[string]any{"delay_enabled": true, "delay_lookups_today": 12.0, "delay_lookups_cap": 40.0, "delay_source": "aeroapi", "paid_routes_enabled": true,
 		"board_airport": "AGP", "board_flights": 187.0, "board_age_s": 720.0, "board_calls_month": 34.0, "board_calls_cap": 900.0, "board_source": "airlabs"}
 	for k, v := range want {
 		if body[k] != v {
 			t.Errorf("%s = %v want %v", k, body[k], v)
 		}
 	}
-	if len(body) != 10 {
+	if len(body) != 11 {
 		t.Errorf("unexpected keys: %v", body)
 	}
 }
@@ -407,7 +411,7 @@ func TestNearest_LabelFallsBackToCode(t *testing.T) {
 func TestSettings_ShowNamesRoundTrip(t *testing.T) {
 	h := NewHandler(&fakeSource{at: time.Now()}, store(10), &fakeStats{}, nil, time.Now)
 	_, body := get(t, h, "/api/settings")
-	if body["show_names"] != false || len(body) != 11 {
+	if body["show_names"] != false || len(body) != 15 {
 		t.Errorf("GET = %v", body)
 	}
 	rec, body := put(t, h, `{"show_names":true}`)
@@ -420,7 +424,7 @@ func TestSettings_ShowLogosRoundTrip(t *testing.T) {
 	st := &fakeStore{s: settings.Settings{RadiusKm: 10, ShowLogos: true}}
 	h := NewHandler(&fakeSource{at: time.Now()}, st, &fakeStats{}, nil, time.Now)
 	_, body := get(t, h, "/api/settings")
-	if body["show_logos"] != true || len(body) != 11 {
+	if body["show_logos"] != true || len(body) != 15 {
 		t.Errorf("GET = %v", body)
 	}
 	rec, body := put(t, h, `{"show_logos":false}`)
@@ -711,7 +715,7 @@ func TestLogoBitmap_LegacySquareKeepsAspect(t *testing.T) {
 func TestSettings_BoardAirportRoundTrip(t *testing.T) {
 	h := NewHandler(&fakeSource{at: time.Now()}, store(10), &fakeStats{}, nil, time.Now)
 	_, body := get(t, h, "/api/settings")
-	if body["board_airport"] != "" || len(body) != 11 {
+	if body["board_airport"] != "" || len(body) != 15 {
 		t.Errorf("GET = %v", body)
 	}
 	rec, body := put(t, h, `{"board_airport":"lemg"}`)
@@ -776,5 +780,276 @@ func TestGeocode_Endpoint(t *testing.T) {
 	plain := NewHandler(&fakeSource{at: time.Now()}, store(10), &fakeStats{}, nil, time.Now)
 	if rec, _ := get(t, plain, "/api/geocode?q=Malaga"); rec.Code != 503 {
 		t.Errorf("no geocoder configured should be 503, got %d", rec.Code)
+	}
+}
+
+func TestNearest_TypeName(t *testing.T) {
+	for _, name := range []string{"737-800", ""} {
+		src := &fakeSource{snap: tracker.Snapshot{Found: true, Callsign: "X1", TypeName: name}, at: time.Now()}
+		h := NewHandler(src, store(10), &fakeStats{}, nil, time.Now)
+		rec, _ := get(t, h, "/api/nearest")
+		want := `"type_name":"` + name + `"`
+		if !strings.Contains(rec.Body.String(), want) {
+			t.Errorf("body %s missing %s", rec.Body.String(), want)
+		}
+	}
+}
+
+func TestStats_PaidRoutesEnabledFalse(t *testing.T) {
+	h := NewHandler(&fakeSource{at: time.Now()}, store(10), &fakeStats{enabled: true}, nil, time.Now)
+	_, body := get(t, h, "/api/stats")
+	if body["paid_routes_enabled"] != false {
+		t.Errorf("paid_routes_enabled = %v", body["paid_routes_enabled"])
+	}
+}
+
+func TestSettings_PaidRoutesPutChangesOnlyThat(t *testing.T) {
+	st := &fakeStore{s: settings.Settings{RadiusKm: 10, ShowDelay: true, DelayLookupsPerDay: 65, PaidRoutes: true}}
+	h := NewHandler(&fakeSource{at: time.Now()}, st, &fakeStats{}, nil, time.Now)
+	rec, body := put(t, h, `{"paid_routes":false}`)
+	if rec.Code != 200 || body["paid_routes"] != false || body["show_delay"] != true || body["delay_lookups_per_day"] != 65.0 || body["radius_km"] != 10.0 {
+		t.Errorf("PUT = %d %v", rec.Code, body)
+	}
+	if _, body := get(t, h, "/api/settings"); body["paid_routes"] != false {
+		t.Errorf("GET = %v", body)
+	}
+}
+
+type fakeSourceLog struct {
+	days, limit int
+	before      time.Time
+	beforeHex   string
+	err         error
+}
+
+func (f *fakeSourceLog) Summary(ctx context.Context, days int) (sourcelog.Summary, error) {
+	f.days = days
+	return sourcelog.Summary{Days: []sourcelog.Day{{Day: "2026-10-30", Passes: 3}}}, f.err
+}
+
+func (f *fakeSourceLog) Passes(ctx context.Context, limit int, before time.Time, beforeHex string) ([]sourcelog.Pass, error) {
+	f.limit, f.before, f.beforeHex = limit, before, beforeHex
+	return []sourcelog.Pass{{Hex: "abc", Callsign: "RYR5EL"}}, f.err
+}
+
+func (f *fakeSourceLog) Disagreements(ctx context.Context, days, limit int) ([]sourcelog.Pass, error) {
+	f.days, f.limit = days, limit
+	return []sourcelog.Pass{{Hex: "def"}}, f.err
+}
+
+func (f *fakeSourceLog) Responses(ctx context.Context, source, subject string, before time.Time, limit int) ([]sourcelog.ResponseMeta, error) {
+	return []sourcelog.ResponseMeta{}, f.err
+}
+
+func (f *fakeSourceLog) Response(ctx context.Context, id int64) (sourcelog.ResponseMeta, []byte, bool, error) {
+	return sourcelog.ResponseMeta{}, nil, false, f.err
+}
+
+func TestSources_Endpoints(t *testing.T) {
+	sl := &fakeSourceLog{}
+	h := NewHandler(&fakeSource{at: time.Now()}, store(10), &fakeStats{}, nil, time.Now, WithSourceLog(sl))
+
+	rec, body := get(t, h, "/api/sources/summary")
+	if rec.Code != 200 || sl.days != 7 || len(body["days"].([]any)) != 1 {
+		t.Errorf("summary default: code=%d days=%d body=%v", rec.Code, sl.days, body)
+	}
+	if rec, _ := get(t, h, "/api/sources/summary?days=30"); rec.Code != 200 || sl.days != 30 {
+		t.Errorf("summary days: code=%d days=%d", rec.Code, sl.days)
+	}
+
+	rec, body = get(t, h, "/api/sources/passes?limit=10&before=1793391374&before_hex=4ca850")
+	if rec.Code != 200 || sl.limit != 10 || sl.before.Unix() != 1793391374 || sl.beforeHex != "4ca850" || len(body["passes"].([]any)) != 1 {
+		t.Errorf("passes: code=%d limit=%d before=%v body=%v", rec.Code, sl.limit, sl.before, body)
+	}
+	if rec, _ := get(t, h, "/api/sources/passes"); rec.Code != 200 || sl.limit != 50 || !sl.before.IsZero() {
+		t.Errorf("passes default: code=%d limit=%d before=%v", rec.Code, sl.limit, sl.before)
+	}
+
+	rec, body = get(t, h, "/api/sources/disagreements?days=3&limit=5")
+	if rec.Code != 200 || sl.days != 3 || sl.limit != 5 || len(body["passes"].([]any)) != 1 {
+		t.Errorf("disagreements: code=%d days=%d limit=%d", rec.Code, sl.days, sl.limit)
+	}
+
+	for _, bad := range []string{"/api/sources/summary?days=x", "/api/sources/passes?limit=-", "/api/sources/passes?before=soon", "/api/sources/disagreements?limit=1.5"} {
+		if rec, _ := get(t, h, bad); rec.Code != 400 {
+			t.Errorf("%s: want 400, got %d", bad, rec.Code)
+		}
+	}
+	sl.err = errors.New("disk")
+	if rec, _ := get(t, h, "/api/sources/summary"); rec.Code != 500 {
+		t.Errorf("store error should be 500, got %d", rec.Code)
+	}
+
+	plain := NewHandler(&fakeSource{at: time.Now()}, store(10), &fakeStats{}, nil, time.Now)
+	for _, p := range []string{"/api/sources/summary", "/api/sources/passes", "/api/sources/disagreements"} {
+		if rec, _ := get(t, plain, p); rec.Code != 404 {
+			t.Errorf("%s without a log: want 404, got %d", p, rec.Code)
+		}
+	}
+}
+
+// respLog adds the captured-response methods to fakeSourceLog.
+type respLog struct {
+	fakeSourceLog
+	source, subject string
+	rBefore         time.Time
+	rLimit          int
+	meta            sourcelog.ResponseMeta
+	body            []byte
+	found           bool
+}
+
+func (f *respLog) Responses(ctx context.Context, source, subject string, before time.Time, limit int) ([]sourcelog.ResponseMeta, error) {
+	f.source, f.subject, f.rBefore, f.rLimit = source, subject, before, limit
+	return []sourcelog.ResponseMeta{f.meta}, f.err
+}
+
+func (f *respLog) Response(ctx context.Context, id int64) (sourcelog.ResponseMeta, []byte, bool, error) {
+	if !f.found || id != f.meta.ID {
+		return sourcelog.ResponseMeta{}, nil, false, f.err
+	}
+	return f.meta, f.body, true, f.err
+}
+
+func newRespLog(ct string, body string) *respLog {
+	return &respLog{
+		meta:  sourcelog.ResponseMeta{ID: 7, Source: "adsbdb", Subject: "RYR5EL", URL: "https://api.example/x", Status: 200, ContentType: ct, FetchedAt: 1700000000, Size: len(body)},
+		body:  []byte(body),
+		found: true,
+	}
+}
+
+func TestSourcesResponses_List(t *testing.T) {
+	sl := newRespLog("application/json", `{}`)
+	h := NewHandler(&fakeSource{at: time.Now()}, store(10), &fakeStats{}, nil, time.Now, WithSourceLog(sl))
+	rec, body := get(t, h, "/api/sources/responses?source=adsbdb&subject=RYR5EL&before=1700000000")
+	if rec.Code != 200 || len(body["responses"].([]any)) != 1 {
+		t.Fatalf("code=%d body=%v", rec.Code, body)
+	}
+	if sl.source != "adsbdb" || sl.subject != "RYR5EL" || sl.rBefore.Unix() != 1700000000 || sl.rLimit != 20 {
+		t.Errorf("fake saw %q %q %v %d", sl.source, sl.subject, sl.rBefore, sl.rLimit)
+	}
+}
+
+func TestSourcesResponses_RequiresSource(t *testing.T) {
+	h := NewHandler(&fakeSource{at: time.Now()}, store(10), &fakeStats{}, nil, time.Now, WithSourceLog(newRespLog("application/json", `{}`)))
+	if rec, _ := get(t, h, "/api/sources/responses"); rec.Code != 400 {
+		t.Errorf("want 400, got %d", rec.Code)
+	}
+}
+
+func TestSourcesResponses_Detail(t *testing.T) {
+	sl := newRespLog("application/json", `{"a":1}`)
+	h := NewHandler(&fakeSource{at: time.Now()}, store(10), &fakeStats{}, nil, time.Now, WithSourceLog(sl))
+	rec, body := get(t, h, "/api/sources/responses/7")
+	if rec.Code != 200 || body["body"] != `{"a":1}` || body["source"] != "adsbdb" {
+		t.Fatalf("code=%d body=%v", rec.Code, body)
+	}
+	if u, _ := body["url"].(string); u != "https://api.example/x" || strings.Contains(u, "api_key") {
+		t.Errorf("url = %q", u)
+	}
+}
+
+func TestSourcesResponses_DetailNotFoundAndBadID(t *testing.T) {
+	h := NewHandler(&fakeSource{at: time.Now()}, store(10), &fakeStats{}, nil, time.Now, WithSourceLog(newRespLog("application/json", `{}`)))
+	if rec, _ := get(t, h, "/api/sources/responses/99"); rec.Code != 404 {
+		t.Errorf("unknown id: want 404, got %d", rec.Code)
+	}
+	for _, p := range []string{"/api/sources/responses/abc", "/api/sources/responses/abc/raw"} {
+		if rec, _ := get(t, h, p); rec.Code != 400 {
+			t.Errorf("%s: want 400, got %d", p, rec.Code)
+		}
+	}
+	if rec, _ := get(t, h, "/api/sources/responses/99/raw"); rec.Code != 404 {
+		t.Errorf("raw unknown id: want 404, got %d", rec.Code)
+	}
+}
+
+func TestSourcesResponses_RawHeaders(t *testing.T) {
+	for _, tc := range []struct{ stored, want string }{
+		{"text/html", "text/plain; charset=utf-8"},
+		{"application/json; charset=utf-8", "application/json"},
+	} {
+		h := NewHandler(&fakeSource{at: time.Now()}, store(10), &fakeStats{}, nil, time.Now, WithSourceLog(newRespLog(tc.stored, `{"hi":1}`)))
+		rec, _ := get(t, h, "/api/sources/responses/7/raw")
+		if rec.Code != 200 || rec.Body.String() != `{"hi":1}` {
+			t.Fatalf("%s: code=%d body=%q", tc.stored, rec.Code, rec.Body.String())
+		}
+		if got := rec.Header().Get("Content-Type"); got != tc.want {
+			t.Errorf("%s: content-type %q, want %q", tc.stored, got, tc.want)
+		}
+		if rec.Header().Get("X-Content-Type-Options") != "nosniff" || rec.Header().Get("Content-Security-Policy") != "sandbox" {
+			t.Errorf("%s: missing hardening headers: %v", tc.stored, rec.Header())
+		}
+	}
+}
+
+func TestSourcesResponses_OffIs404(t *testing.T) {
+	h := NewHandler(&fakeSource{at: time.Now()}, store(10), &fakeStats{}, nil, time.Now)
+	for _, p := range []string{"/api/sources/responses?source=x", "/api/sources/responses/7", "/api/sources/responses/7/raw"} {
+		if rec, _ := get(t, h, p); rec.Code != 404 {
+			t.Errorf("%s: want 404, got %d", p, rec.Code)
+		}
+	}
+}
+
+type fakeLimits struct{ svcs []usage.Service }
+
+func (f fakeLimits) Report() []usage.Service { return f.svcs }
+
+func TestLimitsEndpoint(t *testing.T) {
+	hit := time.Date(2026, 11, 2, 9, 28, 0, 0, time.UTC)
+	lim := fakeLimits{[]usage.Service{
+		{ID: "aeroapi", Label: "FlightAware", Enabled: true, Period: "day", Used: 65, Cap: 65,
+			State: "cap_reached", StateSince: &hit, Refused: 41, Calls: 65, RecentErrors: []usage.ErrorEvent{}},
+		{ID: "hexdb", Label: "hexdb", Enabled: true, Period: "day", Used: 3, Calls: 3, State: "ok",
+			RecentErrors: []usage.ErrorEvent{{At: hit, Message: "timeout", Subject: "RYR1"}}},
+	}}
+	h := NewHandler(&fakeSource{}, store(10), &fakeStats{}, nil, time.Now, WithLimits(lim))
+	code, body := get(t, h, "/api/limits")
+	if code.Code != http.StatusOK {
+		t.Fatalf("status %d", code.Code)
+	}
+	svcs, _ := body["services"].([]any)
+	if len(svcs) != 2 {
+		t.Fatalf("services = %v", body)
+	}
+	a := svcs[0].(map[string]any)
+	if a["id"] != "aeroapi" || a["used"] != 65.0 || a["cap"] != 65.0 || a["state"] != "cap_reached" ||
+		a["state_since"] != "2026-11-02T09:28:00Z" || a["state_until"] != nil || a["refused"] != 41.0 {
+		t.Errorf("aeroapi row = %v", a)
+	}
+	if _, has := a["state_until"]; !has {
+		t.Error("state_until must be present as null")
+	}
+	e := svcs[1].(map[string]any)["recent_errors"].([]any)[0].(map[string]any)
+	if e["message"] != "timeout" || e["subject"] != "RYR1" {
+		t.Errorf("recent error = %v", e)
+	}
+}
+
+func TestLimitsEndpointWithoutSource(t *testing.T) {
+	h := NewHandler(&fakeSource{}, store(10), &fakeStats{}, nil, time.Now)
+	code, body := get(t, h, "/api/limits")
+	svcs, ok := body["services"].([]any)
+	if code.Code != http.StatusOK || !ok || len(svcs) != 0 {
+		t.Fatalf("code=%d body=%v", code.Code, body)
+	}
+}
+
+func TestSettings_CapKeysRoundTrip(t *testing.T) {
+	st := &fakeStore{s: settings.Settings{RadiusKm: 10, AirLabsCallsPerMonth: 900}}
+	h := NewHandler(&fakeSource{at: time.Now()}, st, &fakeStats{}, nil, time.Now)
+	rec, body := put(t, h, `{"airlabs_calls_per_month":500,"adsbdb_calls_per_day":2000,"hexdb_calls_per_day":300}`)
+	if rec.Code != 200 || body["airlabs_calls_per_month"] != 500.0 || body["adsbdb_calls_per_day"] != 2000.0 ||
+		body["hexdb_calls_per_day"] != 300.0 || body["radius_km"] != 10.0 {
+		t.Fatalf("PUT = %d %v", rec.Code, body)
+	}
+	rec, body = put(t, h, `{"radius_km":12}`)
+	if rec.Code != 200 || body["airlabs_calls_per_month"] != 500.0 {
+		t.Errorf("a patch without the caps must keep them: %d %v", rec.Code, body)
+	}
+	if rec, _ = put(t, h, `{"hexdb_calls_per_day":-1}`); rec.Code != 400 {
+		t.Errorf("negative cap should be 400, got %d", rec.Code)
 	}
 }
