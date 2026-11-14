@@ -2,6 +2,7 @@ package usage
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -152,5 +153,56 @@ func TestMeterIgnoresRequestsWithDoneContext(t *testing.T) {
 	}
 	if got := m.Totals(); got.Calls != 0 || got.Errors != 0 {
 		t.Fatalf("totals = %+v, want nothing recorded", got)
+	}
+}
+
+func TestLimitRefusesAtCap(t *testing.T) {
+	clk := newClock("2026-11-02T10:00:00Z")
+	m := NewMeter(clk.now)
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hits++ }))
+	defer srv.Close()
+	c := m.Limit(m.Wrap(&http.Client{}, nil), func() int { return 2 }, func(r *http.Request) string { return r.URL.Path })
+	var errs []error
+	for _, p := range []string{"/a", "/b", "/c"} {
+		resp, err := c.Get(srv.URL + p)
+		if err == nil {
+			resp.Body.Close()
+		}
+		errs = append(errs, err)
+	}
+	got := m.Totals()
+	if hits != 2 || !errors.Is(errs[2], ErrCapReached) || got.Calls != 2 || got.Refused != 1 ||
+		!got.CapHitAt.Equal(clk.now()) || got.Errors != 0 {
+		t.Fatalf("hits=%d errs=%v totals=%+v", hits, errs, got)
+	}
+}
+
+func TestLimitZeroMeansNoCap(t *testing.T) {
+	m := NewMeter(time.Now)
+	srv := statusServer(t)
+	c := m.Limit(m.Wrap(&http.Client{}, nil), func() int { return 0 }, nil)
+	for i := 0; i < 3; i++ {
+		get(t, c, srv.URL+"/?s=200")
+	}
+	if got := m.Totals(); got.Calls != 3 || got.Refused != 0 {
+		t.Fatalf("totals = %+v", got)
+	}
+}
+
+func TestLimitFollowsLiveCap(t *testing.T) {
+	m := NewMeter(time.Now)
+	srv := statusServer(t)
+	limit := 1
+	c := m.Limit(m.Wrap(&http.Client{}, nil), func() int { return limit }, nil)
+	get(t, c, srv.URL+"/?s=200")
+	if _, err := c.Get(srv.URL + "/?s=200"); !errors.Is(err, ErrCapReached) {
+		t.Fatalf("at cap: err = %v", err)
+	}
+	limit = 5
+	if resp, err := c.Get(srv.URL + "/?s=200"); err != nil {
+		t.Fatalf("raised cap: err = %v", err)
+	} else {
+		resp.Body.Close()
 	}
 }

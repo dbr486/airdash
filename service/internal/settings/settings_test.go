@@ -436,3 +436,52 @@ func TestCurrent_PaidRoutesWanted(t *testing.T) {
 		t.Error("independent of show_delay")
 	}
 }
+
+func TestFromConfigSeedsCaps(t *testing.T) {
+	s := FromConfig(config.Config{RadiusKm: 10, BoardCallsPerMonth: 900})
+	if s.AirLabsCallsPerMonth != 900 || s.ADSBDBCallsPerDay != 0 || s.HexDBCallsPerDay != 0 {
+		t.Fatalf("caps = %d/%d/%d, want 900/0/0", s.AirLabsCallsPerMonth, s.ADSBDBCallsPerDay, s.HexDBCallsPerDay)
+	}
+}
+
+func TestNormalizeCapRanges(t *testing.T) {
+	base := Settings{RadiusKm: 10, AirLabsCallsPerMonth: 900}
+	for _, tc := range []struct {
+		name string
+		mod  func(*Settings)
+		ok   bool
+	}{
+		{"airlabs negative", func(s *Settings) { s.AirLabsCallsPerMonth = -1 }, false},
+		{"airlabs too big", func(s *Settings) { s.AirLabsCallsPerMonth = 100001 }, false},
+		{"adsbdb negative", func(s *Settings) { s.ADSBDBCallsPerDay = -1 }, false},
+		{"adsbdb too big", func(s *Settings) { s.ADSBDBCallsPerDay = 100001 }, false},
+		{"hexdb negative", func(s *Settings) { s.HexDBCallsPerDay = -1 }, false},
+		{"hexdb too big", func(s *Settings) { s.HexDBCallsPerDay = 100001 }, false},
+		{"in range", func(s *Settings) { s.AirLabsCallsPerMonth, s.ADSBDBCallsPerDay, s.HexDBCallsPerDay = 500, 1000, 2000 }, true},
+	} {
+		s := base
+		tc.mod(&s)
+		n, _, err := Normalize(s)
+		if tc.ok != (err == nil) {
+			t.Errorf("%s: err = %v", tc.name, err)
+			continue
+		}
+		if err != nil && !errors.Is(err, ErrValidation) {
+			t.Errorf("%s: not a validation error: %v", tc.name, err)
+		}
+		if tc.ok && (n.AirLabsCallsPerMonth != 500 || n.ADSBDBCallsPerDay != 1000 || n.HexDBCallsPerDay != 2000) {
+			t.Errorf("%s: values not kept: %+v", tc.name, n)
+		}
+	}
+}
+
+func TestLoadOldFileInheritsCapDefaults(t *testing.T) {
+	path := t.TempDir() + "/settings.json"
+	if err := os.WriteFile(path, []byte(`{"lat":1,"lon":2,"radius_km":10}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, found, err := Load(path, Settings{RadiusKm: 10, AirLabsCallsPerMonth: 900})
+	if err != nil || !found || s.AirLabsCallsPerMonth != 900 || s.ADSBDBCallsPerDay != 0 {
+		t.Fatalf("s=%+v found=%v err=%v", s, found, err)
+	}
+}

@@ -142,7 +142,7 @@ func TestRun_RefreshesOnStartIntervalAndAirportChange(t *testing.T) {
 	tick := make(chan time.Time)
 	done := make(chan struct{})
 	go func() {
-		b.run(ctx, func() string { mu.Lock(); defer mu.Unlock(); return airport }, 90*time.Minute, tick)
+		b.run(ctx, func() string { mu.Lock(); defer mu.Unlock(); return airport }, every(90*time.Minute), tick)
 		close(done)
 	}()
 	waitCalls := func(n int) {
@@ -233,7 +233,7 @@ func TestRun_BacksOffAfterErrorsAndGoesQuietOnCap(t *testing.T) {
 	defer cancel()
 	tick := make(chan time.Time)
 	done := make(chan struct{})
-	go func() { b.run(ctx, func() string { return "AGP" }, 90*time.Minute, tick); close(done) }()
+	go func() { b.run(ctx, func() string { return "AGP" }, every(90*time.Minute), tick); close(done) }()
 	waitFor := func(cond func() bool, what string) {
 		deadline := time.Now().Add(2 * time.Second)
 		for time.Now().Before(deadline) {
@@ -266,7 +266,7 @@ func TestRun_BacksOffAfterErrorsAndGoesQuietOnCap(t *testing.T) {
 	ctx2, cancel2 := context.WithCancel(context.Background())
 	tick2 := make(chan time.Time)
 	done2 := make(chan struct{})
-	go func() { b2.run(ctx2, func() string { return "AGP" }, time.Minute, tick2); close(done2) }()
+	go func() { b2.run(ctx2, func() string { return "AGP" }, every(time.Minute), tick2); close(done2) }()
 	waitFor(func() bool { return f2.count() == 2 }, "b2 first refresh")
 	for i := 0; i < 5; i++ {
 		mu.Lock()
@@ -494,7 +494,10 @@ func TestBoardOnFailOnlyForAPIErrors(t *testing.T) {
 		b.OnFail(func(subject, msg string) { mu.Lock(); got = append(got, subject+"|"+msg); mu.Unlock() })
 		ctx, cancel := context.WithCancel(context.Background())
 		done := make(chan struct{})
-		go func() { b.run(ctx, func() string { return "AGP" }, 90*time.Minute, make(chan time.Time)); close(done) }()
+		go func() {
+			b.run(ctx, func() string { return "AGP" }, every(90*time.Minute), make(chan time.Time))
+			close(done)
+		}()
 		deadline := time.Now().Add(2 * time.Second)
 		for f.count() == 0 && time.Now().Before(deadline) {
 			time.Sleep(5 * time.Millisecond)
@@ -507,5 +510,178 @@ func TestBoardOnFailOnlyForAPIErrors(t *testing.T) {
 			t.Errorf("err %v: hook calls = %v, want %d", tc.err, got, tc.want)
 		}
 		mu.Unlock()
+	}
+}
+
+func every(d time.Duration) func(time.Time) time.Duration {
+	return func(time.Time) time.Duration { return d }
+}
+
+func utc(s string) time.Time {
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		panic(err)
+	}
+	return t
+}
+
+func TestIntervalSpreadsRemainingCalls(t *testing.T) {
+	now := utc("2026-11-01T00:00:00Z")
+	b := New(&fakeFetcher{}, 1, 3*time.Hour, func() time.Time { return now }, quiet())
+	b.SetCapFunc(func() int { return 900 })
+	if got := b.Interval(now); got != 96*time.Minute {
+		t.Errorf("start of a 30-day month, 900 calls: interval = %v, want 1h36m", got)
+	}
+	b.mu.Lock()
+	b.year, b.month, b.calls = 2026, time.November, 880
+	b.mu.Unlock()
+	now = utc("2026-11-30T00:00:00Z")
+	if got := b.Interval(now); got != 144*time.Minute {
+		t.Errorf("one day and 20 calls left: interval = %v, want 2h24m", got)
+	}
+}
+
+func TestIntervalFloorAndCapReached(t *testing.T) {
+	now := utc("2026-11-01T00:00:00Z")
+	limit := 100000
+	b := New(&fakeFetcher{}, 1, 3*time.Hour, func() time.Time { return now }, quiet())
+	b.SetCapFunc(func() int { return limit })
+	if got := b.Interval(now); got != 15*time.Minute {
+		t.Errorf("huge cap: interval = %v, want the 15 min floor", got)
+	}
+	limit = 1
+	if iv, reached := b.Schedule(); iv != 0 || !reached || b.Interval(now) != 0 {
+		t.Errorf("cap 1 cannot fund a refresh: interval=%v reached=%v", iv, reached)
+	}
+	if s := b.Stats(); s.CallsCap != 1 {
+		t.Errorf("stats must report the live cap: %+v", s)
+	}
+}
+
+func TestLiveCapRaiseResumesRefresh(t *testing.T) {
+	var mu sync.Mutex
+	now := utc("2026-11-02T10:00:00Z")
+	clock := func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+	f := &fakeFetcher{dep: deps(t), arr: arrs(t)}
+	b := New(f, 1, 3*time.Hour, clock, quiet())
+	limit := 2
+	var lmu sync.Mutex
+	b.SetCapFunc(func() int { lmu.Lock(); defer lmu.Unlock(); return limit })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tick := make(chan time.Time)
+	done := make(chan struct{})
+	go func() { b.run(ctx, func() string { return "AGP" }, b.Interval, tick); close(done) }()
+	waitCount(t, f, 2)
+	for i := 0; i < 3; i++ {
+		mu.Lock()
+		now = now.Add(time.Hour)
+		mu.Unlock()
+		tick <- now
+	}
+	if f.count() != 2 {
+		t.Fatalf("cap spent: calls = %d, want 2", f.count())
+	}
+	// Raised far enough that the spread interval (15 min floor) has passed
+	// since the last refresh three hours ago.
+	lmu.Lock()
+	limit = 100000
+	lmu.Unlock()
+	tick <- now
+	waitCount(t, f, 4)
+	cancel()
+	<-done
+}
+
+func TestMonthRolloverResumes(t *testing.T) {
+	var mu sync.Mutex
+	now := utc("2026-11-30T10:00:00Z")
+	clock := func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+	f := &fakeFetcher{dep: deps(t), arr: arrs(t)}
+	b := New(f, 1, 3*time.Hour, clock, quiet())
+	limit := 2
+	var lmu sync.Mutex
+	b.SetCapFunc(func() int { lmu.Lock(); defer lmu.Unlock(); return limit })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tick := make(chan time.Time)
+	done := make(chan struct{})
+	go func() { b.run(ctx, func() string { return "AGP" }, b.Interval, tick); close(done) }()
+	waitCount(t, f, 2)
+	mu.Lock()
+	now = utc("2026-11-30T23:59:00Z")
+	mu.Unlock()
+	tick <- now
+	if f.count() != 2 {
+		t.Fatalf("cap spent before the month ends: calls = %d", f.count())
+	}
+	// A new month with the usual cap: last refresh 14 h ago, far past the
+	// ~99 min interval, so the next tick refreshes.
+	lmu.Lock()
+	limit = 900
+	lmu.Unlock()
+	mu.Lock()
+	now = utc("2026-12-01T00:01:00Z")
+	mu.Unlock()
+	tick <- now
+	waitCount(t, f, 4)
+	cancel()
+	<-done
+}
+
+func waitCount(t *testing.T, f *fakeFetcher, n int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for f.count() < n && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if f.count() != n {
+		t.Fatalf("fetch calls = %d, want %d", f.count(), n)
+	}
+}
+
+// Coming out of a spent cap (a modest raise, or a new month with the same
+// small cap) must refresh on the next tick, not wait a whole spread
+// interval measured from the last refresh before the block.
+func TestCapUnblockRefreshesAtOnce(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		raise int
+		next  string
+	}{
+		{"modest raise", 4, "2026-11-02T13:00:00Z"},
+		{"new month, same cap", 2, "2026-12-01T00:01:00Z"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var mu sync.Mutex
+			now := utc("2026-11-02T10:00:00Z")
+			clock := func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+			f := &fakeFetcher{dep: deps(t), arr: arrs(t)}
+			b := New(f, 1, 3*time.Hour, clock, quiet())
+			limit := 2
+			var lmu sync.Mutex
+			b.SetCapFunc(func() int { lmu.Lock(); defer lmu.Unlock(); return limit })
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			tick := make(chan time.Time)
+			done := make(chan struct{})
+			go func() { b.run(ctx, func() string { return "AGP" }, b.Interval, tick); close(done) }()
+			waitCount(t, f, 2)
+			mu.Lock()
+			now = now.Add(time.Hour)
+			mu.Unlock()
+			tick <- now // blocked by the cap
+			tick <- now // returns only once the blocked tick was handled
+			lmu.Lock()
+			limit = tc.raise
+			lmu.Unlock()
+			mu.Lock()
+			now = utc(tc.next)
+			mu.Unlock()
+			tick <- now
+			waitCount(t, f, 4)
+			cancel()
+			<-done
+		})
 	}
 }

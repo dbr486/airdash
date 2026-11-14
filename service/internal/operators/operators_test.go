@@ -11,6 +11,8 @@ import (
 
 	"airdash/internal/routes"
 	"airdash/internal/standing"
+
+	"airdash/internal/usage"
 )
 
 func serveFixture(t *testing.T, status int, file string, gotUA, gotPath *string) *httptest.Server {
@@ -217,6 +219,19 @@ func TestCache_GateRejectionStartsNoCooldown(t *testing.T) {
 
 	if _, _, err := c.FlagCode(t.Context(), "3451d5"); !errors.Is(err, routes.ErrRateLimited) {
 		t.Fatalf("err = %v, want ErrRateLimited", err)
+	}
+	inner.err, inner.code, inner.ok = nil, "RYR", true
+	if code, ok, err := c.FlagCode(t.Context(), "3451d5"); err != nil || !ok || code != "RYR" {
+		t.Fatalf("second call: code=%q ok=%v err=%v", code, ok, err)
+	}
+}
+
+func TestCache_CapRefusalStartsNoCooldown(t *testing.T) {
+	now := time.Date(2026, 11, 2, 18, 0, 0, 0, time.UTC)
+	inner := &fakeFlags{err: usage.ErrCapReached}
+	c := NewCache(inner, 7*24*time.Hour, 24*time.Hour, 60*time.Second, func() time.Time { return now })
+	if _, _, err := c.FlagCode(t.Context(), "3451d5"); !errors.Is(err, usage.ErrCapReached) {
+		t.Fatalf("err = %v", err)
 	}
 	inner.err, inner.code, inner.ok = nil, "RYR", true
 	if code, ok, err := c.FlagCode(t.Context(), "3451d5"); err != nil || !ok || code != "RYR" {

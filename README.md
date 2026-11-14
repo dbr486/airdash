@@ -109,8 +109,7 @@ overrides them at runtime.
 | `AIRDASH_AEROAPI_KEY` | empty | Enables per-flight delay status (see below) |
 | `AIRDASH_AIRLABS_KEY` | empty | Enables the airport-board delay source (see below) |
 | `AIRDASH_BOARD_AIRPORT` | empty | Board airport (also editable on the page) |
-| `AIRDASH_BOARD_REFRESH_MINUTES` | `100` | Board refresh interval (min 5) |
-| `AIRDASH_BOARD_CALLS_PER_MONTH` | `900` | Monthly AirLabs call cap the service enforces |
+| `AIRDASH_BOARD_CALLS_PER_MONTH` | `900` | Initial monthly AirLabs call cap (then edited on the Settings page; the refresh interval follows it) |
 | `AIRDASH_PORT` | `8080` | Host port for the service (docker compose) |
 | `AIRDASH_UI_PORT` | `3000` | Host port for the web UI (docker compose) |
 | `AIRDASH_LISTEN` | `:8080` | Listen address, standalone binary only |

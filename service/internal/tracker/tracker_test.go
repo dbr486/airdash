@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -17,6 +18,7 @@ import (
 	"airdash/internal/routes"
 	"airdash/internal/settings"
 	"airdash/internal/standing"
+	"airdash/internal/usage"
 )
 
 // Home is Heathrow-ish. Distances below are approximate and only need
@@ -1823,6 +1825,10 @@ func TestRecord_SourceStatuses(t *testing.T) {
 			func(r PassRecord) bool { return r.ADSBDB.Status == StatusCooldown }},
 		{"hexdb cooldown", &fakeRoutes{}, &fakeRoutes{errAll: routes.ErrCooldown}, "WZZ1",
 			func(r PassRecord) bool { return r.HexDB.Status == StatusCooldown }},
+		{"adsbdb cap reached", &fakeRoutes{errAll: usage.ErrCapReached}, &fakeRoutes{}, "WZZ1",
+			func(r PassRecord) bool { return r.ADSBDB.Status == StatusSkipped }},
+		{"hexdb cap reached", &fakeRoutes{}, &fakeRoutes{errAll: usage.ErrCapReached}, "WZZ1",
+			func(r PassRecord) bool { return r.HexDB.Status == StatusSkipped }},
 		{"hexdb implausible", &fakeRoutes{}, &fakeRoutes{byCallsign: map[string]routes.Route{"WZZ1": far}}, "WZZ1",
 			func(r PassRecord) bool {
 				return r.HexDB == SourceAnswer{StatusImplausible, "AGP-TFS"} && r.ShownSource == SourceNone
@@ -2023,6 +2029,23 @@ func TestPositionFailureHookOnlyForBadBody(t *testing.T) {
 		tr.Tick(t.Context())
 		if len(got) != tc.want {
 			t.Errorf("%v: hook calls = %v, want %d", tc.err, got, tc.want)
+		}
+	}
+}
+
+// A spent daily cap is not an outage: it must not flip route health to
+// failing, which would also log a false "recovered" when the cap resets.
+func TestCapRefusalIsNotRouteFailure(t *testing.T) {
+	h, msgs := newRecordingHandler()
+	tr := newTracker(&fakeProvider{acs: []provider.Aircraft{airborne("a", "WZZ1", 51.48, -0.45)}},
+		&fakeRoutes{errAll: usage.ErrCapReached}, filter.Filter{}, &clock{t: time.Now()})
+	tr.o.Logger = slog.New(h)
+	for i := 0; i < 3; i++ {
+		tr.Tick(t.Context())
+	}
+	for _, m := range *msgs {
+		if strings.Contains(m, "failing") {
+			t.Fatalf("cap refusal logged as a failure: %v", *msgs)
 		}
 	}
 }

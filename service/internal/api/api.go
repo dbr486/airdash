@@ -266,6 +266,10 @@ type settingsPatch struct {
 	ShowLogos          *bool    `json:"show_logos"`
 	BoardAirport       *string  `json:"board_airport"`
 	PaidRoutes         *bool    `json:"paid_routes"`
+
+	AirLabsCallsPerMonth *int `json:"airlabs_calls_per_month"`
+	ADSBDBCallsPerDay    *int `json:"adsbdb_calls_per_day"`
+	HexDBCallsPerDay     *int `json:"hexdb_calls_per_day"`
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
@@ -319,6 +323,15 @@ func (h *handler) putSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		if p.DelayLookupsPerDay != nil {
 			cur.DelayLookupsPerDay = *p.DelayLookupsPerDay
+		}
+		if p.AirLabsCallsPerMonth != nil {
+			cur.AirLabsCallsPerMonth = *p.AirLabsCallsPerMonth
+		}
+		if p.ADSBDBCallsPerDay != nil {
+			cur.ADSBDBCallsPerDay = *p.ADSBDBCallsPerDay
+		}
+		if p.HexDBCallsPerDay != nil {
+			cur.HexDBCallsPerDay = *p.HexDBCallsPerDay
 		}
 		if p.ShowNames != nil {
 			cur.ShowNames = *p.ShowNames

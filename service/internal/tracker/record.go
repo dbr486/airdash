@@ -10,7 +10,7 @@ const (
 	StatusUnknown     = "unknown"     // the source has no (usable) route
 	StatusMiss        = "miss"        // board only: no row for the leg flying now
 	StatusError       = "error"
-	StatusSkipped     = "skipped"   // this tick's lookup budget was spent
+	StatusSkipped     = "skipped"   // a time budget or a daily cap was spent
 	StatusCooldown    = "cooldown"  // held back after an earlier failure or a rate-limit ban
 	StatusOff         = "off"       // source not configured or switched off
 	StatusNone        = "none"      // no callsign to ask with

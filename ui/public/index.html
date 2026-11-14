@@ -22,7 +22,9 @@
   #status { margin-top:14px; color:var(--muted); font-size:14px; }
   #apply-msg { margin-left:12px; font-size:13px; color:var(--red); }
   #custom { grid-column:1/-1; font-size:13px; color:var(--yellow); }
-  #display legend { color:var(--muted); }
+  #display legend, #caps legend { color:var(--muted); }
+  #caps label { display:flex; flex-wrap:wrap; align-items:center; gap:4px 8px; width:100%; }
+  .cap-note, .cap-help { color:var(--muted); font-size:12px; }
   #lookups, #board, #find-msg { grid-column:1/-1; font-size:13px; color:var(--muted); }
   #home button { grid-column:auto; padding:6px 12px; }
   #delay-note { grid-column:1/-1; font-size:13px; color:var(--yellow); }
@@ -85,11 +87,18 @@
       <label><input type="checkbox" id="paid_routes" disabled> Look up missing routes on FlightAware</label>
       <label><input type="checkbox" id="show_names"> Show city names instead of airport codes</label>
       <label><input type="checkbox" id="show_logos"> Show airline logos</label>
-      <label>AeroAPI lookups per day <input type="number" id="delay_cap" min="0" max="1000" step="1" style="width:6em"></label>
       <label>Airport board (IATA/ICAO) <input type="text" id="board_airport" placeholder="AGP" maxlength="4" style="width:5em" autocomplete="off"></label>
       <div id="delay-note" class="hidden"></div>
       <div id="lookups"></div>
       <div id="board"></div>
+    </fieldset>
+    <fieldset id="caps">
+      <legend>Service limits</legend>
+      <label>FlightAware lookups per day <input type="number" id="delay_cap" min="0" max="1000" step="1" style="width:6em"> <span class="cap-note" id="note-aeroapi"></span></label>
+      <label>AirLabs calls per month <input type="number" id="airlabs_cap" min="0" max="100000" step="1" style="width:7em"> <span class="cap-note" id="note-airlabs"></span></label>
+      <label>adsbdb calls per day <input type="number" id="adsbdb_cap" min="0" max="100000" step="1" placeholder="no cap" style="width:7em"> <span class="cap-note" id="note-adsbdb"></span></label>
+      <label>hexdb calls per day <input type="number" id="hexdb_cap" min="0" max="100000" step="1" placeholder="no cap" style="width:7em"> <span class="cap-note" id="note-hexdb"></span></label>
+      <div class="cap-help">Blank adsbdb/hexdb means no cap. When a free source hits its cap, lookups fall through to the next source. The AirLabs refresh interval follows its cap so it lasts the month. Details on <a href="sources.html">Route sources</a>.</div>
     </fieldset>
     <div id="custom" class="hidden"></div>
     <label for="codes">Airport code(s)</label>
@@ -114,6 +123,7 @@
 </main>
 
 <script src="mirror.js"></script>
+<script src="limits.js"></script>
 <script>
 // --- settings form ---
 let current = null;
@@ -164,6 +174,10 @@ function fillForm(s) {
   $('show_names').checked = !!s.show_names;
   $('show_logos').checked = !!s.show_logos;
   $('delay_cap').value = s.delay_lookups_per_day;
+  $('airlabs_cap').value = s.airlabs_calls_per_month;
+  // 0 is "no cap" for the free sources: show it as the blank placeholder.
+  $('adsbdb_cap').value = s.adsbdb_calls_per_day || '';
+  $('hexdb_cap').value = s.hexdb_calls_per_day || '';
   $('board_airport').value = s.board_airport || '';
   syncCodesEnabled();
   updateStatus();
@@ -221,6 +235,22 @@ $('filters').addEventListener('submit', async (ev) => {
     body.show_delay = $('show_delay').checked;
     body.delay_lookups_per_day = cap;
   }
+  const capOf = (id, max, blankIsZero) => {
+    const raw = $(id).value.trim();
+    if (raw === '' && blankIsZero) return 0;
+    const n = Number(raw);
+    return raw !== '' && Number.isInteger(n) && n >= 0 && n <= max ? n : null;
+  };
+  if (!$('airlabs_cap').disabled) {
+    const n = capOf('airlabs_cap', 100000, false);
+    if (n === null) { $('apply-msg').textContent = 'AirLabs calls per month must be 0-100000'; return; }
+    body.airlabs_calls_per_month = n;
+  }
+  for (const [id, key, name] of [['adsbdb_cap', 'adsbdb_calls_per_day', 'adsbdb'], ['hexdb_cap', 'hexdb_calls_per_day', 'hexdb']]) {
+    const n = capOf(id, 100000, true);
+    if (n === null) { $('apply-msg').textContent = `${name} calls per day must be blank (no cap) or 0-100000`; return; }
+    body[key] = n;
+  }
   // Same reasoning for paid routes, which need the AeroAPI key itself: with
   // only the AirLabs board configured, saving false here would keep paid
   // routes off after a key is added later.
@@ -255,7 +285,10 @@ async function loadStats() {
     const noKey = !st.delay_source;
     $('show_delay').disabled = noKey;
     $('paid_routes').disabled = noKey || !st.delay_source.includes('aeroapi');
-    $('delay_cap').disabled = noKey;
+    $('delay_cap').disabled = noKey || !st.delay_source.includes('aeroapi');
+    // Without an AirLabs key there is no board to cap; the value is left as
+    // saved rather than written back from a disabled field.
+    $('airlabs_cap').disabled = !st.board_source;
     $('delay-note').classList.toggle('hidden', !noKey);
     if (noKey) $('delay-note').textContent = 'No delay source configured (AIRDASH_AEROAPI_KEY or AIRDASH_AIRLABS_KEY)';
     $('lookups').textContent = (noKey || !st.delay_source.includes('aeroapi')) ? '' : `AeroAPI lookups today: ${st.delay_lookups_today} / ${st.delay_lookups_cap}${st.delay_enabled ? '' : ' (delay off)'} · routes: ${st.paid_routes_enabled ? 'on' : 'off'}`;
@@ -267,6 +300,23 @@ async function loadStats() {
   } catch (e) {
     $('lookups').textContent = '';
     $('board').textContent = '';
+  }
+  loadLimits();
+}
+
+// Each cap field shows where its service stands, from the same report the
+// Route sources page uses.
+async function loadLimits() {
+  try {
+    const res = await fetch('/api/limits', { cache: 'no-store' });
+    if (!res.ok) throw new Error(`http ${res.status}`);
+    const { services } = await res.json();
+    for (const s of services) {
+      const el = document.getElementById('note-' + s.id);
+      if (el) el.textContent = Limits.usageNote(s);
+    }
+  } catch (e) {
+    for (const el of document.querySelectorAll('.cap-note')) el.textContent = '';
   }
 }
 

@@ -13,6 +13,11 @@ import (
 	"time"
 )
 
+// ErrCapReached is returned, without any network I/O, once a service's
+// daily cap is spent. Callers must not cache it: a raised cap has to work
+// on the next lookup.
+var ErrCapReached = errors.New("usage: daily cap reached")
+
 const (
 	recentErrors = 5
 	maxMessage   = 120
@@ -28,11 +33,13 @@ type ErrorEvent struct {
 
 // Totals is a meter's state for one UTC day. Recent is newest first.
 type Totals struct {
-	Day     string       `json:"day"`
-	Calls   int          `json:"calls"`
-	Errors  int          `json:"errors"`
-	Refused int          `json:"refused"`
-	Recent  []ErrorEvent `json:"recent_errors"`
+	Day     string `json:"day"`
+	Calls   int    `json:"calls"`
+	Errors  int    `json:"errors"`
+	Refused int    `json:"refused"`
+	// CapHitAt is when Limit first refused a call today; zero if not.
+	CapHitAt time.Time    `json:"cap_hit_at"`
+	Recent   []ErrorEvent `json:"recent_errors"`
 }
 
 // Meter counts one service's traffic. It is safe for concurrent use and
@@ -151,6 +158,53 @@ func (m *Meter) record(subject, msg string) {
 	if msg != "" {
 		m.fail(subject, msg)
 	}
+}
+
+// Limit returns a copy of c that refuses requests once today's metered
+// calls reach capFn() (0 = no cap). Put it outside the meter's own Wrap so
+// a refused request is counted as refused, never as a call. Concurrent
+// requests may overshoot the cap by a few; it guards free services.
+func (m *Meter) Limit(c *http.Client, capFn func() int, subject func(*http.Request) string) *http.Client {
+	base := c.Transport
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	cp := *c
+	cp.Transport = &limiter{m: m, base: base, capFn: capFn, subject: subject}
+	return &cp
+}
+
+type limiter struct {
+	m       *Meter
+	base    http.RoundTripper
+	capFn   func() int
+	subject func(*http.Request) string
+}
+
+func (l *limiter) RoundTrip(req *http.Request) (*http.Response, error) {
+	if limit := l.capFn(); limit > 0 && l.m.Totals().Calls >= limit {
+		if req.Body != nil {
+			req.Body.Close() // RoundTrip must close it, even on error
+		}
+		subj := ""
+		if l.subject != nil {
+			subj = l.subject(req)
+		}
+		l.m.capRefused(subj)
+		return nil, ErrCapReached
+	}
+	return l.base.RoundTrip(req)
+}
+
+func (m *Meter) capRefused(subject string) {
+	m.mu.Lock()
+	m.roll()
+	if m.t.CapHitAt.IsZero() {
+		m.t.CapHitAt = m.now().UTC()
+		m.changes++
+	}
+	m.mu.Unlock()
+	m.Refuse(subject)
 }
 
 // Fail records an error found after the transport saw a clean answer, such

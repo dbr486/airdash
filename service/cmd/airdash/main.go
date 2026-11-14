@@ -101,8 +101,15 @@ func run() error {
 	// as refused rather than as a call.
 	adsbdbGate := routes.NewGate(time.Now, logger)
 	adsbdbGate.OnRefuse(func(r *http.Request) { adsbdbMeter.Refuse(capture.SubjectLastSegment(r)) })
-	adsbdbClient := adsbdbGate.Wrap(adsbdbMeter.Wrap(capture.Wrap(client, sink, tracker.SourceADSBDB, capture.SubjectLastSegment, time.Now), capture.SubjectLastSegment))
-	hexdbClient := hexdbMeter.Wrap(capture.Wrap(client, sink, tracker.SourceHexDB, capture.SubjectHexDB, time.Now), capture.SubjectHexDB)
+	// The daily caps are read from Settings, which load further down; the
+	// closures only run once lookups start, after cur is set.
+	var cur *settings.Current
+	adsbdbCap := func() int { return cur.Settings().ADSBDBCallsPerDay }
+	hexdbCap := func() int { return cur.Settings().HexDBCallsPerDay }
+	// The cap limiter wraps everything else: a request it refuses never
+	// reaches the gate, the meter (as a call) or upstream.
+	adsbdbClient := adsbdbMeter.Limit(adsbdbGate.Wrap(adsbdbMeter.Wrap(capture.Wrap(client, sink, tracker.SourceADSBDB, capture.SubjectLastSegment, time.Now), capture.SubjectLastSegment)), adsbdbCap, capture.SubjectLastSegment)
+	hexdbClient := hexdbMeter.Limit(hexdbMeter.Wrap(capture.Wrap(client, sink, tracker.SourceHexDB, capture.SubjectHexDB, time.Now), capture.SubjectHexDB), hexdbCap, capture.SubjectHexDB)
 	aeroClient := aeroMeter.Wrap(capture.Wrap(client, sink, tracker.SourceAeroAPI, capture.SubjectLastSegment, time.Now), capture.SubjectLastSegment)
 	airlabsClient := airlabsMeter.Wrap(capture.Wrap(client, sink, capture.SourceAirLabs, capture.SubjectAirLabs, time.Now), capture.SubjectAirLabs)
 	logoSrc := logos.New(client, logos.DefaultBaseURL, userAgent, time.Now)
@@ -116,7 +123,7 @@ func run() error {
 	// Owner answers change rarely, so known ones are cached for a week;
 	// unknown ones for a day in case the registry gets filled in.
 	opResolver := operators.NewResolver(operators.NewCache(
-		operators.NewADSBDBOwner(adsbdbGate.Wrap(adsbdbMeter.Wrap(client, capture.SubjectLastSegment)), routes.DefaultADSBDBURL, userAgent),
+		operators.NewADSBDBOwner(adsbdbMeter.Limit(adsbdbGate.Wrap(adsbdbMeter.Wrap(client, capture.SubjectLastSegment)), adsbdbCap, capture.SubjectLastSegment), routes.DefaultADSBDBURL, userAgent),
 		7*24*time.Hour, 24*time.Hour, routeErrorCooldown, time.Now))
 
 	initial := settings.FromConfig(cfg)
@@ -128,7 +135,7 @@ func run() error {
 			initial, source = s, "file"
 		}
 	}
-	cur, err := settings.NewCurrent(initial, cfg.SettingsFile, logger)
+	cur, err = settings.NewCurrent(initial, cfg.SettingsFile, logger)
 	if err != nil {
 		return err
 	}
@@ -166,7 +173,11 @@ func run() error {
 	// never spends a paid lookup.
 	var brd *board.Board
 	if cfg.AirLabsKey != "" {
-		brd = board.New(board.NewAirLabs(airlabsClient, board.DefaultAirLabsURL, cfg.AirLabsKey, userAgent), cfg.BoardCallsPerMonth, 2*cfg.BoardRefresh, time.Now, logger)
+		// boardStaleFloor keeps rows usable for the old 2 x 100 min while the
+		// cap is spent and no interval applies.
+		const boardStaleFloor = 200 * time.Minute
+		brd = board.New(board.NewAirLabs(airlabsClient, board.DefaultAirLabsURL, cfg.AirLabsKey, userAgent), cfg.BoardCallsPerMonth, boardStaleFloor, time.Now, logger)
+		brd.SetCapFunc(func() int { return cur.Settings().AirLabsCallsPerMonth })
 		if cfg.SettingsFile != "" {
 			// The month's call count lives next to the settings so a redeploy
 			// cannot reset it and overrun the key's quota.
@@ -177,7 +188,8 @@ func run() error {
 		brd.OnRefuse(airlabsMeter.Refuse)
 		brd.OnFail(airlabsMeter.Fail)
 		delay = board.Chain(brd, delay)
-		logger.Info("airport board enabled", "airport", cur.Settings().BoardAirport, "refresh", cfg.BoardRefresh, "cap", cfg.BoardCallsPerMonth)
+		iv, _ := brd.Schedule()
+		logger.Info("airport board enabled", "airport", cur.Settings().BoardAirport, "refresh", iv, "cap", cur.Settings().AirLabsCallsPerMonth)
 	}
 
 	// Filter and RadiusKm come from cur (the Settings source) once Settings
@@ -207,16 +219,34 @@ func run() error {
 		aeroLimit.Blocked = budget.Blocked
 	}
 	limits.Add("aeroapi", "FlightAware", aeroMeter, aeroLimit)
+	if cfg.BoardRefreshIgnored {
+		logger.Warn("AIRDASH_BOARD_REFRESH_MINUTES is ignored: the board refresh interval now follows the monthly cap in Settings")
+	}
 	airlabsLimit := usage.Limit{Enabled: brd != nil, Period: "month"}
 	if brd != nil {
 		airlabsLimit.Used = func() (int, int, time.Time) {
 			st := brd.Stats()
 			return st.CallsMonth, st.CallsCap, brd.CapHitAt()
 		}
+		airlabsLimit.Exhausted = func() bool {
+			_, reached := brd.Schedule()
+			return reached
+		}
+		airlabsLimit.RefreshEvery = func() time.Duration {
+			iv, _ := brd.Schedule()
+			return iv
+		}
 	}
 	limits.Add("airlabs", "AirLabs", airlabsMeter, airlabsLimit)
-	limits.Add("adsbdb", "adsbdb", adsbdbMeter, usage.Limit{Enabled: true, PausedUntil: adsbdbGate.PausedUntil})
-	limits.Add("hexdb", "hexdb", hexdbMeter, usage.Limit{Enabled: true})
+	freeUsed := func(m *usage.Meter, capFn func() int) func() (int, int, time.Time) {
+		return func() (int, int, time.Time) {
+			t := m.Totals()
+			return t.Calls, capFn(), t.CapHitAt
+		}
+	}
+	limits.Add("adsbdb", "adsbdb", adsbdbMeter, usage.Limit{Enabled: true, PausedUntil: adsbdbGate.PausedUntil,
+		ZeroCapIsNone: true, Used: freeUsed(adsbdbMeter, adsbdbCap)})
+	limits.Add("hexdb", "hexdb", hexdbMeter, usage.Limit{Enabled: true, ZeroCapIsNone: true, Used: freeUsed(hexdbMeter, hexdbCap)})
 	limits.Add("positions", providerLabel(cfg.Provider), posMeter, usage.Limit{Enabled: true, PollS: int(cfg.Poll.Seconds())})
 	if cfg.SettingsFile != "" {
 		if err := limits.Persist(filepath.Join(filepath.Dir(cfg.SettingsFile), "usage.json")); err != nil {
@@ -248,7 +278,7 @@ func run() error {
 		close(logDone)
 	}
 	if brd != nil {
-		go brd.Run(ctx, func() string { return cur.Settings().BoardAirport }, cfg.BoardRefresh)
+		go brd.Run(ctx, func() string { return cur.Settings().BoardAirport })
 	}
 
 	srv := &http.Server{

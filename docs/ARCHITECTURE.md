@@ -63,9 +63,10 @@ Wiring is in `cmd/airdash/main.go`; each package has one job.
    callsign or no known route.
 4. **Delay status** is a chain, cheapest first:
    - **`board`** (with `AIRDASH_AIRLABS_KEY`): downloads the departures and
-     arrivals board of one airport every `AIRDASH_BOARD_REFRESH_MINUTES`
-     and matches flights locally. A monthly call counter is persisted so
-     redeploys cannot overrun the quota.
+     arrivals board of one airport and matches flights locally. The refresh
+     interval spreads the calls left this month over the time left (15 min
+     floor), so any cap set in Settings lasts the month. A monthly call
+     counter is persisted so redeploys cannot overrun the quota.
    - **`flightstatus`** (with `AIRDASH_AEROAPI_KEY`): a per-flight AeroAPI
      lookup, only for the aircraft on screen. Results are cached for
      15 minutes and capped per UTC day.
@@ -152,7 +153,7 @@ the host.
 | adsb.fi | 1 request/s | default 5 s poll; minimum 2 s |
 | adsb.lol | ~8 requests/min | use `AIRDASH_POLL_SECONDS` ≥ 10 |
 | Nominatim | 1 request/s | `geocode` throttle and 1-day cache |
-| adsbdb | 512 requests/min per IP; every request counts, rejected ones too, and past 1,024 each request restarts a 300 s ban | route and owner caches; on a 429 `routes.Gate` stops all adsbdb calls for 300 s (or `Retry-After`) + 15 s, doubling on repeats (max 1 h), then sends one probe |
-| hexdb | none published | asked only when board and adsbdb miss; same route cache as adsbdb, airports cached for the process |
-| AirLabs | plan quota (free: 1,000/month) | `AIRDASH_BOARD_CALLS_PER_MONTH` (default 900), persisted counter |
+| adsbdb | 512 requests/min per IP; every request counts, rejected ones too, and past 1,024 each request restarts a 300 s ban | route and owner caches; on a 429 `routes.Gate` stops all adsbdb calls for 300 s (or `Retry-After`) + 15 s, doubling on repeats (max 1 h), then sends one probe; optional `adsbdb_calls_per_day` setting (0 = no cap) |
+| hexdb | none published | asked only when board and adsbdb miss; same route cache as adsbdb, airports cached for the process; optional `hexdb_calls_per_day` setting (0 = no cap) |
+| AirLabs | plan quota (free: 1,000/month) | `airlabs_calls_per_month` setting (seeded from `AIRDASH_BOARD_CALLS_PER_MONTH`, default 900), persisted counter, refresh interval derived from it |
 | AeroAPI | paid per call | `delay_lookups_per_day` setting (default 65, shared by delay and paid routes), 15-min cache |

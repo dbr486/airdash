@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"airdash/internal/routes"
+
+	"airdash/internal/usage"
 )
 
 // ErrCooldown is returned while an aircraft is in its post-error cooldown
@@ -69,9 +71,10 @@ func (c *Cache) FlagCode(ctx context.Context, hex string) (string, bool, error) 
 
 	code, ok, err := c.inner.FlagCode(ctx, key)
 	if err != nil {
-		// The shared adsbdb gate refused the call without asking upstream;
-		// it alone decides when to retry, so no per-hex cooldown here.
-		if errors.Is(err, routes.ErrRateLimited) {
+		// The shared adsbdb gate or the daily cap refused the call without
+		// asking upstream; it alone decides when to retry, so no per-hex
+		// cooldown here.
+		if errors.Is(err, routes.ErrRateLimited) || errors.Is(err, usage.ErrCapReached) {
 			return "", false, err
 		}
 		c.mu.Lock()

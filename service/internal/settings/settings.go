@@ -48,7 +48,17 @@ type Settings struct {
 	// could not find. It spends the same daily cap as delay lookups, so it
 	// has its own switch independent of ShowDelay.
 	PaidRoutes bool `json:"paid_routes"`
+	// Service caps, read live so a change applies on the next call.
+	// AirLabsCallsPerMonth also sets the board's refresh interval (spread
+	// over the month); the free-source caps are per UTC day, 0 = no cap.
+	AirLabsCallsPerMonth int `json:"airlabs_calls_per_month"`
+	ADSBDBCallsPerDay    int `json:"adsbdb_calls_per_day"`
+	HexDBCallsPerDay     int `json:"hexdb_calls_per_day"`
 }
+
+// maxCallsCap bounds every service cap: far beyond any plan in use, it
+// only stops a typo from meaning "unlimited".
+const maxCallsCap = 100000
 
 // DefaultDelayLookupsPerDay caps AeroAPI calls so the worst case (the cap
 // hit every day) stays near $10 a month: 65/day x 31 days x $0.005 ≈
@@ -62,7 +72,9 @@ func FromConfig(c config.Config) Settings {
 		ShowDelay: c.AeroAPIKey != "" || c.AirLabsKey != "", DelayLookupsPerDay: DefaultDelayLookupsPerDay, ShowLogos: true, BoardAirport: c.BoardAirport,
 		// Paid routes follow the key alone: a route-only call is useless without
 		// one, and a persisted file without this key must inherit this default.
-		PaidRoutes: c.AeroAPIKey != ""}
+		PaidRoutes: c.AeroAPIKey != "",
+		// The env value only seeds the monthly cap; Settings owns it after.
+		AirLabsCallsPerMonth: c.BoardCallsPerMonth}
 }
 
 // Normalize upper-cases and trims the code lists, validates them through
@@ -84,6 +96,16 @@ func Normalize(s Settings) (Settings, filter.Filter, error) {
 	if s.DelayLookupsPerDay < 0 || s.DelayLookupsPerDay > 1000 {
 		return Settings{}, filter.Filter{}, fmt.Errorf("%w: delay_lookups_per_day must be between 0 and 1000", ErrValidation)
 	}
+	// 0 stops board refreshes, as delay_lookups_per_day 0 stops AeroAPI.
+	if s.AirLabsCallsPerMonth < 0 || s.AirLabsCallsPerMonth > maxCallsCap {
+		return Settings{}, filter.Filter{}, fmt.Errorf("%w: airlabs_calls_per_month must be between 0 and %d", ErrValidation, maxCallsCap)
+	}
+	if s.ADSBDBCallsPerDay < 0 || s.ADSBDBCallsPerDay > maxCallsCap {
+		return Settings{}, filter.Filter{}, fmt.Errorf("%w: adsbdb_calls_per_day must be between 0 (no cap) and %d", ErrValidation, maxCallsCap)
+	}
+	if s.HexDBCallsPerDay < 0 || s.HexDBCallsPerDay > maxCallsCap {
+		return Settings{}, filter.Filter{}, fmt.Errorf("%w: hexdb_calls_per_day must be between 0 (no cap) and %d", ErrValidation, maxCallsCap)
+	}
 	ba := strings.ToUpper(strings.TrimSpace(s.BoardAirport))
 	if ba != "" && (len(ba) < 3 || len(ba) > 4 || !alnum(ba)) {
 		return Settings{}, filter.Filter{}, fmt.Errorf("%w: board_airport must be a 3-letter IATA or 4-letter ICAO code", ErrValidation)
@@ -101,6 +123,10 @@ func Normalize(s Settings) (Settings, filter.Filter, error) {
 		ShowNames:          s.ShowNames,
 		ShowLogos:          s.ShowLogos,
 		PaidRoutes:         s.PaidRoutes,
+
+		AirLabsCallsPerMonth: s.AirLabsCallsPerMonth,
+		ADSBDBCallsPerDay:    s.ADSBDBCallsPerDay,
+		HexDBCallsPerDay:     s.HexDBCallsPerDay,
 	}
 	f, err := filter.Parse(n.Origin, n.Dest, n.Airport)
 	if err != nil {

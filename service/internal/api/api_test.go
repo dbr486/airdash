@@ -216,7 +216,7 @@ func TestSettings_GetReturnsCurrent(t *testing.T) {
 			t.Errorf("%s = %v want %v", k, body[k], v)
 		}
 	}
-	if len(body) != 12 {
+	if len(body) != 15 {
 		t.Errorf("unexpected keys: %v", body)
 	}
 }
@@ -356,7 +356,7 @@ func TestSettings_DelayKeysRoundTrip(t *testing.T) {
 	st := &fakeStore{s: settings.Settings{RadiusKm: 10, ShowDelay: true, DelayLookupsPerDay: 40}}
 	h := NewHandler(&fakeSource{at: time.Now()}, st, &fakeStats{}, nil, time.Now)
 	_, body := get(t, h, "/api/settings")
-	if body["show_delay"] != true || body["delay_lookups_per_day"] != 40.0 || len(body) != 12 {
+	if body["show_delay"] != true || body["delay_lookups_per_day"] != 40.0 || len(body) != 15 {
 		t.Errorf("GET = %v", body)
 	}
 	rec, body := put(t, h, `{"show_delay":false,"delay_lookups_per_day":5}`)
@@ -411,7 +411,7 @@ func TestNearest_LabelFallsBackToCode(t *testing.T) {
 func TestSettings_ShowNamesRoundTrip(t *testing.T) {
 	h := NewHandler(&fakeSource{at: time.Now()}, store(10), &fakeStats{}, nil, time.Now)
 	_, body := get(t, h, "/api/settings")
-	if body["show_names"] != false || len(body) != 12 {
+	if body["show_names"] != false || len(body) != 15 {
 		t.Errorf("GET = %v", body)
 	}
 	rec, body := put(t, h, `{"show_names":true}`)
@@ -424,7 +424,7 @@ func TestSettings_ShowLogosRoundTrip(t *testing.T) {
 	st := &fakeStore{s: settings.Settings{RadiusKm: 10, ShowLogos: true}}
 	h := NewHandler(&fakeSource{at: time.Now()}, st, &fakeStats{}, nil, time.Now)
 	_, body := get(t, h, "/api/settings")
-	if body["show_logos"] != true || len(body) != 12 {
+	if body["show_logos"] != true || len(body) != 15 {
 		t.Errorf("GET = %v", body)
 	}
 	rec, body := put(t, h, `{"show_logos":false}`)
@@ -715,7 +715,7 @@ func TestLogoBitmap_LegacySquareKeepsAspect(t *testing.T) {
 func TestSettings_BoardAirportRoundTrip(t *testing.T) {
 	h := NewHandler(&fakeSource{at: time.Now()}, store(10), &fakeStats{}, nil, time.Now)
 	_, body := get(t, h, "/api/settings")
-	if body["board_airport"] != "" || len(body) != 12 {
+	if body["board_airport"] != "" || len(body) != 15 {
 		t.Errorf("GET = %v", body)
 	}
 	rec, body := put(t, h, `{"board_airport":"lemg"}`)
@@ -1034,5 +1034,22 @@ func TestLimitsEndpointWithoutSource(t *testing.T) {
 	svcs, ok := body["services"].([]any)
 	if code.Code != http.StatusOK || !ok || len(svcs) != 0 {
 		t.Fatalf("code=%d body=%v", code.Code, body)
+	}
+}
+
+func TestSettings_CapKeysRoundTrip(t *testing.T) {
+	st := &fakeStore{s: settings.Settings{RadiusKm: 10, AirLabsCallsPerMonth: 900}}
+	h := NewHandler(&fakeSource{at: time.Now()}, st, &fakeStats{}, nil, time.Now)
+	rec, body := put(t, h, `{"airlabs_calls_per_month":500,"adsbdb_calls_per_day":2000,"hexdb_calls_per_day":300}`)
+	if rec.Code != 200 || body["airlabs_calls_per_month"] != 500.0 || body["adsbdb_calls_per_day"] != 2000.0 ||
+		body["hexdb_calls_per_day"] != 300.0 || body["radius_km"] != 10.0 {
+		t.Fatalf("PUT = %d %v", rec.Code, body)
+	}
+	rec, body = put(t, h, `{"radius_km":12}`)
+	if rec.Code != 200 || body["airlabs_calls_per_month"] != 500.0 {
+		t.Errorf("a patch without the caps must keep them: %d %v", rec.Code, body)
+	}
+	if rec, _ = put(t, h, `{"hexdb_calls_per_day":-1}`); rec.Code != 400 {
+		t.Errorf("negative cap should be 400, got %d", rec.Code)
 	}
 }

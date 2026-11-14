@@ -5,7 +5,18 @@
 (function () {
   const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   const hm = (iso) => new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-  const dm = (iso) => new Date(iso).toLocaleDateString([], { day: 'numeric', month: 'short' });
+  // Dates read "14 Nov" whatever the browser locale, like the page's other
+  // en-GB stamps; times stay local.
+  const dm = (d) => new Date(d).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
+  // The cap of a month resets on the 1st (UTC) of the next one.
+  const nextMonth = (iso) => { const d = new Date(iso); return Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1); };
+
+  function fmtEvery(sec) {
+    const m = Math.round(sec / 60);
+    const h = Math.floor(m / 60);
+    if (!h) return `${m} min`;
+    return m % 60 ? `${h} h ${m % 60} min` : `${h} h`;
+  }
   const fmt = (n) => Number(n || 0).toLocaleString();
 
   function usageText(s) {
@@ -13,6 +24,20 @@
     const period = s.period === 'month' ? 'this month' : 'today';
     let out = s.capped ? `${fmt(s.used)} / ${fmt(s.cap)} ${period}` : `${fmt(s.calls)} calls today · no cap`;
     if (s.poll_s) out += ` · polled every ${s.poll_s} s`;
+    if (s.refresh_s) out += ` · refreshes every ${fmtEvery(s.refresh_s)}`;
+    return out;
+  }
+
+  // usageNote is the short line beside a cap field on the settings page.
+  function usageNote(s) {
+    if (!s.enabled) return 'not configured';
+    const period = s.period === 'month' ? 'this month' : 'today';
+    let out = `${fmt(s.capped ? s.used : s.calls)} used ${period}`;
+    if (!s.capped) return `${out} · no cap`;
+    if (s.state === 'cap_reached') {
+      return s.period === 'month' && s.state_since ? `${out} · cap reached, resumes ${dm(nextMonth(s.state_since))}` : `${out} · cap reached`;
+    }
+    if (s.refresh_s) out += ` · refreshes every ${fmtEvery(s.refresh_s)}`;
     return out;
   }
 
@@ -24,7 +49,9 @@
       case 'cap_reached':
         if (!s.state_since) return 'Cap reached';
         // A monthly cap stays reached for weeks, so the day matters there.
-        return s.period === 'month' ? `Cap reached on ${dm(s.state_since)} ${hm(s.state_since)}` : `Cap reached at ${hm(s.state_since)}`;
+        return s.period === 'month'
+          ? `Cap reached on ${dm(s.state_since)} ${hm(s.state_since)} · resumes ${dm(nextMonth(s.state_since))}`
+          : `Cap reached at ${hm(s.state_since)}`;
       default: return 'OK';
     }
   }
@@ -62,5 +89,5 @@
     el.innerHTML = `<thead><tr><th>Service</th><th>Usage</th><th>State</th><th>Refused today</th><th>Errors today</th></tr></thead><tbody>${rows}</tbody>`;
   }
 
-  globalThis.Limits = { limitRow, renderLimits };
+  globalThis.Limits = { limitRow, renderLimits, usageNote };
 })();

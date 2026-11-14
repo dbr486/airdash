@@ -39,8 +39,7 @@ test('a monthly cap reached names the day', () => {
   const at = '2026-11-14T09:28:00Z';
   const r = L.limitRow({ ...base, capped: true, period: 'month', used: 900, cap: 900, state: 'cap_reached', state_since: at });
   assert.equal(r.usage, '900 / 900 this month');
-  const day = new Date(at).toLocaleDateString([], { day: 'numeric', month: 'short' });
-  assert.equal(r.state, `Cap reached on ${day} ${hm(at)}`);
+  assert.equal(r.state, `Cap reached on 14 Nov ${hm(at)} · resumes 1 Dec`);
 });
 
 test('an off service is not flagged', () => {
@@ -78,4 +77,27 @@ test('a zero allowance on a capped service is not "no cap"', () => {
   const r = L.limitRow({ ...base, capped: true, used: 0, cap: 0, state: 'cap_reached' });
   assert.equal(r.usage, '0 / 0 today');
   assert.equal(r.state, 'Cap reached');
+});
+
+test('AirLabs usage shows the automatic refresh interval', () => {
+  const r = L.limitRow({ ...base, capped: true, period: 'month', used: 54, cap: 900, refresh_s: 5760 });
+  assert.equal(r.usage, '54 / 900 this month · refreshes every 1 h 36 min');
+  assert.equal(L.limitRow({ ...base, capped: true, period: 'month', used: 1, cap: 100000, refresh_s: 900 }).usage,
+    '1 / 100,000 this month · refreshes every 15 min');
+});
+
+test('a monthly cap reached says when it resumes', () => {
+  const at = '2026-11-14T09:28:00Z';
+  const r = L.limitRow({ ...base, capped: true, period: 'month', used: 900, cap: 900, state: 'cap_reached', state_since: at });
+  assert.match(r.state, / · resumes 1 Dec$/);
+});
+
+test('usageNote for the settings page', () => {
+  assert.equal(L.usageNote({ ...base, calls: 412, used: 412 }), '412 used today · no cap');
+  assert.equal(L.usageNote({ ...base, capped: true, used: 12, cap: 65 }), '12 used today');
+  assert.equal(L.usageNote({ ...base, capped: true, period: 'month', used: 54, cap: 900, refresh_s: 5760 }),
+    '54 used this month · refreshes every 1 h 36 min');
+  assert.equal(L.usageNote({ ...base, capped: true, period: 'month', used: 900, cap: 900, state: 'cap_reached', state_since: '2026-11-14T09:28:00Z' }),
+    '900 used this month · cap reached, resumes 1 Dec');
+  assert.equal(L.usageNote({ ...base, enabled: false, state: 'off' }), 'not configured');
 });

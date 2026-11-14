@@ -28,7 +28,15 @@ type Limit struct {
 	// Blocked returns why calls are refused below the cap ("" if not), e.g.
 	// a paid counter that fails closed because it cannot be saved.
 	Blocked func() string
-	PollS   int
+	// ZeroCapIsNone makes a cap of 0 mean "no cap" (the free sources)
+	// rather than a zero allowance (FlightAware's 0 turns it off).
+	ZeroCapIsNone bool
+	// Exhausted reports a cap that is spent before used reaches it, e.g. the
+	// board needing two calls per refresh with one left.
+	Exhausted func() bool
+	// RefreshEvery is the AirLabs board's current refresh interval.
+	RefreshEvery func() time.Duration
+	PollS        int
 }
 
 // Service is one row of GET /api/limits.
@@ -51,6 +59,7 @@ type Service struct {
 	Errors       int          `json:"errors"`
 	RecentErrors []ErrorEvent `json:"recent_errors"`
 	PollS        int          `json:"poll_s,omitempty"`
+	RefreshS     int          `json:"refresh_s,omitempty"`
 }
 
 type entry struct {
@@ -105,7 +114,10 @@ func (r *Registry) Report() []Service {
 		var hitAt time.Time
 		if e.l.Used != nil {
 			s.Used, s.Cap, hitAt = e.l.Used()
-			s.Capped = true
+			s.Capped = s.Cap > 0 || !e.l.ZeroCapIsNone
+		}
+		if e.l.RefreshEvery != nil {
+			s.RefreshS = int(e.l.RefreshEvery().Seconds())
 		}
 		var until time.Time
 		if e.l.PausedUntil != nil {
@@ -122,7 +134,7 @@ func (r *Registry) Report() []Service {
 			s.State, s.StateReason = "blocked", blocked
 		case until.After(now):
 			s.State, s.StateUntil = "paused", &until
-		case s.Capped && s.Used >= s.Cap:
+		case s.Capped && (s.Used >= s.Cap || (e.l.Exhausted != nil && e.l.Exhausted())):
 			s.State = "cap_reached"
 			if !hitAt.IsZero() {
 				s.StateSince = &hitAt

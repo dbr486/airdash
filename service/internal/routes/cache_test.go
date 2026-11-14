@@ -3,8 +3,11 @@ package routes
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
+
+	"airdash/internal/usage"
 )
 
 const testCooldown = 30 * time.Second
@@ -154,5 +157,19 @@ func TestCache_GateRejectionStartsNoCooldown(t *testing.T) {
 	}
 	if inner.calls != 2 {
 		t.Errorf("inner called %d times, want 2", inner.calls)
+	}
+}
+
+// A cap refusal made no upstream call and must not hide the callsign for a
+// cooldown: a raised cap works on the very next lookup.
+func TestCache_CapRefusalIsNotCached(t *testing.T) {
+	inner := &fakeLookup{err: fmt.Errorf("adsbdb: %w", usage.ErrCapReached)}
+	c := NewCache(inner, 6*time.Hour, time.Hour, testCooldown, (&clock{t: time.Now()}).now)
+	if _, _, err := c.Route(t.Context(), "BAW466"); !errors.Is(err, usage.ErrCapReached) {
+		t.Fatalf("err = %v", err)
+	}
+	inner.err, inner.ok = nil, true
+	if _, ok, err := c.Route(t.Context(), "BAW466"); err != nil || !ok || inner.calls != 2 {
+		t.Fatalf("second lookup ok=%v err=%v calls=%d", ok, err, inner.calls)
 	}
 }

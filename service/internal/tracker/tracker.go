@@ -20,6 +20,7 @@ import (
 	"airdash/internal/provider"
 	"airdash/internal/routes"
 	"airdash/internal/standing"
+	"airdash/internal/usage"
 )
 
 type Snapshot struct {
@@ -281,14 +282,18 @@ func (t *Tracker) Tick(ctx context.Context) {
 				// A cooldown hit is a consequence of an earlier failure,
 				// not a new one; only a fresh error should (re)trigger the
 				// failing/recovered transition below.
-				if errors.Is(err, routes.ErrCooldown) {
+				if errors.Is(err, routes.ErrCooldown) || errors.Is(err, usage.ErrCapReached) {
 					routeSuppressed = true
 				} else if routeErr == nil {
 					routeErr = err
 				}
-				c.trace.adsbdb.Status = StatusError
-				if errors.Is(err, routes.ErrCooldown) {
+				switch {
+				case errors.Is(err, usage.ErrCapReached):
+					c.trace.adsbdb.Status = StatusSkipped
+				case errors.Is(err, routes.ErrCooldown):
 					c.trace.adsbdb.Status = StatusCooldown
+				default:
+					c.trace.adsbdb.Status = StatusError
 				}
 			} else {
 				c.route, c.known = r, ok
@@ -666,6 +671,8 @@ func (t *Tracker) askFallback(fallbackCtx func() context.Context, c *candidate) 
 	r, ok, err := t.o.FallbackRoutes.Route(ctx, c.ac.Callsign)
 	switch {
 	case err != nil && ctx.Err() != nil:
+		c.trace.hexdb.Status = StatusSkipped
+	case errors.Is(err, usage.ErrCapReached):
 		c.trace.hexdb.Status = StatusSkipped
 	case errors.Is(err, routes.ErrCooldown):
 		c.trace.hexdb.Status = StatusCooldown

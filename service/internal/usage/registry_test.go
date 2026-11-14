@@ -133,3 +133,39 @@ func TestReportZeroCapIsCappedAndReached(t *testing.T) {
 		t.Errorf("uncapped row = %+v", got[1])
 	}
 }
+
+func TestReportFreeCap(t *testing.T) {
+	clk := newClock("2026-11-02T12:00:00Z")
+	limit, used := 0, 5
+	r := NewRegistry(clk.now, nil)
+	r.Add("hexdb", "hexdb", NewMeter(clk.now), Limit{Enabled: true, ZeroCapIsNone: true,
+		Used: func() (int, int, time.Time) { return used, limit, time.Time{} }})
+	if s := r.Report()[0]; s.Capped || s.State != "ok" {
+		t.Errorf("cap 0 = no cap: %+v", s)
+	}
+	limit = 5
+	if s := r.Report()[0]; !s.Capped || s.State != "cap_reached" || s.Cap != 5 {
+		t.Errorf("cap 5 used 5: %+v", s)
+	}
+}
+
+func TestReportRefreshS(t *testing.T) {
+	r := NewRegistry(time.Now, nil)
+	r.Add("airlabs", "AirLabs", NewMeter(time.Now), Limit{Enabled: true, Period: "month",
+		RefreshEvery: func() time.Duration { return 96 * time.Minute }})
+	if s := r.Report()[0]; s.RefreshS != 5760 {
+		t.Errorf("refresh_s = %d", s.RefreshS)
+	}
+}
+
+// AirLabs spends calls in pairs: with one call left (a cap of 1, or 901
+// after 900) the board cannot refresh, and the row must say so.
+func TestReportExhaustedBelowCap(t *testing.T) {
+	r := NewRegistry(time.Now, nil)
+	r.Add("airlabs", "AirLabs", NewMeter(time.Now), Limit{Enabled: true, Period: "month",
+		Used:      func() (int, int, time.Time) { return 900, 901, time.Time{} },
+		Exhausted: func() bool { return true }})
+	if s := r.Report()[0]; s.State != "cap_reached" {
+		t.Fatalf("row = %+v", s)
+	}
+}
