@@ -2,6 +2,10 @@
 
 A tiny desk display that shows the aircraft flying closest to your home:
 callsign, airline logo, route, altitude, distance and whether it's on time.
+The same live screen also works as a **Home Assistant dashboard widget**,
+with or without the hardware.
+The same live screen also works as a **Home Assistant dashboard widget**,
+with or without the hardware.
 
 [![ci](https://github.com/dbr486/airdash/actions/workflows/ci.yml/badge.svg)](https://github.com/dbr486/airdash/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -16,7 +20,8 @@ callsign, airline logo, route, altitude, distance and whether it's on time.
 - Route as airport codes or city names, with the airline's logo
 - Optional on-time / delayed status (FlightAware AeroAPI and/or an AirLabs airport board)
 - A web page that mirrors the display and edits every setting live, including an address lookup for home
-- A Home Assistant widget and REST sensor snippet
+- A Home Assistant widget: the live screen in a dashboard card (optionally
+  with Refresh / Next buttons), plus a REST sensor for automations
 - Two boards from one codebase: LILYGO T-Display and M5Stack StickS3
 
 ## Hardware
@@ -142,14 +147,33 @@ You are responsible for any charges on your keys; see
 
 ## Home Assistant
 
-`/widget` (on the UI port) is the screen alone, sized to whatever box it
-is given, for Home Assistant's Webpage (iframe) card. The settings page's
-"Home Assistant" section shows the card YAML for your deployment with a
-copy button, plus an optional REST sensor snippet exposing the nearest
-aircraft's fields as attributes. `?controls=1` adds the Refresh and Next
-buttons under the screen (give the card a little extra height then; the
-aspect ratio only covers the screen). An HTTPS Home Assistant cannot
-embed an HTTP iframe; use the sensor then.
+AirDash can show the same screen on a Home Assistant dashboard. You only
+need the service and web UI running; the physical display is optional.
+
+**Widget card.** `http://<server>:3000/widget` is the screen on its own,
+scaled to fit whatever box it is given. Open the settings page, scroll to
+its "Home Assistant" section and press **Copy card YAML**. Then in Home
+Assistant go to Edit dashboard → Add card → Manual and paste it. The
+snippet uses your deployment's address and looks like this:
+
+    type: iframe
+    url: http://<server>:3000/widget
+    aspect_ratio: 56.25%
+    title: AirDash
+
+Add `?controls=1` to the URL for Refresh and Next buttons under the
+screen. Give the card some extra height if you do (for example
+`aspect_ratio: 70%`), because 56.25% only fits the screen.
+
+**REST sensor.** The same section has a **Copy sensor YAML** button for a
+`rest:` sensor in `configuration.yaml`. It polls `/api/nearest` every 10 s.
+Its state is the nearest aircraft's callsign (or `none`) and its
+attributes are airline, origin, dest, alt_ft, gs_kt, dist_km, bearing,
+nearby and delay. Use it in automations, templates or a Markdown card.
+
+**HTTPS.** A Home Assistant served over HTTPS can't embed the HTTP widget
+because the browser blocks mixed content. Use the REST sensor there
+instead, or serve AirDash behind an HTTPS reverse proxy.
 
 ## Running without Docker
 
