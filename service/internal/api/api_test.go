@@ -836,6 +836,14 @@ func (f *fakeSourceLog) Disagreements(ctx context.Context, days, limit int) ([]s
 	return []sourcelog.Pass{{Hex: "def"}}, f.err
 }
 
+func (f *fakeSourceLog) Responses(ctx context.Context, source, subject string, before time.Time, limit int) ([]sourcelog.ResponseMeta, error) {
+	return []sourcelog.ResponseMeta{}, f.err
+}
+
+func (f *fakeSourceLog) Response(ctx context.Context, id int64) (sourcelog.ResponseMeta, []byte, bool, error) {
+	return sourcelog.ResponseMeta{}, nil, false, f.err
+}
+
 func TestSources_Endpoints(t *testing.T) {
 	sl := &fakeSourceLog{}
 	h := NewHandler(&fakeSource{at: time.Now()}, store(10), &fakeStats{}, nil, time.Now, WithSourceLog(sl))
@@ -875,6 +883,111 @@ func TestSources_Endpoints(t *testing.T) {
 	for _, p := range []string{"/api/sources/summary", "/api/sources/passes", "/api/sources/disagreements"} {
 		if rec, _ := get(t, plain, p); rec.Code != 404 {
 			t.Errorf("%s without a log: want 404, got %d", p, rec.Code)
+		}
+	}
+}
+
+// respLog adds the captured-response methods to fakeSourceLog.
+type respLog struct {
+	fakeSourceLog
+	source, subject string
+	rBefore         time.Time
+	rLimit          int
+	meta            sourcelog.ResponseMeta
+	body            []byte
+	found           bool
+}
+
+func (f *respLog) Responses(ctx context.Context, source, subject string, before time.Time, limit int) ([]sourcelog.ResponseMeta, error) {
+	f.source, f.subject, f.rBefore, f.rLimit = source, subject, before, limit
+	return []sourcelog.ResponseMeta{f.meta}, f.err
+}
+
+func (f *respLog) Response(ctx context.Context, id int64) (sourcelog.ResponseMeta, []byte, bool, error) {
+	if !f.found || id != f.meta.ID {
+		return sourcelog.ResponseMeta{}, nil, false, f.err
+	}
+	return f.meta, f.body, true, f.err
+}
+
+func newRespLog(ct string, body string) *respLog {
+	return &respLog{
+		meta:  sourcelog.ResponseMeta{ID: 7, Source: "adsbdb", Subject: "RYR5EL", URL: "https://api.example/x", Status: 200, ContentType: ct, FetchedAt: 1700000000, Size: len(body)},
+		body:  []byte(body),
+		found: true,
+	}
+}
+
+func TestSourcesResponses_List(t *testing.T) {
+	sl := newRespLog("application/json", `{}`)
+	h := NewHandler(&fakeSource{at: time.Now()}, store(10), &fakeStats{}, nil, time.Now, WithSourceLog(sl))
+	rec, body := get(t, h, "/api/sources/responses?source=adsbdb&subject=RYR5EL&before=1700000000")
+	if rec.Code != 200 || len(body["responses"].([]any)) != 1 {
+		t.Fatalf("code=%d body=%v", rec.Code, body)
+	}
+	if sl.source != "adsbdb" || sl.subject != "RYR5EL" || sl.rBefore.Unix() != 1700000000 || sl.rLimit != 20 {
+		t.Errorf("fake saw %q %q %v %d", sl.source, sl.subject, sl.rBefore, sl.rLimit)
+	}
+}
+
+func TestSourcesResponses_RequiresSource(t *testing.T) {
+	h := NewHandler(&fakeSource{at: time.Now()}, store(10), &fakeStats{}, nil, time.Now, WithSourceLog(newRespLog("application/json", `{}`)))
+	if rec, _ := get(t, h, "/api/sources/responses"); rec.Code != 400 {
+		t.Errorf("want 400, got %d", rec.Code)
+	}
+}
+
+func TestSourcesResponses_Detail(t *testing.T) {
+	sl := newRespLog("application/json", `{"a":1}`)
+	h := NewHandler(&fakeSource{at: time.Now()}, store(10), &fakeStats{}, nil, time.Now, WithSourceLog(sl))
+	rec, body := get(t, h, "/api/sources/responses/7")
+	if rec.Code != 200 || body["body"] != `{"a":1}` || body["source"] != "adsbdb" {
+		t.Fatalf("code=%d body=%v", rec.Code, body)
+	}
+	if u, _ := body["url"].(string); u != "https://api.example/x" || strings.Contains(u, "api_key") {
+		t.Errorf("url = %q", u)
+	}
+}
+
+func TestSourcesResponses_DetailNotFoundAndBadID(t *testing.T) {
+	h := NewHandler(&fakeSource{at: time.Now()}, store(10), &fakeStats{}, nil, time.Now, WithSourceLog(newRespLog("application/json", `{}`)))
+	if rec, _ := get(t, h, "/api/sources/responses/99"); rec.Code != 404 {
+		t.Errorf("unknown id: want 404, got %d", rec.Code)
+	}
+	for _, p := range []string{"/api/sources/responses/abc", "/api/sources/responses/abc/raw"} {
+		if rec, _ := get(t, h, p); rec.Code != 400 {
+			t.Errorf("%s: want 400, got %d", p, rec.Code)
+		}
+	}
+	if rec, _ := get(t, h, "/api/sources/responses/99/raw"); rec.Code != 404 {
+		t.Errorf("raw unknown id: want 404, got %d", rec.Code)
+	}
+}
+
+func TestSourcesResponses_RawHeaders(t *testing.T) {
+	for _, tc := range []struct{ stored, want string }{
+		{"text/html", "text/plain; charset=utf-8"},
+		{"application/json; charset=utf-8", "application/json"},
+	} {
+		h := NewHandler(&fakeSource{at: time.Now()}, store(10), &fakeStats{}, nil, time.Now, WithSourceLog(newRespLog(tc.stored, `{"hi":1}`)))
+		rec, _ := get(t, h, "/api/sources/responses/7/raw")
+		if rec.Code != 200 || rec.Body.String() != `{"hi":1}` {
+			t.Fatalf("%s: code=%d body=%q", tc.stored, rec.Code, rec.Body.String())
+		}
+		if got := rec.Header().Get("Content-Type"); got != tc.want {
+			t.Errorf("%s: content-type %q, want %q", tc.stored, got, tc.want)
+		}
+		if rec.Header().Get("X-Content-Type-Options") != "nosniff" || rec.Header().Get("Content-Security-Policy") != "sandbox" {
+			t.Errorf("%s: missing hardening headers: %v", tc.stored, rec.Header())
+		}
+	}
+}
+
+func TestSourcesResponses_OffIs404(t *testing.T) {
+	h := NewHandler(&fakeSource{at: time.Now()}, store(10), &fakeStats{}, nil, time.Now)
+	for _, p := range []string{"/api/sources/responses?source=x", "/api/sources/responses/7", "/api/sources/responses/7/raw"} {
+		if rec, _ := get(t, h, p); rec.Code != 404 {
+			t.Errorf("%s: want 404, got %d", p, rec.Code)
 		}
 	}
 }

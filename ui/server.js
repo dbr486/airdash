@@ -59,10 +59,14 @@ export function createApp({ apiBase, logger = console.log } = {}) {
       // Logos are immutable per airline, so let the browser cache them as
       // the service says; everything else is live data and stays no-store.
       const cache = req.url.startsWith('/logo/') && up.headers.get('cache-control') ? up.headers.get('cache-control') : 'no-store';
-      res.status(up.status)
-        .set('Cache-Control', cache)
-        .type(up.headers.get('content-type') ?? 'application/json')
-        .send(body);
+      res.status(up.status).set('Cache-Control', cache);
+      // The raw-response view serves upstream bytes as-is; the service's
+      // sniffing and sandbox guards must survive the hop to this origin.
+      for (const h of ['x-content-type-options', 'content-security-policy']) {
+        const v = up.headers.get(h);
+        if (v) res.set(h, v);
+      }
+      res.type(up.headers.get('content-type') ?? 'application/json').send(body);
     } catch (err) {
       // Every poll hits this proxy, so log only the transition into the
       // down state, not every failed request while it stays down.

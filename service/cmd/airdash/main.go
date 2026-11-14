@@ -18,6 +18,7 @@ import (
 
 	"airdash/internal/api"
 	"airdash/internal/board"
+	"airdash/internal/capture"
 	"airdash/internal/config"
 	"airdash/internal/flightstatus"
 	"airdash/internal/geocode"
@@ -65,12 +66,37 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	// The source log is a diagnostic: a file that cannot be opened turns it
+	// off with a warning rather than keeping the display from starting. It
+	// opens before the clients because they capture into it.
+	var srcLog *sourcelog.Log
+	// sink stays a nil interface unless the log opened; assigning a nil *Log
+	// would make the capture wrapper's nil check pass and then panic.
+	var sink capture.Sink
+	if cfg.SourceLogFile != "" {
+		if l, err := sourcelog.Open(cfg.SourceLogFile, time.Now, logger); err != nil {
+			logger.Warn("route source log disabled", "file", cfg.SourceLogFile, "err", err)
+		} else {
+			srcLog = l
+			sink = l
+			logger.Info("route source log enabled", "file", cfg.SourceLogFile)
+		}
+	}
+	apiOpts := []api.Option{api.WithGeocoder(geocode.New(client, geocode.DefaultURL, userAgent+" +https://github.com/dbr486/airdash", time.Now))}
+	// Only the route and board lookups are captured: they are the answers the
+	// source comparison can disagree about, and the raw body is what explains
+	// a disagreement. Owner, logo, geocoder and position traffic is either
+	// not part of that comparison or not JSON worth keeping.
+	adsbdbClient := capture.Wrap(client, sink, tracker.SourceADSBDB, capture.SubjectLastSegment, time.Now)
+	hexdbClient := capture.Wrap(client, sink, tracker.SourceHexDB, capture.SubjectHexDB, time.Now)
+	aeroClient := capture.Wrap(client, sink, tracker.SourceAeroAPI, capture.SubjectLastSegment, time.Now)
+	airlabsClient := capture.Wrap(client, sink, capture.SourceAirLabs, capture.SubjectAirLabs, time.Now)
 	logoSrc := logos.New(client, logos.DefaultBaseURL, userAgent, time.Now)
 	lookup := routes.NewCache(
-		routes.NewADSBDB(client, routes.DefaultADSBDBURL, userAgent),
+		routes.NewADSBDB(adsbdbClient, routes.DefaultADSBDBURL, userAgent),
 		cfg.RouteCacheTTL, time.Hour, routeErrorCooldown, time.Now)
 	fallbackRoutes := routes.NewCache(
-		routes.NewHexDB(client, routes.DefaultHexDBURL, userAgent, time.Now),
+		routes.NewHexDB(hexdbClient, routes.DefaultHexDBURL, userAgent, time.Now),
 		cfg.RouteCacheTTL, time.Hour, routeErrorCooldown, time.Now)
 
 	// Owner answers change rarely, so known ones are cached for a week;
@@ -106,7 +132,7 @@ func run() error {
 	if cfg.AeroAPIKey != "" {
 		budget = flightstatus.NewBudget(func() int { return cur.Settings().DelayLookupsPerDay }, time.Now, logger)
 		aero = flightstatus.NewCache(
-			flightstatus.NewBudgeted(flightstatus.NewAeroAPI(client, cfg.AeroAPIURL, cfg.AeroAPIKey, userAgent), budget),
+			flightstatus.NewBudgeted(flightstatus.NewAeroAPI(aeroClient, cfg.AeroAPIURL, cfg.AeroAPIKey, userAgent), budget),
 			15*time.Minute, 15*time.Minute, time.Minute, time.Now)
 		delay = aero
 		logger.Info("delay lookups enabled", "source", "aeroapi", "cap", cur.Settings().DelayLookupsPerDay)
@@ -118,7 +144,7 @@ func run() error {
 	// never spends a paid lookup.
 	var brd *board.Board
 	if cfg.AirLabsKey != "" {
-		brd = board.New(board.NewAirLabs(client, board.DefaultAirLabsURL, cfg.AirLabsKey, userAgent), cfg.BoardCallsPerMonth, 2*cfg.BoardRefresh, time.Now, logger)
+		brd = board.New(board.NewAirLabs(airlabsClient, board.DefaultAirLabsURL, cfg.AirLabsKey, userAgent), cfg.BoardCallsPerMonth, 2*cfg.BoardRefresh, time.Now, logger)
 		if cfg.SettingsFile != "" {
 			// The month's call count lives next to the settings so a redeploy
 			// cannot reset it and overrun the key's quota.
@@ -146,19 +172,9 @@ func run() error {
 	if aero != nil {
 		opts.Flights = aero
 	}
-	// The source log is a diagnostic: a file that cannot be opened turns it
-	// off with a warning rather than keeping the display from starting.
-	var srcLog *sourcelog.Log
-	apiOpts := []api.Option{api.WithGeocoder(geocode.New(client, geocode.DefaultURL, userAgent+" +https://github.com/dbr486/airdash", time.Now))}
-	if cfg.SourceLogFile != "" {
-		if l, err := sourcelog.Open(cfg.SourceLogFile, time.Now, logger); err != nil {
-			logger.Warn("route source log disabled", "file", cfg.SourceLogFile, "err", err)
-		} else {
-			srcLog = l
-			opts.Recorder = l
-			apiOpts = append(apiOpts, api.WithSourceLog(l))
-			logger.Info("route source log enabled", "file", cfg.SourceLogFile)
-		}
+	if srcLog != nil {
+		opts.Recorder = srcLog
+		apiOpts = append(apiOpts, api.WithSourceLog(srcLog))
 	}
 	tr := tracker.New(opts)
 

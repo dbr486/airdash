@@ -24,6 +24,10 @@ before(async () => {
       } else if (req.url === '/api/sources/summary?days=7') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end('{"days":[],"totals":{"passes":0}}');
+      } else if (req.url === '/api/sources/responses/1/raw') {
+        res.writeHead(200, { 'Content-Type': 'text/html', 'X-Content-Type-Options': 'nosniff',
+          'Content-Security-Policy': "default-src 'none'; sandbox" });
+        res.end('<b>raw</b>');
       } else if (req.url === '/api/logo/BA') {
         res.writeHead(200, { 'Content-Type': 'image/png', 'Cache-Control': 'public, max-age=86400' });
         res.end(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0xff, 0xfe, 0x0d, 0x0a]));
@@ -192,4 +196,17 @@ test('proxies the route source log with its query string', async () => {
   assert.equal(res.status, 200);
   assert.equal(res.headers.get('cache-control'), 'no-store');
   assert.deepEqual(await res.json(), { days: [], totals: { passes: 0 } });
+});
+
+test('passes the raw response safety headers through', async () => {
+  const res = await fetch(`${appUrl}/api/sources/responses/1/raw`);
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get('x-content-type-options'), 'nosniff');
+  assert.equal(res.headers.get('content-security-policy'), "default-src 'none'; sandbox");
+  assert.equal(await res.text(), '<b>raw</b>');
+});
+
+test('omits the safety headers when the service does not send them', async () => {
+  const res = await fetch(`${appUrl}/api/nearest`);
+  assert.equal(res.headers.get('content-security-policy'), null);
 });

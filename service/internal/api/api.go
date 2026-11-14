@@ -54,6 +54,8 @@ type SourceLog interface {
 	Summary(ctx context.Context, days int) (sourcelog.Summary, error)
 	Passes(ctx context.Context, limit int, before time.Time, beforeHex string) ([]sourcelog.Pass, error)
 	Disagreements(ctx context.Context, days, limit int) ([]sourcelog.Pass, error)
+	Responses(ctx context.Context, source, subject string, before time.Time, limit int) ([]sourcelog.ResponseMeta, error)
+	Response(ctx context.Context, id int64) (sourcelog.ResponseMeta, []byte, bool, error)
 }
 
 // LogoSource serves airline logos by IATA code; nil disables the endpoint.
@@ -98,13 +100,16 @@ func NewHandler(src Source, st SettingsStore, stats StatsSource, logos LogoSourc
 	mux.HandleFunc("GET /api/sources/summary", h.sourcesSummary)
 	mux.HandleFunc("GET /api/sources/passes", h.sourcesPasses)
 	mux.HandleFunc("GET /api/sources/disagreements", h.sourcesDisagreements)
+	mux.HandleFunc("GET /api/sources/responses", h.sourcesResponses)
+	mux.HandleFunc("GET /api/sources/responses/{id}", h.sourcesResponse)
+	mux.HandleFunc("GET /api/sources/responses/{id}/raw", h.sourcesResponseRaw)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		_, _ = w.Write([]byte("ok"))
 	})
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
-		_, _ = w.Write([]byte("airdash: GET /api/nearest for the closest aircraft, GET/PUT /api/settings for filters, GET /api/stats for delay lookup usage, GET /api/sources/{summary,passes,disagreements} for the route source log\n"))
+		_, _ = w.Write([]byte("airdash: GET /api/nearest for the closest aircraft, GET/PUT /api/settings for filters, GET /api/stats for delay lookup usage, GET /api/sources/{summary,passes,disagreements,responses} for the route source log\n"))
 	})
 	return mux
 }
@@ -579,4 +584,88 @@ func (h *handler) sourcesDisagreements(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, passes(ps))
+}
+
+func (h *handler) sourcesResponses(w http.ResponseWriter, r *http.Request) {
+	if !h.sourcesReady(w) {
+		return
+	}
+	q := r.URL.Query()
+	source := q.Get("source")
+	if source == "" {
+		writeError(w, http.StatusBadRequest, "source is required")
+		return
+	}
+	limit, ok := intParam(w, r, "limit", 20)
+	if !ok {
+		return
+	}
+	beforeUnix, ok := intParam(w, r, "before", 0)
+	if !ok {
+		return
+	}
+	var before time.Time
+	if beforeUnix > 0 {
+		before = time.Unix(int64(beforeUnix), 0)
+	}
+	rs, err := h.sources.Responses(r.Context(), source, q.Get("subject"), before, limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "source log unavailable")
+		return
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Responses []sourcelog.ResponseMeta `json:"responses"`
+	}{rs})
+}
+
+// responseByID resolves the {id} path value to a stored response, writing the
+// error reply itself when it cannot.
+func (h *handler) responseByID(w http.ResponseWriter, r *http.Request) (sourcelog.ResponseMeta, []byte, bool) {
+	if !h.sourcesReady(w) {
+		return sourcelog.ResponseMeta{}, nil, false
+	}
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "id must be an integer")
+		return sourcelog.ResponseMeta{}, nil, false
+	}
+	meta, body, found, err := h.sources.Response(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "source log unavailable")
+		return sourcelog.ResponseMeta{}, nil, false
+	}
+	if !found {
+		writeError(w, http.StatusNotFound, "response not found")
+		return sourcelog.ResponseMeta{}, nil, false
+	}
+	return meta, body, true
+}
+
+func (h *handler) sourcesResponse(w http.ResponseWriter, r *http.Request) {
+	meta, body, ok := h.responseByID(w, r)
+	if !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, struct {
+		sourcelog.ResponseMeta
+		Body string `json:"body"`
+	}{meta, string(body)})
+}
+
+// sourcesResponseRaw is proxied onto the dashboard's own origin and upstream
+// can return HTML error pages, so anything that is not JSON is forced to
+// plain text and sandboxed; otherwise a stored page could run script there.
+func (h *handler) sourcesResponseRaw(w http.ResponseWriter, r *http.Request) {
+	meta, body, ok := h.responseByID(w, r)
+	if !ok {
+		return
+	}
+	ct := "text/plain; charset=utf-8"
+	if strings.Contains(strings.ToLower(meta.ContentType), "json") {
+		ct = "application/json"
+	}
+	w.Header().Set("Content-Type", ct)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Security-Policy", "sandbox")
+	_, _ = w.Write(body)
 }

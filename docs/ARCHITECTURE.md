@@ -90,6 +90,21 @@ Wiring is in `cmd/airdash/main.go`; each package has one job.
    is never replaced by a later miss) and prunes rows older than 90 days.
    `GET /api/sources/summary`, `/passes` and `/disagreements` serve it.
 
+   The same database also keeps the raw answers: the HTTP clients of adsbdb,
+   hexdb, AeroAPI and AirLabs are wrapped by `capture`, which stores each
+   response body (gzip, in `sources.db`) with its status and fetch time. The
+   body is copied as the client reads it, so capture never delays a lookup;
+   bodies over 4 MiB or cut by a read error are not kept. The
+   API key is stripped from the stored URL and headers are never stored (only
+   the response's Content-Type is kept). AirLabs bodies are stored without
+   their `request` echo (which carries the key): only `response` and `error`
+   are kept, and a body that is not a JSON object is stored empty, since the
+   echo cannot be removed from it. AirLabs responses are pruned after 7 days (the board
+   refreshes constantly), the others after 90.
+   `GET /api/sources/responses?source=&subject=&before=&limit=` lists them
+   (newest first), `GET /api/sources/responses/{id}` returns one with its
+   metadata and `GET /api/sources/responses/{id}/raw` the stored body.
+
 7. **`logos`**: fetches the airline's square logo from the CDN, crops the
    wordmark out of its padding and fits it (`fit.go`). It serves RGB565 for
    the displays and PNG for the page, cached for a week.

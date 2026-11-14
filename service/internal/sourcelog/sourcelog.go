@@ -4,6 +4,8 @@
 package sourcelog
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"database/sql"
 	"fmt"
@@ -11,6 +13,7 @@ import (
 	"net/url"
 	"time"
 
+	"airdash/internal/capture"
 	"airdash/internal/tracker"
 
 	// Pure-Go driver: the image is built with CGO off on scratch.
@@ -21,6 +24,9 @@ const (
 	retention     = 90 * 24 * time.Hour
 	pruneInterval = time.Hour
 	queueSize     = 64
+	// The paid AirLabs board is queried per airport and its answers go stale
+	// fast; a week is enough to debug it without paying for storage.
+	boardRetention = 7 * 24 * time.Hour
 )
 
 const schema = `
@@ -49,6 +55,21 @@ CREATE TABLE IF NOT EXISTS passes (
 );
 CREATE INDEX IF NOT EXISTS passes_first_seen ON passes (first_seen);
 CREATE INDEX IF NOT EXISTS passes_callsign ON passes (callsign);
+
+-- body is gzip-compressed; size is the uncompressed length.
+CREATE TABLE IF NOT EXISTS responses (
+	id           INTEGER PRIMARY KEY,
+	source       TEXT    NOT NULL,
+	subject      TEXT    NOT NULL DEFAULT '',
+	fetched_at   INTEGER NOT NULL,
+	url          TEXT    NOT NULL,
+	status       INTEGER NOT NULL,
+	content_type TEXT    NOT NULL DEFAULT '',
+	size         INTEGER NOT NULL,
+	body         BLOB    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS responses_lookup ON responses (source, subject, fetched_at);
+CREATE INDEX IF NOT EXISTS responses_fetched ON responses (fetched_at);
 `
 
 // keepHit keeps a stored hit (status and route together) against a later
@@ -95,9 +116,15 @@ type Log struct {
 	now    func() time.Time
 	logger *slog.Logger
 	queue  chan []tracker.PassRecord
+	// responses is separate from queue so a burst of large captures cannot
+	// crowd out pass records.
+	responses chan capture.Response
 }
 
-var _ tracker.Recorder = (*Log)(nil)
+var (
+	_ tracker.Recorder = (*Log)(nil)
+	_ capture.Sink     = (*Log)(nil)
+)
 
 func Open(path string, now func() time.Time, logger *slog.Logger) (*Log, error) {
 	// The pragmas go in the DSN so every pooled connection gets them, not
@@ -120,7 +147,8 @@ func Open(path string, now func() time.Time, logger *slog.Logger) (*Log, error) 
 		db.Close()
 		return nil, fmt.Errorf("sourcelog: schema: %w", err)
 	}
-	return &Log{db: db, now: now, logger: logger, queue: make(chan []tracker.PassRecord, queueSize)}, nil
+	return &Log{db: db, now: now, logger: logger, queue: make(chan []tracker.PassRecord, queueSize),
+		responses: make(chan capture.Response, queueSize)}, nil
 }
 
 // Record hands a tick's batch to the writer. It never blocks: a full queue
@@ -137,6 +165,17 @@ func (l *Log) Record(recs []tracker.PassRecord) {
 	}
 }
 
+// Capture queues an upstream response for storage. It never blocks: it runs
+// on the lookup's goroutine, and a missing raw copy is cheaper than a slow
+// lookup.
+func (l *Log) Capture(r capture.Response) {
+	select {
+	case l.responses <- r:
+	default:
+		l.logger.Debug("source log response queue full; capture dropped", "source", r.Source, "subject", r.Subject)
+	}
+}
+
 // Run writes queued batches until ctx is done, then writes whatever is
 // still queued and returns, so a clean shutdown loses nothing. Call Close
 // only after Run has returned.
@@ -148,6 +187,8 @@ func (l *Log) Run(ctx context.Context) {
 		select {
 		case recs := <-l.queue:
 			l.writeLogged(recs)
+		case r := <-l.responses:
+			l.writeResponseLogged(r)
 		case <-tick.C:
 			l.pruneLogged()
 		case <-ctx.Done():
@@ -155,6 +196,8 @@ func (l *Log) Run(ctx context.Context) {
 				select {
 				case recs := <-l.queue:
 					l.writeLogged(recs)
+				case r := <-l.responses:
+					l.writeResponseLogged(r)
 				default:
 					return
 				}
@@ -168,6 +211,12 @@ func (l *Log) Close() error { return l.db.Close() }
 func (l *Log) writeLogged(recs []tracker.PassRecord) {
 	if err := l.write(recs); err != nil {
 		l.logger.Warn("source log write failed", "records", len(recs), "err", err)
+	}
+}
+
+func (l *Log) writeResponseLogged(r capture.Response) {
+	if err := l.writeResponse(r); err != nil {
+		l.logger.Warn("source log response write failed", "source", r.Source, "subject", r.Subject, "err", err)
 	}
 }
 
@@ -211,8 +260,34 @@ func (l *Log) write(recs []tracker.PassRecord) error {
 	return tx.Commit()
 }
 
+// writeResponse stores the body gzipped: route JSON is highly repetitive and
+// the log holds months of it. BestSpeed keeps the single writer cheap.
+func (l *Log) writeResponse(r capture.Response) error {
+	var buf bytes.Buffer
+	zw, err := gzip.NewWriterLevel(&buf, gzip.BestSpeed)
+	if err != nil {
+		return err
+	}
+	if _, err := zw.Write(r.Body); err != nil {
+		return err
+	}
+	if err := zw.Close(); err != nil {
+		return err
+	}
+	_, err = l.db.Exec(`INSERT INTO responses (source, subject, fetched_at, url, status, content_type, size, body)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		r.Source, r.Subject, r.FetchedAt.Unix(), r.URL, r.Status, r.ContentType, len(r.Body), buf.Bytes())
+	return err
+}
+
 func (l *Log) prune() error {
-	cutoff := l.now().Add(-retention).Unix()
-	_, err := l.db.Exec(`DELETE FROM passes WHERE first_seen < ?`, cutoff)
+	now := l.now()
+	if _, err := l.db.Exec(`DELETE FROM passes WHERE first_seen < ?`, now.Add(-retention).Unix()); err != nil {
+		return err
+	}
+	if _, err := l.db.Exec(`DELETE FROM responses WHERE source = ? AND fetched_at < ?`, capture.SourceAirLabs, now.Add(-boardRetention).Unix()); err != nil {
+		return err
+	}
+	_, err := l.db.Exec(`DELETE FROM responses WHERE fetched_at < ?`, now.Add(-retention).Unix())
 	return err
 }
