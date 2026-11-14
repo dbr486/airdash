@@ -1,0 +1,18 @@
+/* Uses the palette tokens from sources.css; load that first. */
+.jv { font:13px/1.5 var(--mono); }
+.jv summary { cursor:pointer; list-style-position:inside; padding:1px 0; }
+.jv summary:hover { background:#222220; }
+.jv-kids { margin-left:14px; padding-left:10px; border-left:1px solid var(--grid); }
+.jv-row { padding:1px 0 1px 15px; }
+.jv-key { color:var(--ink-2); }
+.jv-sep, .jv-mark { color:var(--muted); }
+.jv-count { color:var(--muted); font-size:11px; border:1px solid var(--axis); border-radius:8px; padding:0 6px; margin-left:4px; }
+/* Long strings (URLs, tokens) must wrap or a phone gets page-level horizontal scroll. */
+.jv-str, .jv-num, .jv-bool, .jv-null, .jv-key { white-space:pre-wrap; overflow-wrap:anywhere; }
+.jv-str { color:var(--hexdb); }
+.jv-num { color:var(--board); }
+.jv-bool { color:var(--aeroapi); }
+.jv-null { color:var(--muted); }
+.jv-hit { background:rgba(201,133,0,0.28); border-radius:3px; outline:1px solid var(--aeroapi); }
+.jv-empty { color:var(--muted); }
+.jv-text { font:13px/1.5 var(--mono); white-space:pre-wrap; overflow-wrap:anywhere; margin:0; }

@@ -1,0 +1,54 @@
+/* Dark only, like the rest of the AirDash pages. Series colours are the
+   validated dark categorical steps; answer states use the fixed status
+   palette and always carry a text label. */
+:root {
+  color-scheme: dark;
+  --page:#0d0d0d; --surface:#1a1a19; --ink:#f0efec; --ink-2:#c3c2b7; --muted:#898781;
+  --grid:#2c2c2a; --axis:#383835; --ring:rgba(255,255,255,0.10);
+  --board:#3987e5; --adsbdb:#d95926; --hexdb:#199e70; --aeroapi:#c98500; --none:#5b5a56;
+  --good:#0ca30c; --serious:#ec835a; --critical:#d03b3b; --nodata:#6b6a65; --off:#383835;
+  --mono:ui-monospace,Menlo,Consolas,monospace;
+}
+* { box-sizing:border-box; }
+html,body { margin:0; background:var(--page); color:var(--ink); font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif; }
+main { max-width:1080px; margin:0 auto; padding:20px 16px 48px; }
+header { display:flex; flex-wrap:wrap; align-items:flex-end; gap:12px 20px; margin-bottom:18px; }
+h1 { font-size:20px; font-weight:650; margin:0; }
+.sub { color:var(--ink-2); margin:2px 0 0; }
+header .grow { flex:1 1 280px; }
+a { color:var(--board); }
+.seg { display:inline-flex; border:1px solid var(--axis); border-radius:8px; overflow:hidden; }
+.seg button { background:none; border:0; color:var(--ink-2); font:inherit; padding:6px 12px; cursor:pointer; }
+.seg button + button { border-left:1px solid var(--axis); }
+.seg button[aria-pressed=true] { background:var(--surface); color:var(--ink); font-weight:600; }
+.seg button:hover { background:#222220; }
+.note { color:var(--muted); font-size:12px; }
+.tiles { display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:10px; margin-bottom:14px; }
+.tile, .card { background:var(--surface); border:1px solid var(--ring); border-radius:10px; }
+.tile { padding:12px 14px; }
+.tile .k { color:var(--ink-2); font-size:12px; }
+.tile .v { font-size:28px; font-weight:650; margin-top:2px; }
+.tile .d { color:var(--muted); font-size:12px; }
+.card { padding:14px 16px 16px; margin-bottom:14px; min-width:0; }
+.card h2 { font-size:15px; font-weight:650; margin:0; }
+.card .what { color:var(--ink-2); font-size:13px; margin:2px 0 10px; }
+table { width:100%; border-collapse:collapse; font-size:13px; }
+th { text-align:left; color:var(--muted); font-weight:500; font-size:12px; padding:6px 8px; border-bottom:1px solid var(--axis); white-space:nowrap; }
+td { padding:6px 8px; border-bottom:1px solid var(--grid); vertical-align:top; white-space:nowrap; }
+td.num, th.num { text-align:right; font-variant-numeric:tabular-nums; }
+.scroll { overflow-x:auto; }
+.ans { font-family:var(--mono); }
+/* Link takes the cell's colour (shown/bad/odd) so the table stays readable. */
+.ans a.raw { color:inherit; text-decoration:none; }
+.ans a.raw:hover { text-decoration:underline; }
+.ans .st { font-family:system-ui,sans-serif; font-size:11px; color:var(--muted); margin-left:4px; }
+.ans.shown { font-weight:700; }
+.ans.shown::after { content:" ●"; color:var(--ink-2); font-size:9px; vertical-align:2px; }
+.ans.bad { color:var(--serious); }
+.ans.odd { background:rgba(236,131,90,0.12); border-radius:4px; }
+.dim { color:var(--muted); }
+.toolbar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:0 0 10px; }
+input[type=search] { background:#000; color:var(--ink); border:1px solid var(--axis); border-radius:6px; padding:6px 8px; font:inherit; width:16em; }
+button.more { background:var(--surface); color:var(--ink); border:1px solid var(--axis); border-radius:6px; padding:6px 14px; font:inherit; cursor:pointer; margin-top:10px; }
+button.more:disabled { opacity:.5; cursor:default; }
+.empty { color:var(--muted); padding:18px 0; text-align:center; }

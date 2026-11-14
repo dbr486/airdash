@@ -210,3 +210,21 @@ test('omits the safety headers when the service does not send them', async () =>
   const res = await fetch(`${appUrl}/api/nearest`);
   assert.equal(res.headers.get('content-security-policy'), null);
 });
+
+test('serves the response viewer page and its helper assets', async () => {
+  for (const f of ['response.html', 'jsonview.js', 'jsonview.css', 'rawdata.js', 'sources.css']) {
+    const res = await fetch(`${appUrl}/${f}`);
+    assert.equal(res.status, 200, f);
+  }
+  const html = await (await fetch(`${appUrl}/response.html`)).text();
+  assert.match(html, /jsonview\.js/);
+  assert.match(html, /\/api\/sources\/responses/);
+});
+
+test('serves the airport board page', async () => {
+  const res = await fetch(`${appUrl}/board.html`);
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.match(html, /rawdata\.js/);
+  assert.match(html, /source=airlabs/);
+});

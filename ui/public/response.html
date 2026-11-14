@@ -1,0 +1,301 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AirDash saved response</title>
+<link rel="stylesheet" href="sources.css">
+<link rel="stylesheet" href="jsonview.css">
+<style>
+  header h1 { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+  .nav { display:flex; gap:16px; flex-wrap:wrap; }
+  .dot { display:inline-block; width:10px; height:10px; border-radius:50%; background:var(--c, var(--none)); flex:none; }
+  .meta { display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:14px 24px; margin:0; }
+  .meta > div { min-width:0; }
+  .meta dt { color:var(--muted); font-size:12px; margin-bottom:2px; }
+  .meta dd { margin:0; overflow-wrap:anywhere; }
+  .meta .wide { grid-column:1 / -1; }
+  .meta .url { font-family:var(--mono); font-size:12px; color:var(--ink-2); }
+  .meta .subj { font-family:var(--mono); font-weight:600; }
+  .st-ok { color:var(--good); } .st-warn { color:var(--serious); } .st-bad { color:var(--critical); }
+  .tabs { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:14px; }
+  .tabs button { background:var(--surface); color:var(--ink-2); border:1px solid var(--axis); border-radius:8px; padding:6px 12px; font:inherit; cursor:pointer; font-variant-numeric:tabular-nums; }
+  .tabs button[aria-pressed=true] { color:var(--ink); border-color:var(--ink-2); font-weight:600; }
+  .tabs button:hover { background:#222220; }
+  .tabs .tag { color:var(--muted); font-size:11px; margin-left:6px; }
+  .toolbar button, .toolbar a.btn { background:var(--page); color:var(--ink); border:1px solid var(--axis); border-radius:6px; padding:6px 12px; font:inherit; cursor:pointer; text-decoration:none; }
+  .toolbar button:hover, .toolbar a.btn:hover { background:#222220; }
+  .toolbar .count { color:var(--muted); font-size:12px; min-width:5em; }
+  .toolbar .sp { flex:1 1 0; }
+  .viewer { background:#000; border:1px solid var(--grid); border-radius:8px; padding:12px 14px; max-height:70vh; overflow:auto; }
+  .card h2 { margin-bottom:10px; }
+  .linkrow { margin:12px 0 0; font-size:13px; }
+  /* Summary snippets come from rawdata.js. */
+  .rd-dl { display:grid; grid-template-columns:max-content 1fr; gap:8px 18px; margin:0; }
+  .rd-dl dt { color:var(--muted); }
+  .rd-dl dd { margin:0; overflow-wrap:anywhere; }
+  .rd-note { color:var(--ink-2); margin:0; }
+  .rd-badge { display:inline-block; font-size:11px; color:var(--ink-2); border:1px solid var(--axis); border-radius:8px; padding:0 7px; margin:0 6px 6px 0; }
+  .rd-summary > .rd-badge { color:var(--serious); border-color:var(--serious); }
+  .rd-table .rd-badge { margin:0 0 0 4px; }
+  .rd-table tr.used td { background:rgba(25,158,112,0.12); }
+  @media (max-width:520px) { .rd-dl { grid-template-columns:1fr; gap:2px; } .rd-dl dd { margin-bottom:8px; } input[type=search] { width:100%; } }
+  #off, #none, #err { display:none; }
+  #none .empty, #err .empty { text-align:left; padding:6px 0; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="grow">
+      <h1><span class="dot" id="dot"></span><span id="title">Saved response</span></h1>
+      <p class="sub" id="sub">What a route source answered, as saved by the service.</p>
+    </div>
+    <div class="nav"><a href="sources.html">← Route sources</a><a href="board.html">Airport board</a></div>
+  </header>
+
+  <div class="card" id="off"><p class="empty">The route source log is off. Set <code>AIRDASH_SOURCE_LOG_FILE</code> on the service to start recording.</p></div>
+  <div class="card" id="none"><p class="empty" id="none-msg"></p></div>
+  <div class="card" id="err"><p class="empty" id="err-msg"></p></div>
+
+  <div id="main" style="display:none">
+    <div class="tabs" id="tabs"></div>
+
+    <div class="card">
+      <dl class="meta" id="meta"></dl>
+    </div>
+
+    <div class="card">
+      <h2>Summary</h2>
+      <div id="summary"></div>
+      <p class="linkrow" id="summary-links"></p>
+    </div>
+
+    <div class="card">
+      <h2>Response body</h2>
+      <div class="toolbar">
+        <button type="button" id="expand">Expand all</button>
+        <button type="button" id="collapse">Collapse all</button>
+        <input type="search" id="find" placeholder="Search keys and values" aria-label="Search the JSON">
+        <span class="count" id="count" aria-live="polite"></span>
+        <span class="sp"></span>
+        <button type="button" id="copy">Copy</button>
+        <button type="button" id="download">Download</button>
+        <a class="btn" id="raw" target="_blank" rel="noopener">Open raw</a>
+      </div>
+      <div class="viewer" id="json"></div>
+    </div>
+  </div>
+</main>
+
+<script src="jsonview.js"></script>
+<script src="rawdata.js"></script>
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const enc = encodeURIComponent;
+const P = new URLSearchParams(location.search);
+const SOURCES = { board: ['Airport board', 'var(--board)'], adsbdb: ['adsbdb', 'var(--adsbdb)'], hexdb: ['hexdb', 'var(--hexdb)'], aeroapi: ['FlightAware AeroAPI', 'var(--aeroapi)'], airlabs: ['AirLabs board', 'var(--board)'] };
+const BEFORE = P.get('before') ? Number(P.get('before')) : null;
+const SAVED_FROM = '31 Oct 2026';
+
+let current = null; // { meta, body } of the response on screen
+let viewer = null;
+let loadSeq = 0; // a slow earlier tab must not overwrite a later click
+
+async function api(path) {
+  const r = await fetch('/api/sources/' + path, { cache: 'no-store' });
+  if (r.status === 404) {
+    const j = await r.json().catch(() => ({}));
+    if (/log is off/i.test(j.error || '')) throw Object.assign(new Error('off'), { off: true });
+    return null;
+  }
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  return r.json();
+}
+
+const when = (t) => new Date(t * 1000).toLocaleString([], { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+const clock = (t) => new Date(t * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+
+function span(sec) {
+  const s = Math.round(Math.abs(sec));
+  if (s < 90) return s + ' s';
+  if (s < 5400) return Math.round(s / 60) + ' min';
+  return (s / 3600).toFixed(1) + ' h';
+}
+
+function statusInfo(st) {
+  if (st >= 200 && st < 300) return ['st-ok', 'OK'];
+  if (st === 404) return ['st-warn', 'not found'];
+  if (st === 429) return ['st-warn', 'rate-limited'];
+  return ['st-bad', st >= 500 ? 'server error' : 'error'];
+}
+
+function size(n) {
+  if (n < 1024) return n + ' B';
+  return (n / 1024).toFixed(n < 10240 ? 1 : 0) + ' KB';
+}
+
+function show(which) {
+  for (const id of ['off', 'none', 'err']) $(id).style.display = id === which ? 'block' : 'none';
+  $('main').style.display = which ? 'none' : 'block';
+}
+
+function renderMeta(m) {
+  const [name, color] = SOURCES[m.source] || [m.source, 'var(--none)'];
+  $('dot').style.setProperty('--c', color);
+  $('title').textContent = name;
+  $('sub').textContent = 'Saved response for ' + m.subject;
+  const [cls, label] = statusInfo(m.status);
+  let rel = '';
+  if (BEFORE != null) {
+    const d = m.fetched_at - (BEFORE - 60); // before = last_seen + 60
+    rel = `<dd class="dim">${d === 0 ? 'at' : span(d) + (d < 0 ? ' before' : ' after')} the pass's last sighting</dd>`;
+  }
+  $('meta').innerHTML =
+    `<div><dt>Subject</dt><dd class="subj">${esc(m.subject)}</dd></div>` +
+    `<div><dt>HTTP status</dt><dd class="${cls}"><b>${esc(m.status)}</b> ${esc(label)}</dd></div>` +
+    `<div><dt>Fetched</dt><dd>${esc(when(m.fetched_at))}</dd>${rel}</div>` +
+    `<div><dt>Size</dt><dd>${esc(size(m.size))}</dd></div>` +
+    `<div class="wide"><dt>URL</dt><dd class="url">${esc(m.url)}</dd></div>`;
+}
+
+// hexdb routes hold bare ICAO codes; the airport names come from the
+// airport lookups the service saves once it has the route, so a second or
+// so after this response.
+const AIRPORT_LAG_S = 10;
+async function airportsFor(m, body) {
+  const out = {};
+  let route = '';
+  try { route = String(JSON.parse(body).route || ''); } catch { return out; }
+  for (const code of route.split('-').filter(Boolean)) {
+    try {
+      const l = await api(`responses?source=hexdb&subject=${enc('airport:' + code)}&before=${m.fetched_at + AIRPORT_LAG_S}&limit=1`);
+      const hit = l && l.responses && l.responses[0];
+      if (!hit) continue;
+      const d = await api(`responses/${hit.id}`);
+      if (d) out[code] = JSON.parse(d.body);
+    } catch { /* a missing airport name only makes the summary plainer */ }
+  }
+  return out;
+}
+
+async function renderSummary(m, body, seq) {
+  const airports = m.source === 'hexdb' ? await airportsFor(m, body) : {};
+  if (seq !== loadSeq) return; // another tab was opened while the airport names loaded
+  const ctx = { subject: m.subject, usedRoute: P.get('pass') || '', airports, fetchedAt: m.fetched_at, passAt: BEFORE != null ? BEFORE - 60 : undefined };
+  $('summary').innerHTML = RawData.summarize(m.source, m.status, body, ctx);
+  $('summary-links').innerHTML = m.source === 'airlabs'
+    ? `<a href="board.html?id=${enc(m.id)}&before=${enc(m.fetched_at)}">Browse this refresh on the airport board →</a>` : '';
+}
+
+function pretty(body) {
+  try { return JSON.stringify(JSON.parse(body), null, 2); } catch { return body; }
+}
+
+async function open(id) {
+  const seq = ++loadSeq;
+  const d = await api('responses/' + enc(id));
+  if (seq !== loadSeq) return;
+  if (!d) { $('err-msg').textContent = 'No saved response with id ' + id + '.'; show('err'); return; }
+  show(null);
+  current = { meta: d, body: String(d.body == null ? '' : d.body) };
+  renderMeta(d);
+  $('count').textContent = '';
+  $('find').value = '';
+  viewer = JsonView.mount($('json'), current.body);
+  $('raw').href = `/api/sources/responses/${enc(d.id)}/raw`;
+  for (const b of $('tabs').children) b.setAttribute('aria-pressed', String(b.dataset.id === String(d.id)));
+  await renderSummary(d, current.body, seq);
+}
+
+function buildTabs(list) {
+  $('tabs').innerHTML = list.length < 2 ? '' : list.map((r, i) => {
+    const [cls, label] = statusInfo(r.status);
+    return `<button type="button" data-id="${esc(r.id)}">${esc(clock(r.fetched_at))} <span class="tag ${cls}">${esc(r.status)} ${esc(label)}</span>${i === 0 ? '<span class="tag">newest</span>' : ''}</button>`;
+  }).join('');
+}
+
+$('tabs').addEventListener('click', (e) => {
+  const b = e.target.closest('button[data-id]');
+  if (b) open(b.dataset.id).catch(fail);
+});
+
+function fail(err) {
+  if (err.off) return show('off');
+  $('err-msg').textContent = 'Could not load the response: ' + err.message;
+  show('err');
+}
+
+async function start() {
+  if (P.get('id')) return open(P.get('id'));
+  const source = P.get('source') || '';
+  const subject = P.get('subject') || '';
+  const before = BEFORE != null ? BEFORE : Math.floor(Date.now() / 1000);
+  let list = [];
+  for (const s of [subject, P.get('alt')].filter(Boolean)) {
+    const j = await api(`responses?source=${enc(source)}&subject=${enc(s)}&before=${enc(before)}&limit=20`);
+    list = (j && j.responses) || [];
+    if (list.length) break;
+  }
+  if (!list.length) {
+    $('none-msg').textContent = `No saved response for ${subject || 'this request'} before ${when(before)}. Responses are saved from ${SAVED_FROM}; older passes and answers served from a cache filled before then have none.`;
+    return show('none');
+  }
+  buildTabs(list);
+  await open(list[0].id);
+}
+
+$('expand').onclick = () => viewer && viewer.expandAll();
+$('collapse').onclick = () => viewer && viewer.collapseAll();
+let findTimer;
+$('find').addEventListener('input', () => {
+  clearTimeout(findTimer);
+  findTimer = setTimeout(() => {
+    const term = $('find').value;
+    // Too-short terms only clear the highlights; see JsonView.MIN_TERM.
+    if (!viewer || term.trim().length < JsonView.MIN_TERM) { if (viewer) viewer.find(''); $('count').textContent = ''; return; }
+    const { count, more } = viewer.find(term);
+    $('count').textContent = more ? `${count}+ matches` : count + (count === 1 ? ' match' : ' matches');
+  }, 150);
+});
+
+// Same clipboard approach as index.html: the async API needs a secure
+// context, which a plain-http LAN address is not.
+async function copyText(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    await navigator.clipboard.writeText(text);
+    return true;
+  }
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.cssText = 'position:fixed;opacity:0';
+  document.body.appendChild(ta);
+  ta.select();
+  try { return document.execCommand('copy'); } catch { return false; } finally { ta.remove(); }
+}
+$('copy').onclick = async () => {
+  if (!current) return;
+  let ok = false;
+  try { ok = await copyText(pretty(current.body)); } catch { ok = false; }
+  $('copy').textContent = ok ? 'Copied' : 'Copy failed';
+  setTimeout(() => { $('copy').textContent = 'Copy'; }, 2000);
+};
+$('download').onclick = () => {
+  if (!current) return;
+  const m = current.meta;
+  const name = `${m.source}-${m.subject}-${m.id}.json`.replace(/[^A-Za-z0-9._-]+/g, '_');
+  const url = URL.createObjectURL(new Blob([pretty(current.body)], { type: 'application/json' }));
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+};
+
+start().catch(fail);
+</script>
+</body>
+</html>

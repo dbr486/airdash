@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AirDash airport board</title>
+<link rel="stylesheet" href="sources.css">
+<style>
+  .nav { display:flex; gap:16px; flex-wrap:wrap; }
+  .controls { display:flex; flex-wrap:wrap; gap:10px 14px; align-items:center; margin-bottom:12px; }
+  select { background:#000; color:var(--ink); border:1px solid var(--axis); border-radius:6px; padding:6px 8px; font:inherit; max-width:100%; }
+  .controls .grow { flex:1 1 auto; }
+  .seg button .n { color:var(--muted); font-weight:400; margin-left:6px; font-variant-numeric:tabular-nums; }
+  .banner { display:inline-block; border:1px solid var(--axis); border-radius:8px; padding:3px 10px; font-size:12px; color:var(--ink-2); margin:0 0 10px; }
+  .banner.ok { color:var(--good); border-color:var(--good); }
+  .banner.warn { color:var(--serious); border-color:var(--serious); }
+  td.fl { font-weight:600; }
+  td.fl .ic { color:var(--muted); font-weight:400; font-family:var(--mono); font-size:12px; margin-left:6px; }
+  td.ap { font-family:var(--mono); }
+  td.late { color:var(--serious); }
+  tr.hit td { background:rgba(57,135,229,0.16); }
+  tr.hit td:first-child { box-shadow:inset 3px 0 0 var(--board); }
+  .links { margin:12px 0 0; font-size:13px; display:flex; gap:16px; flex-wrap:wrap; }
+  .st { text-transform:capitalize; }
+  #off, #none, #err { display:none; }
+  #none .empty, #err .empty { text-align:left; padding:6px 0; }
+  @media (max-width:520px) { input[type=search] { width:100%; } .controls .grow { flex-basis:100%; } }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="grow">
+      <h1>Airport board</h1>
+      <p class="sub">The departures and arrivals board as AirLabs answered it, one refresh at a time.</p>
+    </div>
+    <div class="nav"><a href="sources.html">← Route sources</a><a href="/">Display &amp; settings</a></div>
+  </header>
+
+  <div class="card" id="off"><p class="empty">The route source log is off. Set <code>AIRDASH_SOURCE_LOG_FILE</code> on the service to start recording.</p></div>
+  <div class="card" id="none"><p class="empty">No airport board has been saved yet. The board is saved from 31 Oct 2026 and kept for 7 days. If the board stays empty, the monthly AirLabs call cap may be spent.</p></div>
+  <div class="card" id="err"><p class="empty" id="err-msg"></p></div>
+
+  <div id="main" style="display:none">
+    <div class="controls">
+      <label class="note" for="refresh">Refresh</label>
+      <select id="refresh"></select>
+      <div class="seg" id="tabs" role="group" aria-label="Direction">
+        <button type="button" data-dir="dep" aria-pressed="true">Departures<span class="n" id="n-dep"></span></button>
+        <button type="button" data-dir="arr">Arrivals<span class="n" id="n-arr"></span></button>
+      </div>
+      <input class="grow" type="search" id="q" placeholder="Filter by flight number" aria-label="Filter by flight">
+    </div>
+
+    <div class="card">
+      <div id="hitbanner"></div>
+      <div class="scroll" id="holder"></div>
+      <p class="links" id="links"></p>
+    </div>
+  </div>
+</main>
+
+<script src="rawdata.js"></script>
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const enc = encodeURIComponent;
+const P = new URLSearchParams(location.search);
+const FLIGHT = RawData.normCallsign(P.get('flight'));
+
+let groups = [];
+let group = null;
+let groupSeq = 0; // a slow load for an earlier picker choice must not overwrite a later one
+let dir = 'dep';
+const rowsOf = {}; // direction -> parsed rows for the selected refresh; null = not saved or failed
+const errOf = {}; // direction -> why AirLabs gave no board for that side, or null
+const failedIds = new Set(); // captures known to have failed, from their meta or their body
+const PAGE = 100; // the API's maximum page size
+const KEEP_S = 7 * 86400; // the service keeps AirLabs captures this long
+
+async function api(path) {
+  const r = await fetch('/api/sources/' + path, { cache: 'no-store' });
+  if (r.status === 404) {
+    const j = await r.json().catch(() => ({}));
+    if (/log is off/i.test(j.error || '')) throw Object.assign(new Error('off'), { off: true });
+    return null;
+  }
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  return r.json();
+}
+
+function show(which) {
+  for (const id of ['off', 'none', 'err']) $(id).style.display = id === which ? 'block' : 'none';
+  $('main').style.display = which ? 'none' : 'block';
+}
+
+const fmtAt = (t) => new Date(t * 1000).toLocaleString([], { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+const sides = (g) => (g.dep && g.arr ? 'dep + arr' : g.dep ? 'dep only' : 'arr only');
+
+// AirLabs stamps are UTC with no zone marker, so add one before parsing; the
+// exact UTC stamp stays in the tooltip.
+function cell(v) {
+  let t = String(v || '');
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(t)) t = t.replace(' ', 'T') + 'Z';
+  const d = t ? new Date(t) : null;
+  if (!d || Number.isNaN(d.getTime())) return '<span class="dim">–</span>';
+  const hm = String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+  return `<time title="${esc(d.toISOString())}">${hm}</time>`;
+}
+
+function delayCell(d) {
+  const n = d == null || d === '' ? NaN : Number(d);
+  if (!Number.isFinite(n)) return '<td class="num dim">–</td>';
+  return `<td class="num${n > 0 ? ' late' : ''}">${esc(n > 0 ? '+' + n : n)} min</td>`;
+}
+
+const hitsIn = (d) => (rowsOf[d] || []).filter((r) => r.flightIcao.toUpperCase() === FLIGHT).length;
+
+function renderTable() {
+  const rows = rowsOf[dir];
+  $('hitbanner').innerHTML = '';
+  if (!group) {
+    $('holder').innerHTML = '<p class="empty">Pick a refresh above.</p>';
+    $('hitbanner').innerHTML = '<span class="banner warn">No board refresh saved at or before this pass</span>';
+    return;
+  }
+  if (errOf[dir]) {
+    $('holder').innerHTML = `<p class="empty">${esc(errOf[dir])}</p>`;
+    renderHitBanner();
+    return;
+  }
+  if (rows == null) {
+    $('holder').innerHTML = '<p class="empty">not saved for this refresh</p>';
+    return;
+  }
+  const q = RawData.normCallsign($('q').value);
+  // Rows with no scheduled time sort last rather than first.
+  const sorted = rows.slice().sort((a, b) => (!a.sched - !b.sched) || String(a.sched).localeCompare(String(b.sched)));
+  const shown = sorted.filter((r) => !q || r.flightIata.toUpperCase().includes(q) || r.flightIcao.toUpperCase().includes(q));
+  const other = dir === 'dep' ? 'arr' : 'dep';
+  const body = shown.map((r) => {
+    const hit = FLIGHT && r.flightIcao.toUpperCase() === FLIGHT;
+    return `<tr${hit ? ' class="hit"' : ''}><td class="fl">${esc(r.flightIata || r.flightIcao)}${r.flightIata && r.flightIcao ? `<span class="ic">${esc(r.flightIcao)}</span>` : ''}</td>` +
+      `<td class="ap">${esc(r[other])}</td><td>${cell(r.sched)}</td><td>${cell(r.est)}</td><td>${cell(r.actual)}</td>${delayCell(r.delay)}` +
+      `<td class="st">${esc(r.status)}</td></tr>`;
+  }).join('');
+  const holder = $('holder');
+  holder.innerHTML = `<table><thead><tr><th>Flight</th><th>${dir === 'dep' ? 'To' : 'From'}</th><th>Scheduled</th><th>Estimated</th><th>Actual</th><th class="num">Delay</th><th>Status</th></tr></thead><tbody>${body || '<tr><td colspan="7" class="empty">no flights match</td></tr>'}</tbody></table>`;
+
+  renderHitBanner();
+}
+
+// Failed sides hold no rows, so they never count as "not on this board".
+function renderHitBanner() {
+  if (!FLIGHT) return;
+  const hits = hitsIn('dep') + hitsIn('arr');
+  const readable = ['dep', 'arr'].some((d) => rowsOf[d]);
+  const [cls, msg] = hits === 1 ? ['ok', 'matched'] : hits > 1 ? ['ok', `${hits} rows for ${FLIGHT}`]
+    : readable ? ['warn', `${FLIGHT} is not on this board`] : ['warn', 'AirLabs gave no readable board for this refresh'];
+  $('hitbanner').innerHTML = `<span class="banner ${cls}">${esc(msg)}</span>`;
+}
+
+function optionText(g) {
+  const bad = [g.dep, g.arr].some((m) => m && (RawData.captureFailed(m) || failedIds.has(String(m.id))));
+  return `${fmtAt(g.at)} · ${sides(g)}${bad ? ' · error' : ''}`;
+}
+
+function renderPicker(idx) {
+  const placeholder = idx < 0 ? '<option value="" selected disabled>Pick a refresh</option>' : '';
+  $('refresh').innerHTML = placeholder + groups.map((g, i) => `<option value="${i}">${esc(optionText(g))}</option>`).join('');
+  if (idx >= 0) $('refresh').value = String(idx);
+}
+
+function renderLinks() {
+  const l = [];
+  if (group.dep) l.push(`<a href="response.html?id=${enc(group.dep.id)}">Departures JSON</a>`);
+  if (group.arr) l.push(`<a href="response.html?id=${enc(group.arr.id)}">Arrivals JSON</a>`);
+  $('links').innerHTML = l.join('');
+}
+
+async function loadGroup(g) {
+  const seq = ++groupSeq;
+  const load = async (d) => {
+    const meta = g[d];
+    if (!meta) return null;
+    const j = await api('responses/' + enc(meta.id));
+    return j ? RawData.boardState(j.status, j.body, d) : null;
+  };
+  const [dep, arr] = await Promise.all([load('dep'), load('arr')]);
+  if (seq !== groupSeq) return;
+  group = g;
+  const placeholder = $('refresh').querySelector('option[value=""]');
+  if (placeholder) placeholder.remove();
+  for (const [d, st] of [['dep', dep], ['arr', arr]]) {
+    rowsOf[d] = st && st.ok ? st.rows : null;
+    errOf[d] = st && !st.ok ? st.error : null;
+    if (errOf[d]) failedIds.add(String(g[d].id));
+    $('n-' + d).textContent = errOf[d] ? 'error' : rowsOf[d] ? rowsOf[d].length : '–';
+  }
+  // An `error` body is only seen once loaded; mark its picker option now.
+  const opt = $('refresh').querySelector(`option[value="${groups.indexOf(g)}"]`);
+  if (opt) opt.textContent = optionText(g);
+  // Open on the side that holds the wanted flight, else on a side that was saved.
+  const o = dir === 'dep' ? 'arr' : 'dep';
+  if (FLIGHT && !hitsIn(dir) && hitsIn(o)) setDir(o);
+  else if (!rowsOf[dir] && rowsOf[o]) setDir(o);
+  renderLinks();
+  renderTable();
+  // Scroll only when a refresh loads, not on every filter keystroke or tab click.
+  const first = FLIGHT && $('holder').querySelector('tr.hit');
+  if (first) first.scrollIntoView({ block: 'center' });
+}
+
+function setDir(d) {
+  dir = d;
+  for (const b of $('tabs').children) b.setAttribute('aria-pressed', String(b.dataset.dir === d));
+}
+
+const page = async (before) => {
+  const j = await api(`responses?source=airlabs&limit=${PAGE}${before == null ? '' : '&before=' + enc(before)}`);
+  return (j && j.responses) || [];
+};
+
+// About 29 captures a day for 7 days is more than one page, so walk back to
+// the retention floor. The anchor's own page comes first so a pass older than
+// the newest page still finds its refresh.
+async function loadCaptures(anchor) {
+  const lists = [];
+  if (anchor != null) lists.push(await page(anchor + RawData.PAIR_WINDOW_S));
+  const floor = Math.floor(Date.now() / 1000) - KEEP_S;
+  let before = null;
+  for (let i = 0; i < 20; i++) {
+    const p = await page(before);
+    lists.push(p);
+    before = RawData.nextPageBefore(p, PAGE, floor, before);
+    if (before == null) break;
+  }
+  return RawData.mergeResponses(...lists);
+}
+
+async function start() {
+  const id = P.get('id');
+  let before = P.get('before') ? Number(P.get('before')) : null;
+  if (before == null && id) {
+    const m = await api('responses/' + enc(id));
+    if (m) before = m.fetched_at;
+  }
+  groups = RawData.groupRefreshes(await loadCaptures(before));
+  if (!groups.length) return show('none');
+  show(null);
+  const idx = RawData.pickGroup(groups, before, id);
+  renderPicker(idx);
+  if (idx < 0) {
+    group = null;
+    $('links').innerHTML = '';
+    $('n-dep').textContent = $('n-arr').textContent = '';
+    return renderTable();
+  }
+  await loadGroup(groups[idx]);
+}
+
+$('refresh').addEventListener('change', () => {
+  const g = groups[Number($('refresh').value)];
+  if (g) loadGroup(g).catch(fail);
+});
+$('tabs').addEventListener('click', (e) => {
+  const b = e.target.closest('button[data-dir]');
+  if (!b) return;
+  setDir(b.dataset.dir);
+  renderTable();
+});
+$('q').addEventListener('input', renderTable);
+
+function fail(err) {
+  if (err.off) return show('off');
+  $('err-msg').textContent = 'Could not load the board: ' + err.message;
+  show('err');
+}
+
+start().catch(fail);
+</script>
+</body>
+</html>
