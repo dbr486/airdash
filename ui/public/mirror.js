@@ -52,7 +52,11 @@ function render(n) {
     const dl = $('delay');
     dl.textContent = delayText(n.delay);
     dl.className = 'dl' + (n.delay ? ' ' + n.delay.kind : '');
-    $('type').textContent = [n.type, n.airline].filter(Boolean).join('  ');
+    // Without a route the route row already shows the airline; repeating it
+    // here would print it twice.
+    const routeShown = Boolean((n.origin_label ?? n.origin) || (n.dest_label ?? n.dest));
+    const model = n.type_name || n.type;
+    $('type').textContent = [model, routeShown && n.airline].filter(Boolean).join('  ');
     $('alt').textContent = `${n.alt_ft} ft  ${n.gs_kt} kt`;
     $('dist').textContent = n.nearby > 1 ? `${n.dist_km.toFixed(1)} km  ${n.index + 1}/${n.nearby}` : `${n.dist_km.toFixed(1)} km`;
     selectedHex = (n.index > 0 || n.hex === selectedHex) ? n.hex : '';

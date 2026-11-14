@@ -12,7 +12,9 @@ edits the settings.
          ┌──────────────┬──────────────┬───────────────┼──────────────┬───────────────┐
          ▼              ▼              ▼               ▼              ▼               ▼
    adsb.fi/adsb.lol   adsbdb     pics.avs.io     AirLabs board   AeroAPI      Nominatim
-   (positions)       (routes)    (logos)         (optional)     (optional)   (address search)
+   (positions)    (routes, owners) (logos)       (optional)     (optional)   (address search)
+
+   VRS airline list + type names: embedded in the service binary, no network
 ```
 
 The displays never talk to the internet directly. Keys, caches and rate
@@ -24,7 +26,11 @@ Wiring is in `cmd/airdash/main.go`; each package has one job.
 
 1. **`provider`**: polls a readsb-style point query
    (`AIRDASH_PROVIDER`, every `AIRDASH_POLL_SECONDS`) for aircraft within
-   the radius of home.
+   the radius of home. Altitude below 6,000 ft is QNH-corrected when the
+   feed's barometric altitude is known; an aircraft without its own
+   `nav_qnh` borrows the median of the airborne aircraft below 6,000 ft. The tracker also adds `type_name`
+   (e.g. "737-800") from the embedded ICAO type table, and `/api/nearest`
+   exposes it next to `type`.
 2. **`tracker`**: keeps the latest snapshot, drops aircraft on the ground or
    without a position, applies the airport **`filter`**, sorts by distance
    (**`geo`**), and answers "nearest", "follow this hex" and "next after
@@ -32,6 +38,15 @@ Wiring is in `cmd/airdash/main.go`; each package has one job.
 3. **`routes`**: callsign → airline, origin and destination from adsbdb,
    cached for `AIRDASH_ROUTE_CACHE_HOURS`, with a cooldown after errors.
    City names come from the same answer.
+   **`operators`** then names the operating airline for each aircraft that
+   survives the filter: the callsign prefix is looked up in the embedded
+   VRS airline list; failing that (and when the route gave no airline) the
+   adsbdb registered owner by hex is mapped through the same list. Owner
+   answers are cached 7 days when known, 24 hours when unknown and 60
+   seconds after an error. An operator found this way replaces the route's
+   airline name, and its IATA code too when the list has one (so the logo
+   matches the name shown). It also covers aircraft with no
+   callsign or no known route.
 4. **Delay status** is a chain, cheapest first:
    - **`board`** (with `AIRDASH_AIRLABS_KEY`): downloads the departures and
      arrivals board of one airport every `AIRDASH_BOARD_REFRESH_MINUTES`

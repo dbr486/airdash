@@ -162,3 +162,84 @@ func TestNew(t *testing.T) {
 		t.Error("expected error for unknown provider")
 	}
 }
+
+func TestCorrectQNH(t *testing.T) {
+	for _, c := range []struct {
+		alt  int
+		qnh  float64
+		want int
+	}{
+		{1125, 1020.0, 1307}, // 1125 + 6.75*27 = 1307.25
+		{-125, 1020.0, 57},   // -125 + 182.25
+		{100, 990.0, 0},      // 100 - 627.75 clamped
+	} {
+		if got := correctQNH(c.alt, c.qnh); got != c.want {
+			t.Errorf("correctQNH(%d, %v) = %d, want %d", c.alt, c.qnh, got, c.want)
+		}
+	}
+}
+
+func TestDecodeReadsb_QNH(t *testing.T) {
+	body, err := os.ReadFile("testdata/qnh_mix.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	acs, err := decodeReadsb(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]int{
+		"aaaaaa": 1307, // own QNH 1020
+		"bbbbbb": 2182, // only A is a low sample, median 1020 -> 2000 + 6.75*27 = 2182.25
+		"cccccc": 7000, // above transition altitude, and not a median sample
+		"dddddd": 3182, // invalid own QNH -> median 1020
+	}
+	for _, a := range acs {
+		if a.AltFt != want[a.Hex] {
+			t.Errorf("%s AltFt = %d, want %d", a.Hex, a.AltFt, want[a.Hex])
+		}
+	}
+}
+
+// Cruising aircraft select standard 1013, so their nav_qnh says nothing
+// about the local pressure and must not be borrowed by low aircraft.
+func TestDecodeReadsb_QNHIgnoresHighAircraftForMedian(t *testing.T) {
+	acs, err := decodeReadsb([]byte(`{"ac":[
+{"hex":"a","alt_baro":2000},
+{"hex":"b","alt_baro":35000,"nav_qnh":1013.6}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acs[0].AltFt != 2000 {
+		t.Errorf("low AltFt = %d, want 2000 (uncorrected)", acs[0].AltFt)
+	}
+}
+
+func TestDecodeReadsb_NoQNHAnywhere(t *testing.T) {
+	acs, err := decodeReadsb([]byte(`{"ac":[{"hex":"a","alt_baro":1500},{"hex":"b","alt_baro":2500}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acs[0].AltFt != 1500 || acs[1].AltFt != 2500 {
+		t.Errorf("altitudes changed: %d, %d", acs[0].AltFt, acs[1].AltFt)
+	}
+}
+
+func TestDecodeReadsb_QNHSkipsUnknownAndGround(t *testing.T) {
+	acs, err := decodeReadsb([]byte(`{"ac":[
+{"hex":"a","alt_baro":2000,"nav_qnh":1020},
+{"hex":"b","nav_qnh":1020},
+{"hex":"c","alt_baro":"ground","nav_qnh":1020}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acs[0].AltFt != 2182 { // 2000 + 6.75*27 = 2182.25
+		t.Errorf("airborne AltFt = %d, want 2182", acs[0].AltFt)
+	}
+	if acs[1].AltFt != 0 {
+		t.Errorf("no alt_baro AltFt = %d, want 0", acs[1].AltFt)
+	}
+	if !acs[2].OnGround || acs[2].AltFt != 0 {
+		t.Errorf("ground: OnGround=%v AltFt=%d, want true/0", acs[2].OnGround, acs[2].AltFt)
+	}
+}

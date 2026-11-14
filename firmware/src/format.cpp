@@ -16,10 +16,17 @@ void formatRoute(const Nearest& n, char* out, size_t len) {
 }
 
 void formatTypeAirline(const Nearest& n, char* out, size_t len) {
-  if (n.type[0] && n.airline[0]) {
-    snprintf(out, len, "%s  %s", n.type, n.airline);
+  // The parser already folds the ICAO type into typeName for older services.
+  const char* model = n.typeName;
+  // Without a route formatRoute already puts the airline on row 2; repeating
+  // it here would show it twice.
+  bool routeShown = n.originLabel[0] || n.destLabel[0];
+  if (model[0] && n.airline[0] && routeShown) {
+    snprintf(out, len, "%s  %s", model, n.airline);
+  } else if (model[0]) {
+    snprintf(out, len, "%s", model);
   } else {
-    snprintf(out, len, "%s", n.type[0] ? n.type : n.airline);
+    snprintf(out, len, "%s", routeShown ? n.airline : "");
   }
 }
 

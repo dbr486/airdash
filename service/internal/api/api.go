@@ -98,6 +98,7 @@ type foundResponse struct {
 	Callsign    string `json:"callsign"`
 	Hex         string `json:"hex"`
 	Type        string `json:"type"`
+	TypeName    string `json:"type_name"`
 	Reg         string `json:"reg"`
 	Airline     string `json:"airline"`
 	AirlineIATA string `json:"airline_iata"`
@@ -200,7 +201,7 @@ func (h *handler) nearest(w http.ResponseWriter, r *http.Request) {
 	if snap.Found {
 		st := h.st.Settings()
 		body = foundResponse{
-			Found: true, Callsign: snap.Callsign, Hex: snap.Hex, Index: snap.Index, Type: snap.Type, Reg: snap.Reg,
+			Found: true, Callsign: snap.Callsign, Hex: snap.Hex, Index: snap.Index, Type: snap.Type, TypeName: snap.TypeName, Reg: snap.Reg,
 			Airline: snap.Airline, AirlineIATA: snap.AirlineIATA, Origin: snap.Origin, Dest: snap.Dest,
 			OriginLabel: label(snap.Origin, snap.OriginName, st.ShowNames),
 			DestLabel:   label(snap.Dest, snap.DestName, st.ShowNames),

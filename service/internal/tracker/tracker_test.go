@@ -14,6 +14,7 @@ import (
 	"airdash/internal/provider"
 	"airdash/internal/routes"
 	"airdash/internal/settings"
+	"airdash/internal/standing"
 )
 
 // Home is Heathrow-ish. Distances below are approximate and only need
@@ -849,4 +850,193 @@ func TestTick_HomeComesFromSettings(t *testing.T) {
 	if p.lat < 40.4 || p.lat > 40.6 {
 		t.Errorf("the feed must be asked around the settings home, got %v,%v", p.lat, p.lon)
 	}
+}
+
+type opCall struct {
+	callsign, hex string
+	haveAirline   bool
+}
+
+type fakeOperators struct {
+	res   standing.Airline
+	ok    bool
+	err   error
+	calls []opCall
+}
+
+func (f *fakeOperators) Operator(ctx context.Context, callsign, hex string, haveAirline bool) (standing.Airline, bool, error) {
+	f.calls = append(f.calls, opCall{callsign, hex, haveAirline})
+	return f.res, f.ok, f.err
+}
+
+func newOpTracker(p provider.Provider, r routes.Lookup, ops OperatorLookup) *Tracker {
+	return New(Options{
+		Lat: homeLat, Lon: homeLon, RadiusKm: 10, Poll: 5 * time.Second,
+		Provider: p, Routes: r, Operators: ops, Now: time.Now,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+}
+
+func TestTick_OperatorFromPrefixOverridesRouteAirline(t *testing.T) {
+	p := &fakeProvider{acs: []provider.Aircraft{airborne("aaa", "SCR137", 51.48, -0.45)}}
+	r := &fakeRoutes{byCallsign: map[string]routes.Route{"SCR137": {Airline: "Si-Chang Flying Service"}}}
+	ops := &fakeOperators{res: standing.Airline{Name: "Silver Cloud Air"}, ok: true}
+	tr := newOpTracker(p, r, ops)
+	tr.Tick(t.Context())
+	s, _ := tr.Current()
+	if s.Airline != "Silver Cloud Air" || s.AirlineIATA != "" {
+		t.Errorf("airline = %q/%q", s.Airline, s.AirlineIATA)
+	}
+}
+
+// The logo must belong to the airline whose name is shown: VRS's code wins,
+// and the route's code survives only when VRS has none.
+func TestTick_OperatorIATAPrecedence(t *testing.T) {
+	for _, c := range []struct {
+		name     string
+		op       standing.Airline
+		wantName string
+		wantIATA string
+	}{
+		{"vrs code replaces route code", standing.Airline{Name: "Jet2.com", IATA: "XX"}, "Jet2.com", "XX"},
+		{"route code kept when vrs has none", standing.Airline{Name: "Silver Cloud Air"}, "Silver Cloud Air", "LS"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			p := &fakeProvider{acs: []provider.Aircraft{airborne("aaa", "EXS1", 51.48, -0.45)}}
+			r := &fakeRoutes{byCallsign: map[string]routes.Route{"EXS1": {Airline: "Jet2", AirlineIATA: "LS"}}}
+			tr := newOpTracker(p, r, &fakeOperators{res: c.op, ok: true})
+			tr.Tick(t.Context())
+			s, _ := tr.Current()
+			if s.Airline != c.wantName || s.AirlineIATA != c.wantIATA {
+				t.Errorf("airline = %q/%q, want %q/%q", s.Airline, s.AirlineIATA, c.wantName, c.wantIATA)
+			}
+		})
+	}
+}
+
+func TestTick_OperatorForNoCallsign(t *testing.T) {
+	ac := airborne("3451d5", "", 51.48, -0.45)
+	ac.Reg = "EC-MKO"
+	p := &fakeProvider{acs: []provider.Aircraft{ac}}
+	ops := &fakeOperators{res: standing.Airline{Name: "Vueling Airlines", IATA: "VY"}, ok: true}
+	tr := newOpTracker(p, &fakeRoutes{}, ops)
+	tr.Tick(t.Context())
+	s, _ := tr.Current()
+	if s.Callsign != "EC-MKO" || s.Airline != "Vueling Airlines" || s.AirlineIATA != "VY" {
+		t.Errorf("snapshot = %+v", s)
+	}
+	if s.Origin != "" || s.Dest != "" {
+		t.Errorf("route fields must stay empty: %+v", s)
+	}
+	if len(ops.calls) != 1 || ops.calls[0].haveAirline {
+		t.Errorf("calls = %+v", ops.calls)
+	}
+}
+
+func TestTick_HaveAirlinePassedThrough(t *testing.T) {
+	p := &fakeProvider{acs: []provider.Aircraft{airborne("aaa", "BAW1", 51.48, -0.45)}}
+	r := &fakeRoutes{byCallsign: map[string]routes.Route{"BAW1": {Airline: "British Airways"}}}
+	ops := &fakeOperators{}
+	tr := newOpTracker(p, r, ops)
+	tr.Tick(t.Context())
+	if len(ops.calls) != 1 || !ops.calls[0].haveAirline {
+		t.Errorf("calls = %+v", ops.calls)
+	}
+}
+
+func TestTick_OperatorErrorIgnored(t *testing.T) {
+	p := &fakeProvider{acs: []provider.Aircraft{airborne("aaa", "BAW1", 51.48, -0.45)}}
+	r := &fakeRoutes{byCallsign: map[string]routes.Route{"BAW1": {Airline: "British Airways"}}}
+	ops := &fakeOperators{err: errors.New("boom")}
+	tr := newOpTracker(p, r, ops)
+	tr.Tick(t.Context())
+	s, _ := tr.Current()
+	if !s.Found || s.Airline != "British Airways" {
+		t.Errorf("snapshot = %+v", s)
+	}
+	if tr.routeFailing {
+		t.Error("operator errors must not mark route lookups as failing")
+	}
+}
+
+func TestTick_TypeName(t *testing.T) {
+	a := airborne("aaa", "X1", 51.48, -0.45)
+	a.Type = "C56X"
+	b := airborne("bbb", "X2", 51.49, -0.45)
+	b.Type = "ZZZZ"
+	tr := newOpTracker(&fakeProvider{acs: []provider.Aircraft{a, b}}, &fakeRoutes{}, nil)
+	tr.Tick(t.Context())
+	l, _ := tr.List()
+	if l[0].TypeName != "Citation XLS" || l[1].TypeName != "" {
+		t.Errorf("type names = %q, %q", l[0].TypeName, l[1].TypeName)
+	}
+}
+
+func TestTick_NilOperators(t *testing.T) {
+	p := &fakeProvider{acs: []provider.Aircraft{airborne("aaa", "BAW1", 51.48, -0.45)}}
+	r := &fakeRoutes{byCallsign: map[string]routes.Route{"BAW1": {Airline: "British Airways"}}}
+	tr := newOpTracker(p, r, nil)
+	tr.Tick(t.Context())
+	s, _ := tr.Current()
+	if s.Airline != "British Airways" {
+		t.Errorf("airline = %q", s.Airline)
+	}
+}
+
+// blockingOperators waits for its context, like a stalled adsbdb.
+type blockingOperators struct{ calls int }
+
+func (b *blockingOperators) Operator(ctx context.Context, _, _ string, _ bool) (standing.Airline, bool, error) {
+	b.calls++
+	<-ctx.Done()
+	return standing.Airline{}, false, ctx.Err()
+}
+
+func TestTick_OperatorLookupsShareOneBudget(t *testing.T) {
+	var acs []provider.Aircraft
+	for i, hex := range []string{"3451d1", "3451d2", "3451d3", "3451d4", "3451d5"} {
+		acs = append(acs, airborne(hex, "", 51.48+float64(i)*0.001, -0.45))
+	}
+	tr := New(Options{
+		Lat: homeLat, Lon: homeLon, RadiusKm: 10, Poll: 5 * time.Second,
+		RouteTimeout: 50 * time.Millisecond,
+		Provider:     &fakeProvider{acs: acs}, Routes: &fakeRoutes{}, Operators: &blockingOperators{}, Now: time.Now,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	start := time.Now()
+	tr.Tick(t.Context())
+	if d := time.Since(start); d > 150*time.Millisecond {
+		t.Errorf("Tick took %v, want < 150ms", d)
+	}
+	if s, _ := tr.Current(); !s.Found || s.Nearby != 5 {
+		t.Errorf("snapshot = %+v", s)
+	}
+}
+
+func TestTick_FilteredAircraftMakeNoOperatorCall(t *testing.T) {
+	p := &fakeProvider{acs: []provider.Aircraft{airborne("aaa", "BAW1", 51.48, -0.45)}}
+	r := &fakeRoutes{byCallsign: map[string]routes.Route{"BAW1": {OriginIATA: "LHR", DestIATA: "BCN"}}}
+	ops := &fakeOperators{}
+	tr := New(Options{
+		Lat: homeLat, Lon: homeLon, RadiusKm: 10, Poll: 5 * time.Second,
+		Provider: p, Routes: r, Operators: ops, Now: time.Now,
+		Filter: mustFilter(t, "", "", "CDG"),
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	tr.Tick(t.Context())
+	if s, _ := tr.Current(); s.Found {
+		t.Fatalf("aircraft should be filtered out: %+v", s)
+	}
+	if len(ops.calls) != 0 {
+		t.Errorf("operator calls = %+v, want none", ops.calls)
+	}
+}
+
+func mustFilter(t *testing.T, o, d, a string) filter.Filter {
+	t.Helper()
+	f, err := filter.Parse(o, d, a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return f
 }

@@ -19,13 +19,16 @@ import (
 	"airdash/internal/geo"
 	"airdash/internal/provider"
 	"airdash/internal/routes"
+	"airdash/internal/standing"
 )
 
 type Snapshot struct {
-	Found       bool
-	Hex         string
-	Callsign    string
-	Type        string
+	Found    bool
+	Hex      string
+	Callsign string
+	Type     string
+	// TypeName is the readable aircraft model ("737-800"), empty when the ICAO code is unmapped.
+	TypeName    string
 	Reg         string
 	Airline     string
 	AirlineIATA string
@@ -44,6 +47,13 @@ type Snapshot struct {
 	Index    int
 	RadiusKm float64
 	Delay    *flightstatus.Status
+}
+
+// OperatorLookup names the operating airline from the callsign prefix or the
+// registry owner. It is the authority over the route lookup's airline because
+// adsbdb routes are keyed by callsign alone and can carry a stale or wrong one.
+type OperatorLookup interface {
+	Operator(ctx context.Context, callsign, hex string, haveAirline bool) (standing.Airline, bool, error)
 }
 
 // SettingsSource supplies the filter and radius for each tick, so the web
@@ -65,6 +75,7 @@ type Options struct {
 	DelayTimeout time.Duration
 	Provider     provider.Provider
 	Routes       routes.Lookup
+	Operators    OperatorLookup // nil disables operator resolution
 	Delay        flightstatus.Lookup
 	// BoardDelay answers from a cached airport board with no network call,
 	// so it is asked for every aircraft in the list; Delay (which may chain
@@ -200,6 +211,10 @@ func (t *Tracker) Tick(ctx context.Context) {
 
 	var matched []candidate
 	nearby := 0
+	// One budget for every owner lookup this tick: positions must not wait on
+	// enrichment, and per-call timeouts would add up across aircraft when
+	// adsbdb stalls.
+	opCtx, opCancel := context.WithTimeout(ctx, t.o.RouteTimeout)
 	var routeErr error // first non-cooldown route lookup error this tick, if any
 	for _, ac := range acs {
 		if ac.OnGround || !ac.HasPos {
@@ -229,9 +244,30 @@ func (t *Tracker) Tick(ctx context.Context) {
 		if f.Active() && !(c.known && f.Match(c.route)) {
 			continue
 		}
+		// After the filter so aircraft that are dropped cost no lookup. Runs
+		// even with no callsign or no known route: those are exactly the
+		// aircraft the route lookup cannot name.
+		if t.o.Operators != nil {
+			op, ok, err := t.o.Operators.Operator(opCtx, ac.Callsign, ac.Hex, c.route.Airline != "")
+			switch {
+			case err != nil:
+				// Debug only and kept off routeErr: an owner-lookup outage
+				// must not flip the route-lookup failing/recovered state.
+				t.o.Logger.Debug("operator lookup failed", "callsign", ac.Callsign, "hex", ac.Hex, "err", err)
+			case ok:
+				c.route.Airline = op.Name
+				// The logo is keyed by IATA, so it must follow the name we show:
+				// a stale adsbdb airline's code would put another airline's logo
+				// next to the VRS name. Keep the route's code only when VRS has none.
+				if op.IATA != "" {
+					c.route.AirlineIATA = op.IATA
+				}
+			}
+		}
 		nearby++
 		matched = append(matched, c)
 	}
+	opCancel()
 	// Kept whole and ordered so a client can step through the aircraft in
 	// range by identity, not just read the nearest.
 	sort.SliceStable(matched, func(i, j int) bool { return matched[i].distKm < matched[j].distKm })
@@ -346,6 +382,7 @@ func toSnapshot(c candidate, nearby int, radiusKm float64) Snapshot {
 		Hex:         c.ac.Hex,
 		Callsign:    cs,
 		Type:        c.ac.Type,
+		TypeName:    standing.TypeName(c.ac.Type),
 		Reg:         c.ac.Reg,
 		Airline:     c.route.Airline,
 		AirlineIATA: c.route.AirlineIATA,

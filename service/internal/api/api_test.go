@@ -103,7 +103,7 @@ func TestNearest_Found(t *testing.T) {
 		t.Errorf("Cache-Control = %q", rec.Header().Get("Cache-Control"))
 	}
 	want := map[string]any{
-		"found": true, "callsign": "BAW466", "hex": "400877", "index": 0.0, "type": "A319", "reg": "G-EUPG",
+		"found": true, "callsign": "BAW466", "hex": "400877", "index": 0.0, "type": "A319", "type_name": "", "reg": "G-EUPG",
 		"airline": "British Airways", "airline_iata": "BA", "origin": "LHR", "dest": "BCN",
 		"origin_label": "LHR", "dest_label": "BCN", "logo": "",
 		"alt_ft": 3525.0, "gs_kt": 267.0, "track": 216.0, "dist_km": 3.4, "bearing": 112.0,
@@ -776,5 +776,17 @@ func TestGeocode_Endpoint(t *testing.T) {
 	plain := NewHandler(&fakeSource{at: time.Now()}, store(10), &fakeStats{}, nil, time.Now)
 	if rec, _ := get(t, plain, "/api/geocode?q=Malaga"); rec.Code != 503 {
 		t.Errorf("no geocoder configured should be 503, got %d", rec.Code)
+	}
+}
+
+func TestNearest_TypeName(t *testing.T) {
+	for _, name := range []string{"737-800", ""} {
+		src := &fakeSource{snap: tracker.Snapshot{Found: true, Callsign: "X1", TypeName: name}, at: time.Now()}
+		h := NewHandler(src, store(10), &fakeStats{}, nil, time.Now)
+		rec, _ := get(t, h, "/api/nearest")
+		want := `"type_name":"` + name + `"`
+		if !strings.Contains(rec.Body.String(), want) {
+			t.Errorf("body %s missing %s", rec.Body.String(), want)
+		}
 	}
 }

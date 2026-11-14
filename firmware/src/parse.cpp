@@ -33,6 +33,8 @@ bool parseNearest(const char* json, Nearest& out) {
     copyStr(n.hex, sizeof n.hex, doc["hex"] | "");
     n.index = clampInt(doc["index"] | 0, 0, 9999);
     copyStr(n.type, sizeof n.type, doc["type"] | "");
+    copyStr(n.typeName, sizeof n.typeName, doc["type_name"] | (const char*)n.type);
+    if (!n.typeName[0]) copyStr(n.typeName, sizeof n.typeName, n.type);
     copyStr(n.reg, sizeof n.reg, doc["reg"] | "");
     copyStr(n.airline, sizeof n.airline, doc["airline"] | "");
     copyStr(n.origin, sizeof n.origin, doc["origin"] | "");

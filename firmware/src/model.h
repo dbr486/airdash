@@ -10,6 +10,9 @@ struct Nearest {
   // selection key when stepping through the aircraft in range.
   char hex[8] = "";
   char type[8] = "";
+  // Readable model ("Citation XLS") for the type row; older services omit it
+  // and the parser falls back to the ICAO type.
+  char typeName[16] = "";
   char reg[12] = "";
   char airline[32] = "";
   char origin[5] = "";

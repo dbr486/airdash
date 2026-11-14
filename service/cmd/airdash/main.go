@@ -22,6 +22,7 @@ import (
 	"airdash/internal/flightstatus"
 	"airdash/internal/geocode"
 	"airdash/internal/logos"
+	"airdash/internal/operators"
 	"airdash/internal/provider"
 	"airdash/internal/routes"
 	"airdash/internal/settings"
@@ -67,6 +68,12 @@ func run() error {
 	lookup := routes.NewCache(
 		routes.NewADSBDB(client, routes.DefaultADSBDBURL, userAgent),
 		cfg.RouteCacheTTL, time.Hour, routeErrorCooldown, time.Now)
+
+	// Owner answers change rarely, so known ones are cached for a week;
+	// unknown ones for a day in case the registry gets filled in.
+	opResolver := operators.NewResolver(operators.NewCache(
+		operators.NewADSBDBOwner(client, routes.DefaultADSBDBURL, userAgent),
+		7*24*time.Hour, 24*time.Hour, routeErrorCooldown, time.Now))
 
 	initial := settings.FromConfig(cfg)
 	source := "env"
@@ -121,7 +128,7 @@ func run() error {
 	// happened in settings.NewCurrent above.
 	opts := tracker.Options{
 		Lat: cfg.Lat, Lon: cfg.Lon, RadiusKm: cfg.RadiusKm, Poll: cfg.Poll,
-		Provider: prov, Routes: lookup, Settings: cur, Logger: logger, Delay: delay,
+		Provider: prov, Routes: lookup, Operators: opResolver, Settings: cur, Logger: logger, Delay: delay,
 	}
 	if brd != nil { // a typed nil in the interface would not be nil
 		opts.BoardDelay = brd
