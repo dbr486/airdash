@@ -46,7 +46,10 @@ Wiring is in `cmd/airdash/main.go`; each package has one job.
    not cancelled: today's schedule, free); then adsbdb's route, only if
    the aircraft's position could lie on it (detour via its position at most
    1.25 × the direct distance plus 100 km). Otherwise the airports are
-   dropped, the airline stays, and step 5 may ask AeroAPI.
+   dropped and the airline stays. A route still missing is asked of hexdb
+   (free, no key): its record must be under 30 days old, a single leg, and
+   pass the same position check; it carries no city names. Only then may
+   step 5 ask AeroAPI. hexdb errors never mark route lookup as failing.
    **`operators`** then names the operating airline for each aircraft that
    survives the filter: the callsign prefix is looked up in the embedded
    VRS airline list; failing that (and when the route gave no airline) the
@@ -120,5 +123,6 @@ the host.
 | adsb.fi | 1 request/s | default 5 s poll; minimum 2 s |
 | adsb.lol | ~8 requests/min | use `AIRDASH_POLL_SECONDS` ≥ 10 |
 | Nominatim | 1 request/s | `geocode` throttle and 1-day cache |
+| hexdb | none published | asked only when board and adsbdb miss; same route cache as adsbdb, airports cached for the process |
 | AirLabs | plan quota (free: 1,000/month) | `AIRDASH_BOARD_CALLS_PER_MONTH` (default 900), persisted counter |
 | AeroAPI | paid per call | `delay_lookups_per_day` setting (default 65, shared by delay and paid routes), 15-min cache |

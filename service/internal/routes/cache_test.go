@@ -109,3 +109,31 @@ func TestCache_KeysAreIndependent(t *testing.T) {
 		t.Errorf("calls=%d, want 2", inner.calls)
 	}
 }
+
+func TestCache_SpentContextStillServesCachedEntries(t *testing.T) {
+	inner := &fakeLookup{route: Route{OriginIATA: "LHR"}, ok: true}
+	ck := &clock{t: time.Date(2026, 9, 28, 12, 0, 0, 0, time.UTC)}
+	c := NewCache(inner, 6*time.Hour, time.Hour, testCooldown, ck.now)
+	if _, _, err := c.Route(t.Context(), "BAW466"); err != nil {
+		t.Fatal(err)
+	}
+	spent, cancel := context.WithCancel(t.Context())
+	cancel()
+	if r, ok, err := c.Route(spent, "BAW466"); err != nil || !ok || r.OriginIATA != "LHR" {
+		t.Errorf("a cached route must not need the caller's budget: r=%+v ok=%v err=%v", r, ok, err)
+	}
+}
+
+func TestCache_SpentContextSkipsUpstreamWithoutCooldown(t *testing.T) {
+	inner := &fakeLookup{route: Route{OriginIATA: "LHR"}, ok: true}
+	ck := &clock{t: time.Date(2026, 9, 28, 12, 0, 0, 0, time.UTC)}
+	c := NewCache(inner, 6*time.Hour, time.Hour, testCooldown, ck.now)
+	spent, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, _, err := c.Route(spent, "BAW466"); err == nil || inner.calls != 0 {
+		t.Fatalf("a spent budget must skip the upstream: calls=%d err=%v", inner.calls, err)
+	}
+	if _, ok, err := c.Route(t.Context(), "BAW466"); err != nil || !ok || inner.calls != 1 {
+		t.Errorf("skipping for a spent budget must not start a cooldown: calls=%d ok=%v err=%v", inner.calls, ok, err)
+	}
+}

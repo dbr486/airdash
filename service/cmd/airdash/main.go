@@ -68,6 +68,9 @@ func run() error {
 	lookup := routes.NewCache(
 		routes.NewADSBDB(client, routes.DefaultADSBDBURL, userAgent),
 		cfg.RouteCacheTTL, time.Hour, routeErrorCooldown, time.Now)
+	fallbackRoutes := routes.NewCache(
+		routes.NewHexDB(client, routes.DefaultHexDBURL, userAgent, time.Now),
+		cfg.RouteCacheTTL, time.Hour, routeErrorCooldown, time.Now)
 
 	// Owner answers change rarely, so known ones are cached for a week;
 	// unknown ones for a day in case the registry gets filled in.
@@ -133,7 +136,7 @@ func run() error {
 	// happened in settings.NewCurrent above.
 	opts := tracker.Options{
 		Lat: cfg.Lat, Lon: cfg.Lon, RadiusKm: cfg.RadiusKm, Poll: cfg.Poll,
-		Provider: prov, Routes: lookup, Operators: opResolver, Settings: cur, Logger: logger, Delay: delay,
+		Provider: prov, Routes: lookup, FallbackRoutes: fallbackRoutes, Operators: opResolver, Settings: cur, Logger: logger, Delay: delay,
 	}
 	if brd != nil { // a typed nil in the interface would not be nil
 		opts.BoardDelay = brd

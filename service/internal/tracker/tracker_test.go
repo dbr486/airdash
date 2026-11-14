@@ -3,9 +3,11 @@ package tracker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1529,5 +1531,176 @@ func TestPaidRoute_UnknownFlightCostsOneCallPerPassWithDelayOn(t *testing.T) {
 	}
 	if rig.inner.calls() != 1 {
 		t.Errorf("a flight AeroAPI does not know costs one call per pass, got %d", rig.inner.calls())
+	}
+}
+
+// lhrWAW is a hexdb-style route: codes and coordinates, no airline or names.
+var lhrWAW = routes.Route{OriginIATA: "LHR", OriginICAO: "EGLL", DestIATA: "WAW", DestICAO: "EPWA",
+	HasCoords: true, OriginLat: 51.47, OriginLon: -0.46, DestLat: 52.17, DestLon: 20.97}
+
+func fallbackTracker(free, fb *fakeRoutes, f filter.Filter) *Tracker {
+	tr := newTracker(&fakeProvider{acs: []provider.Aircraft{airborne("a", "WZZ1", 51.48, -0.45)}}, free, f, &clock{t: time.Now()})
+	tr.o.FallbackRoutes = fb
+	return tr
+}
+
+func TestTick_FallbackFillsUnknownRoute(t *testing.T) {
+	fb := &fakeRoutes{byCallsign: map[string]routes.Route{"WZZ1": lhrWAW}}
+	tr := fallbackTracker(&fakeRoutes{}, fb, filter.Filter{})
+	tr.Tick(t.Context())
+	s, _ := tr.Current()
+	if s.Origin != "LHR" || s.Dest != "WAW" || s.OriginName != "" || s.DestName != "" {
+		t.Errorf("fallback route must fill an unknown one, without names: %+v", s)
+	}
+}
+
+func TestTick_FallbackFillsAfterImplausibleDrop(t *testing.T) {
+	fb := &fakeRoutes{byCallsign: map[string]routes.Route{"WZZ1": lhrWAW}}
+	tr := fallbackTracker(&fakeRoutes{byCallsign: map[string]routes.Route{"WZZ1": agpTFS}}, fb, filter.Filter{})
+	tr.Tick(t.Context())
+	s, _ := tr.Current()
+	if s.Origin != "LHR" || s.Dest != "WAW" || s.DestName != "" {
+		t.Errorf("fallback route must replace an implausible one: %+v", s)
+	}
+	if s.Airline != "Wizz Air" || s.AirlineIATA != "W6" {
+		t.Errorf("airline from the free route must stay: %+v", s)
+	}
+}
+
+func TestTick_FallbackImplausibleNotShown(t *testing.T) {
+	far := agpTFS
+	far.Airline, far.AirlineIATA, far.OriginName, far.DestName = "", "", "", ""
+	fb := &fakeRoutes{byCallsign: map[string]routes.Route{"WZZ1": far}}
+	tr := fallbackTracker(&fakeRoutes{byCallsign: map[string]routes.Route{"WZZ1": agpTFS}}, fb, filter.Filter{})
+	tr.Tick(t.Context())
+	s, _ := tr.Current()
+	if s.Origin != "" || s.Dest != "" {
+		t.Errorf("an implausible fallback route must not be shown: %+v", s)
+	}
+	if s.Airline != "Wizz Air" {
+		t.Errorf("airline must stay: %+v", s)
+	}
+}
+
+func TestTick_FallbackNotAskedWhenFreeRoutePlausible(t *testing.T) {
+	fb := &fakeRoutes{byCallsign: map[string]routes.Route{"WZZ1": lhrWAW}}
+	tr := fallbackTracker(&fakeRoutes{byCallsign: map[string]routes.Route{"WZZ1": lhrBUD}}, fb, filter.Filter{})
+	tr.Tick(t.Context())
+	if s, _ := tr.Current(); s.Dest != "BUD" || fb.calls != 0 {
+		t.Errorf("a plausible free route must win without asking the fallback: calls=%d %+v", fb.calls, s)
+	}
+}
+
+func TestTick_FallbackNotAskedWhenBoardNames(t *testing.T) {
+	fb := &fakeRoutes{byCallsign: map[string]routes.Route{"WZZ1": lhrWAW}}
+	tr := fallbackTracker(&fakeRoutes{}, fb, filter.Filter{})
+	tr.o.BoardRoute = &fakeBoardRoute{r: flightstatus.FlightRoute{OriginIATA: "LHR", DestIATA: "BUD"}, ok: true}
+	tr.Tick(t.Context())
+	if s, _ := tr.Current(); s.Dest != "BUD" || fb.calls != 0 {
+		t.Errorf("the board must win without asking the fallback: calls=%d %+v", fb.calls, s)
+	}
+}
+
+func TestTick_FallbackErrorDoesNotFlipRouteFailing(t *testing.T) {
+	fb := &fakeRoutes{errFor: map[string]bool{"WZZ1": true}}
+	tr := fallbackTracker(&fakeRoutes{}, fb, filter.Filter{})
+	tr.Tick(t.Context())
+	if tr.routeFailing || fb.calls != 1 {
+		t.Errorf("a fallback outage must not mark route lookup failing: calls=%d", fb.calls)
+	}
+	if s, _ := tr.Current(); !s.Found || s.Origin != "" {
+		t.Errorf("aircraft must still show, without a route: %+v", s)
+	}
+}
+
+func TestTick_FilterSeesFallbackRoute(t *testing.T) {
+	f, err := filter.Parse("", "WAW", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fb := &fakeRoutes{byCallsign: map[string]routes.Route{"WZZ1": lhrWAW}}
+	tr := fallbackTracker(&fakeRoutes{}, fb, f)
+	tr.Tick(t.Context())
+	if s, _ := tr.Current(); !s.Found || s.Dest != "WAW" {
+		t.Errorf("the filter must judge the fallback route: %+v", s)
+	}
+}
+
+// blockingRoutes stalls until the caller gives up, like an upstream that
+// accepts connections but never answers.
+type blockingRoutes struct{ calls atomic.Int32 }
+
+func (b *blockingRoutes) Route(ctx context.Context, cs string) (routes.Route, bool, error) {
+	b.calls.Add(1)
+	<-ctx.Done()
+	return routes.Route{}, false, ctx.Err()
+}
+
+func TestTick_StalledFallbackCostsOneTimeoutPerTick(t *testing.T) {
+	var acs []provider.Aircraft
+	for i := range 10 {
+		acs = append(acs, airborne(fmt.Sprintf("h%d", i), fmt.Sprintf("WZZ%d", i), 51.48+float64(i)*0.001, -0.45))
+	}
+	tr := newTracker(&fakeProvider{acs: acs}, &fakeRoutes{}, filter.Filter{}, &clock{t: time.Now()})
+	tr.o.RouteTimeout = 50 * time.Millisecond
+	fb := &blockingRoutes{}
+	tr.o.FallbackRoutes = fb
+	start := time.Now()
+	tr.Tick(t.Context())
+	if d := time.Since(start); d > 3*tr.o.RouteTimeout {
+		t.Errorf("a stalled fallback must share one deadline per tick, took %v (%d calls)", d, fb.calls.Load())
+	}
+	if l, _ := tr.List(); len(l) != 10 {
+		t.Errorf("every aircraft must still be listed: %d", len(l))
+	}
+}
+
+// stallOnce blocks for one callsign until the caller gives up and answers
+// the rest from its map, so a real routes.Cache can be warmed around it.
+type stallOnce struct {
+	stall string
+	byCs  map[string]routes.Route
+}
+
+func (s *stallOnce) Route(ctx context.Context, cs string) (routes.Route, bool, error) {
+	if cs == s.stall {
+		<-ctx.Done()
+		return routes.Route{}, false, ctx.Err()
+	}
+	r, ok := s.byCs[cs]
+	return r, ok, nil
+}
+
+func TestTick_SpentFallbackBudgetKeepsCachedRoutes(t *testing.T) {
+	ck := &clock{t: time.Now()}
+	inner := &stallOnce{byCs: map[string]routes.Route{"WZZ2": lhrWAW}}
+	fb := routes.NewCache(inner, time.Hour, time.Hour, time.Minute, ck.now)
+	if _, ok, err := fb.Route(t.Context(), "WZZ2"); !ok || err != nil {
+		t.Fatal("warm-up failed")
+	}
+	inner.stall = "WZZ1"
+	f, err := filter.Parse("", "WAW", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &fakeProvider{acs: []provider.Aircraft{airborne("a", "WZZ1", 51.48, -0.45), airborne("b", "WZZ2", 51.49, -0.45)}}
+	tr := newTracker(p, &fakeRoutes{}, f, ck)
+	tr.o.RouteTimeout = 30 * time.Millisecond
+	tr.o.FallbackRoutes = fb
+	tr.Tick(t.Context())
+	l, _ := tr.List()
+	if len(l) != 1 || l[0].Callsign != "WZZ2" || l[0].Dest != "WAW" {
+		t.Errorf("a cached fallback route must survive a spent tick budget: %+v", l)
+	}
+}
+
+func TestTick_SlowPrimaryDoesNotSpendFallbackBudget(t *testing.T) {
+	ck := &clock{t: time.Now()}
+	tr := newTracker(&fakeProvider{acs: []provider.Aircraft{airborne("a", "WZZ1", 51.48, -0.45)}}, &stallOnce{stall: "WZZ1"}, filter.Filter{}, ck)
+	tr.o.RouteTimeout = 30 * time.Millisecond
+	tr.o.FallbackRoutes = routes.NewCache(&fakeRoutes{byCallsign: map[string]routes.Route{"WZZ1": lhrWAW}}, time.Hour, time.Hour, time.Minute, ck.now)
+	tr.Tick(t.Context())
+	if s, _ := tr.Current(); s.Dest != "WAW" {
+		t.Errorf("a stalled primary source must leave the fallback its own budget: %+v", s)
 	}
 }

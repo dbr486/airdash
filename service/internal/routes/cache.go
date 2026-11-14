@@ -62,6 +62,12 @@ func (c *Cache) Route(ctx context.Context, callsign string) (Route, bool, error)
 		return e.route, e.ok, nil
 	}
 
+	// A caller whose budget is already spent still gets cached answers above,
+	// but no upstream call; that is the caller's limit, not an upstream
+	// failure, so it must not start a cooldown either.
+	if err := ctx.Err(); err != nil {
+		return Route{}, false, err
+	}
 	r, ok, err := c.inner.Route(ctx, callsign)
 	if err != nil {
 		c.mu.Lock()

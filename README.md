@@ -327,7 +327,7 @@ Tests and conventions: [CONTRIBUTING.md](CONTRIBUTING.md).
 
 - Aircraft positions: [adsb.fi](https://adsb.fi) open data (personal,
   non-commercial use) or [adsb.lol](https://adsb.lol)
-- Routes and airlines: [adsbdb](https://www.adsbdb.com)
+- Routes and airlines: [adsbdb](https://www.adsbdb.com), with [hexdb](https://hexdb.io) as a free fallback for routes
 - Airline names: [VRS standing data](https://github.com/vradarserver/standing-data) (CC0), refreshed with scripts/update-standing-data.sh
 - Airport boards: [AirLabs](https://airlabs.co) schedules API
 - Flight status: [FlightAware AeroAPI](https://www.flightaware.com/commercial/aeroapi/)

@@ -94,10 +94,13 @@ type Options struct {
 	Flights flightstatus.FlightLookup
 	// BoardRoute is the first route source, ahead of adsbdb; nil = off.
 	BoardRoute BoardRoute
-	Filter     filter.Filter
-	Settings   SettingsSource
-	Now        func() time.Time
-	Logger     *slog.Logger
+	// FallbackRoutes is a free route source (hexdb) asked only when the
+	// board and a plausible adsbdb route both miss; nil = off.
+	FallbackRoutes routes.Lookup
+	Filter         filter.Filter
+	Settings       SettingsSource
+	Now            func() time.Time
+	Logger         *slog.Logger
 }
 
 const (
@@ -231,6 +234,19 @@ func (t *Tracker) Tick(ctx context.Context) {
 	// enrichment, and per-call timeouts would add up across aircraft when
 	// adsbdb stalls.
 	opCtx, opCancel := context.WithTimeout(ctx, t.o.RouteTimeout)
+	// The fallback route source gets the same kind of shared budget: it is
+	// asked for every aircraft adsbdb cannot name, so a stalled hexdb would
+	// otherwise cost one full timeout per aircraft before positions publish.
+	// It starts at the first fallback lookup, so slow adsbdb answers before
+	// it cannot spend it and push an aircraft on to the paid lookup.
+	var fbCtx context.Context
+	fbCancel := context.CancelFunc(func() {})
+	fallbackCtx := func() context.Context {
+		if fbCtx == nil {
+			fbCtx, fbCancel = context.WithTimeout(ctx, t.o.RouteTimeout)
+		}
+		return fbCtx
+	}
 	var routeErr error // first non-cooldown route lookup error this tick, if any
 	for _, ac := range acs {
 		if ac.OnGround || !ac.HasPos {
@@ -257,7 +273,7 @@ func (t *Tracker) Tick(ctx context.Context) {
 				c.route, c.known = r, ok
 			}
 		}
-		t.preferRoute(&c, fetchedAt)
+		t.preferRoute(fallbackCtx, &c, fetchedAt)
 		if f.Active() && !(c.known && f.Match(c.route)) {
 			continue
 		}
@@ -285,6 +301,7 @@ func (t *Tracker) Tick(ctx context.Context) {
 		matched = append(matched, c)
 	}
 	opCancel()
+	fbCancel()
 	// Kept whole and ordered so a client can step through the aircraft in
 	// range by identity, not just read the nearest.
 	sort.SliceStable(matched, func(i, j int) bool { return matched[i].distKm < matched[j].distKm })
@@ -450,8 +467,10 @@ func (t *Tracker) fillRoute(ctx context.Context, c *candidate, seen, now time.Ti
 // with their times, while adsbdb keeps whatever a flight number last flew,
 // and airlines reuse numbers on other city pairs. adsbdb's route is kept only if the aircraft's
 // position could lie on it; otherwise its ends are dropped (the airline from
-// the callsign prefix stays) and fillRoute may ask AeroAPI.
-func (t *Tracker) preferRoute(c *candidate, now time.Time) {
+// the callsign prefix stays). A route still missing is asked of the free
+// fallback source under the same position check, and only then may
+// fillRoute pay AeroAPI.
+func (t *Tracker) preferRoute(fallbackCtx func() context.Context, c *candidate, now time.Time) {
 	if m := t.passMemo(c.ac.Hex, now); m.state == passFound {
 		useRoute(c, m.route)
 		return
@@ -467,6 +486,25 @@ func (t *Tracker) preferRoute(c *candidate, now time.Time) {
 		t.o.Logger.Debug("implausible route dropped", "callsign", c.ac.Callsign,
 			"route", firstNonEmpty(c.route.OriginIATA, c.route.OriginICAO)+"-"+firstNonEmpty(c.route.DestIATA, c.route.DestICAO))
 		c.route = routes.Route{Airline: c.route.Airline, AirlineIATA: c.route.AirlineIATA}
+	}
+	if !hasRoute(c.route) && t.o.FallbackRoutes != nil && c.ac.Callsign != "" {
+		t.fallbackRoute(fallbackCtx(), c)
+	}
+}
+
+// fallbackRoute fills the route ends from the free fallback source. Its
+// errors stay at debug level and off the failing/recovered state, which
+// tracks adsbdb: a fallback outage only means fewer routes, never stale ones.
+// ctx is the tick's shared fallback budget; once it is spent the cache still
+// answers from memory but makes no upstream call.
+func (t *Tracker) fallbackRoute(ctx context.Context, c *candidate) {
+	r, ok, err := t.o.FallbackRoutes.Route(ctx, c.ac.Callsign)
+	switch {
+	case err != nil:
+		t.o.Logger.Debug("fallback route lookup failed", "callsign", c.ac.Callsign, "err", err)
+	case ok && r.Plausible(c.ac.Lat, c.ac.Lon):
+		r.Airline, r.AirlineIATA = c.route.Airline, c.route.AirlineIATA
+		c.route, c.known = r, true
 	}
 }
 
