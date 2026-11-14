@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
 
 const DefaultAeroAPIURL = "https://aeroapi.flightaware.com/aeroapi"
@@ -34,8 +35,11 @@ func NewAeroAPI(client *http.Client, baseURL, apiKey, userAgent string) *AeroAPI
 // distinguish null from zero, which matters for the delay fields.
 type flight struct {
 	Ident           string  `json:"ident"`
+	Registration    string  `json:"registration"`
 	Status          string  `json:"status"`
 	ProgressPercent *int    `json:"progress_percent"`
+	ScheduledOff    *string `json:"scheduled_off"`
+	EstimatedOff    *string `json:"estimated_off"`
 	ActualOff       *string `json:"actual_off"`
 	ActualOn        *string `json:"actual_on"`
 	DepartureDelay  *int    `json:"departure_delay"`
@@ -95,7 +99,7 @@ func (a *AeroAPI) Flight(ctx context.Context, q Query) (Flight, bool, error) {
 	if err := json.Unmarshal(body, &fr); err != nil {
 		return Flight{}, false, fmt.Errorf("aeroapi: decode: %w", err)
 	}
-	f, ok := pickFlight(fr.Flights)
+	f, ok := pickFlight(fr.Flights, q.Seen, q.Reg)
 	if !ok {
 		return Flight{}, false, nil
 	}
@@ -106,9 +110,21 @@ func (a *AeroAPI) Flight(ctx context.Context, q Query) (Flight, bool, error) {
 	return out, out.HasRoute || out.HasStatus, nil
 }
 
+// These bound how far an instance's expected take-off may sit from the
+// aircraft's first sighting in range: FlightAware's estimate can trail a
+// delayed departure, and a just-departed aircraft is sighted minutes after.
+// The short after-bound keeps out an inbound aircraft's next leg, which
+// cannot leave within minutes of the aircraft being seen on approach.
+const (
+	takeoffBeforeSeen = 60 * time.Minute
+	takeoffAfterSeen  = 10 * time.Minute
+)
+
 // pickFlight chooses the instance that is in the air now; AeroAPI returns
-// several days of the same flight number.
-func pickFlight(fs []flight) (flight, bool) {
+// several days of the same flight number. seen is when the aircraft was
+// first sighted airborne in range and reg its ADS-B registration (either
+// may be empty).
+func pickFlight(fs []flight, seen time.Time, reg string) (flight, bool) {
 	for _, f := range fs {
 		if f.ActualOff != nil && f.ActualOn == nil {
 			return f, true
@@ -124,12 +140,56 @@ func pickFlight(fs []flight) (flight, bool) {
 			return f, true
 		}
 	}
-	// No airborne instance: the caller only ever looks up an aircraft that
-	// is currently in the air, so anything left (e.g. a cancelled or
-	// diverted instance from an earlier day, or one not yet departed) is
-	// not the flight actually overhead. Report unknown rather than
-	// guessing wrong and caching it for 15 minutes.
+	// FlightAware logs a take-off a minute or two late, so an aircraft just
+	// airborne can still be "Scheduled" there. The caller only looks up
+	// aircraft already in the air, so the one instance due off around the
+	// first sighting and assigned this very tail is the flight overhead;
+	// two of them fail closed.
+	if f, ok := departingAt(fs, seen, reg); ok {
+		return f, true
+	}
+	// Anything left (a cancelled or diverted instance from an earlier day,
+	// a later leg) is not the flight actually overhead. Report unknown
+	// rather than guessing wrong and caching it for 15 minutes.
 	return flight{}, false
+}
+
+func departingAt(fs []flight, seen time.Time, reg string) (flight, bool) {
+	tail := normReg(reg)
+	if seen.IsZero() || tail == "" {
+		return flight{}, false
+	}
+	var hit flight
+	n := 0
+	for _, f := range fs {
+		if f.Cancelled || f.ActualOn != nil || normReg(f.Registration) != tail {
+			continue
+		}
+		off, ok := parseTime(f.EstimatedOff)
+		if !ok {
+			off, ok = parseTime(f.ScheduledOff)
+		}
+		if !ok {
+			continue
+		}
+		if d := seen.Sub(off); d <= takeoffBeforeSeen && d >= -takeoffAfterSeen {
+			hit = f
+			n++
+		}
+	}
+	return hit, n == 1
+}
+
+func normReg(r string) string {
+	return strings.ToUpper(strings.ReplaceAll(strings.TrimSpace(r), "-", ""))
+}
+
+func parseTime(s *string) (time.Time, bool) {
+	if s == nil {
+		return time.Time{}, false
+	}
+	t, err := time.Parse(time.RFC3339, *s)
+	return t, err == nil
 }
 
 func classify(f flight) (Status, bool) {

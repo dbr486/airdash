@@ -38,6 +38,9 @@ type Query struct {
 	// few minutes earlier, which dates a departure the board has not
 	// recorded yet.
 	Seen time.Time
+	// Reg is the aircraft's ADS-B registration (empty when unknown); it
+	// confirms a just-departed instance is this very aircraft.
+	Reg string
 }
 
 // Lookup resolves one aircraft. (status, true, nil) when known;

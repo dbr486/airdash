@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"testing"
+	"time"
 )
 
 func serve(t *testing.T, status int, file string, gotKey, gotPath, gotQuery *string) *httptest.Server {
@@ -118,14 +119,14 @@ func ip(i int) *int       { return &i }
 
 func TestPickFlight_Fallbacks(t *testing.T) {
 	enroute := fl("En Route / Delayed", 0, nil, nil, ip(0), nil, false, false)
-	if f, ok := pickFlight([]flight{fl("Arrived", 100, sp("x"), sp("y"), nil, nil, false, false), enroute}); !ok || f.Status != "En Route / Delayed" {
+	if f, ok := pickFlight([]flight{fl("Arrived", 100, sp("x"), sp("y"), nil, nil, false, false), enroute}, time.Time{}, ""); !ok || f.Status != "En Route / Delayed" {
 		t.Errorf("status prefix fallback failed: %+v ok=%v", f, ok)
 	}
 	half := fl("Taxiing", 50, nil, nil, ip(0), nil, false, false)
-	if f, ok := pickFlight([]flight{half}); !ok || f.Status != "Taxiing" {
+	if f, ok := pickFlight([]flight{half}, time.Time{}, ""); !ok || f.Status != "Taxiing" {
 		t.Errorf("progress fallback failed: %+v ok=%v", f, ok)
 	}
-	if _, ok := pickFlight(nil); ok {
+	if _, ok := pickFlight(nil, time.Time{}, ""); ok {
 		t.Error("empty list must be unknown")
 	}
 }
@@ -138,7 +139,7 @@ func TestPickFlight_Fallbacks(t *testing.T) {
 func TestPickFlight_StaleCancelledPlusDepartingIsUnknown(t *testing.T) {
 	staleCancelled := fl("Cancelled", 0, nil, nil, nil, nil, true, false)
 	notYetDeparted := fl("Scheduled", 0, nil, nil, nil, nil, false, false)
-	if _, ok := pickFlight([]flight{staleCancelled, notYetDeparted}); ok {
+	if _, ok := pickFlight([]flight{staleCancelled, notYetDeparted}, time.Time{}, ""); ok {
 		t.Error("a stale cancelled instance plus a not-yet-departed one must be unknown")
 	}
 }
@@ -217,5 +218,58 @@ func TestIdent(t *testing.T) {
 		if got := Ident(c.cs, c.reg); got != c.want {
 			t.Errorf("Ident(%q,%q) = %q, want %q", c.cs, c.reg, got, c.want)
 		}
+	}
+}
+
+// FlightAware logs a take-off a minute or two late, so an aircraft first
+// seen airborne just after leaving can still be "Scheduled" there. The one
+// instance due off at that moment, assigned this aircraft's registration, is
+// the one overhead; a later leg or another tail is not.
+func TestPickFlight_JustTakenOffBeforeFlightAwareKnows(t *testing.T) {
+	seen := time.Date(2026, 10, 30, 17, 54, 20, 0, time.UTC)
+	departing := flight{Ident: "EWG535", Status: "Scheduled / Delayed", Registration: "D-AGWG",
+		ScheduledOff: sp("2026-10-30T17:50:00Z"), EstimatedOff: sp("2026-10-30T17:54:00Z")}
+	yesterday := flight{Ident: "EWG535", Status: "Arrived / Gate Arrival", Registration: "D-AEWV",
+		ActualOff: sp("2026-10-29T10:14:20Z"), ActualOn: sp("2026-10-29T13:06:59Z"), ScheduledOff: sp("2026-10-29T10:05:00Z")}
+	if f, ok := pickFlight([]flight{departing, yesterday}, seen, "D-AGWG"); !ok || f.Registration != "D-AGWG" {
+		t.Errorf("the instance due off now must be picked: %+v ok=%v", f, ok)
+	}
+	if _, ok := pickFlight([]flight{departing}, seen, "DAGWG"); !ok {
+		t.Error("registrations compare without the dash")
+	}
+	// An inbound aircraft first seen on approach: its next leg under the same
+	// number cannot leave within minutes of that sighting.
+	nextLeg := departing
+	nextLeg.ScheduledOff, nextLeg.EstimatedOff = sp("2026-10-30T18:09:20Z"), nil
+	if _, ok := pickFlight([]flight{nextLeg}, seen, "D-AGWG"); ok {
+		t.Error("a leg due off 15 min after the first sighting is not the aircraft overhead")
+	}
+	laterLeg := flight{Status: "Scheduled", Registration: "D-AGWG", ScheduledOff: sp("2026-10-30T21:00:00Z")}
+	if _, ok := pickFlight([]flight{laterLeg}, seen, "D-AGWG"); ok {
+		t.Error("a leg due off hours from now is not the aircraft overhead")
+	}
+	cancelled := departing
+	cancelled.Cancelled = true
+	if _, ok := pickFlight([]flight{cancelled}, seen, "D-AGWG"); ok {
+		t.Error("a cancelled instance is never the aircraft overhead")
+	}
+	if _, ok := pickFlight([]flight{departing}, seen, "D-ABZE"); ok {
+		t.Error("another tail is not this aircraft")
+	}
+	if _, ok := pickFlight([]flight{departing}, seen, ""); ok {
+		t.Error("without the aircraft's registration nothing confirms it")
+	}
+	noTail := departing
+	noTail.Registration = ""
+	if _, ok := pickFlight([]flight{noTail}, seen, "D-AGWG"); ok {
+		t.Error("without an assigned registration nothing confirms it")
+	}
+	if _, ok := pickFlight([]flight{departing}, time.Time{}, "D-AGWG"); ok {
+		t.Error("without a first sighting there is nothing to date the take-off against")
+	}
+	twin := departing
+	twin.ScheduledOff, twin.EstimatedOff = sp("2026-10-30T18:00:00Z"), nil
+	if _, ok := pickFlight([]flight{departing, twin}, seen, "D-AGWG"); ok {
+		t.Error("two instances due off now must fail closed")
 	}
 }

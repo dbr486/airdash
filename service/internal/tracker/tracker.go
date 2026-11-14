@@ -520,7 +520,7 @@ func applyRoute(c *candidate, r flightstatus.FlightRoute) {
 func queryFor(c candidate, seen time.Time) flightstatus.Query {
 	return flightstatus.Query{Callsign: c.ac.Callsign, AirlineIATA: c.route.AirlineIATA,
 		Origin: firstNonEmpty(c.route.OriginIATA, c.route.OriginICAO), Dest: firstNonEmpty(c.route.DestIATA, c.route.DestICAO),
-		Seen: seen}
+		Seen: seen, Reg: c.ac.Reg}
 }
 
 // sighting is one pass of an aircraft through range. The route memory rides

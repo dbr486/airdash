@@ -3,6 +3,7 @@ package flightstatus
 import (
 	"context"
 	"errors"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -46,13 +47,22 @@ func (c *Cache) Status(ctx context.Context, q Query) (Status, bool, error) {
 }
 
 // Flight serves both Status and route readers from one entry keyed by the
-// ident, so a route lookup and a delay lookup for the same aircraft share
-// a single paid call.
+// ident and the pass (first sighting), so a route lookup and a delay lookup
+// for the same aircraft share a single paid call. The pass is in the key
+// because the chosen instance depends on it; errors stay keyed by ident
+// alone, so a cooldown (a bad key above all) is not reset by a new pass.
 func (c *Cache) Flight(ctx context.Context, q Query) (Flight, bool, error) {
 	callsign := q.Callsign
+	key := callsign
+	if !q.Seen.IsZero() {
+		key += "@" + strconv.FormatInt(q.Seen.Unix(), 10)
+	}
 	now := c.now()
 	c.mu.Lock()
 	e, hit := c.entries[callsign]
+	if !hit || !e.err || !now.Before(e.expires) {
+		e, hit = c.entries[key]
+	}
 	c.mu.Unlock()
 	if hit && now.Before(e.expires) {
 		if e.err {
@@ -75,7 +85,7 @@ func (c *Cache) Flight(ctx context.Context, q Query) (Flight, bool, error) {
 	if ok {
 		ttl = c.knownTTL
 	}
-	c.entries[callsign] = entry{fl: fl, ok: ok, expires: now.Add(ttl)}
+	c.entries[key] = entry{fl: fl, ok: ok, expires: now.Add(ttl)}
 	for k, v := range c.entries {
 		if !now.Before(v.expires) {
 			delete(c.entries, k)

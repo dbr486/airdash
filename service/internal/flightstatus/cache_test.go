@@ -222,3 +222,34 @@ func TestBudgeted_OneUnitPerInnerCallForEitherMethod(t *testing.T) {
 		t.Errorf("used = %d, want 2 (one per inner call)", used)
 	}
 }
+
+// The answer depends on when the aircraft was first seen (a just-departed
+// instance is dated against it), so a new pass must not replay an answer
+// chosen for another; one pass still shares one entry between readers.
+func TestCache_KeyedByPass(t *testing.T) {
+	ck := &clock{t: time.Date(2026, 10, 30, 17, 0, 0, 0, time.UTC)}
+	inner := &fakeLookup{}
+	c := NewCache(inner, 15*time.Minute, 15*time.Minute, time.Minute, ck.now)
+	pass1 := Query{Callsign: "EWG8ZR", Seen: ck.t}
+	c.Flight(t.Context(), pass1)
+	c.Status(t.Context(), pass1)
+	if inner.calls != 1 {
+		t.Fatalf("one pass shares one entry, calls=%d", inner.calls)
+	}
+	ck.advance(5 * time.Minute)
+	c.Flight(t.Context(), Query{Callsign: "EWG8ZR", Seen: ck.t})
+	if inner.calls != 2 {
+		t.Errorf("a new pass must ask again, calls=%d", inner.calls)
+	}
+}
+
+func TestCache_ErrorCooldownSpansPasses(t *testing.T) {
+	ck := &clock{t: time.Date(2026, 10, 30, 17, 0, 0, 0, time.UTC)}
+	inner := &fakeLookup{err: ErrAuth}
+	c := NewCache(inner, 15*time.Minute, 15*time.Minute, time.Minute, ck.now)
+	c.Flight(t.Context(), Query{Callsign: "EWG8ZR", Seen: ck.t})
+	ck.advance(5 * time.Minute)
+	if _, _, err := c.Flight(t.Context(), Query{Callsign: "EWG8ZR", Seen: ck.t}); !errors.Is(err, ErrCooldown) || inner.calls != 1 {
+		t.Errorf("a bad key must stay in cooldown across passes: calls=%d err=%v", inner.calls, err)
+	}
+}
