@@ -37,7 +37,16 @@ Wiring is in `cmd/airdash/main.go`; each package has one job.
    this hex".
 3. **`routes`**: callsign → airline, origin and destination from adsbdb,
    cached for `AIRDASH_ROUTE_CACHE_HOURS`, with a cooldown after errors.
-   City names come from the same answer.
+   City names come from the same answer. adsbdb routes have no date and go
+   stale when an airline reuses a flight number, so before the filter the
+   tracker settles each aircraft's route in order: a board or AeroAPI route
+   already found this pass (so it cannot flap); the airport board's one row
+   for the same callsign whose leg is flying now (departed within 45 min or
+   up to 3 h behind schedule, or due to land within an hour and not landed,
+   not cancelled: today's schedule, free); then adsbdb's route, only if
+   the aircraft's position could lie on it (detour via its position at most
+   1.25 × the direct distance plus 100 km). Otherwise the airports are
+   dropped, the airline stays, and step 5 may ask AeroAPI.
    **`operators`** then names the operating airline for each aircraft that
    survives the filter: the callsign prefix is looked up in the embedded
    VRS airline list; failing that (and when the route gave no airline) the
@@ -55,17 +64,15 @@ Wiring is in `cmd/airdash/main.go`; each package has one job.
    - **`flightstatus`** (with `AIRDASH_AEROAPI_KEY`): a per-flight AeroAPI
      lookup, only for the aircraft on screen. Results are cached for
      15 minutes and capped per UTC day.
-5. **Route fallback** (tracker): when the free `routes` lookup has no route
-   for the nearest aircraft after filters, the tracker tries, in order, the
-   airport board's row with the same callsign (free) and then, with
-   `paid_routes` on, one AeroAPI `/flights/{ident}` call (ident = callsign,
-   else the registration without its dash; light aircraft are skipped). The
-   AeroAPI call goes through the same 15-minute cache as the delay lookup,
-   so route and delay never cost two calls, and it spends the same daily
-   cap. A found route or an "unknown" answer is remembered for the rest of
-   that aircraft's pass, so one aircraft costs at most one route-only call
-   per pass. Filters keep using the free route only; a filled route changes
-   what is shown, not what is listed.
+5. **Route fallback** (tracker): when step 3 leaves the nearest aircraft
+   with no route and `paid_routes` is on, the tracker makes one AeroAPI
+   `/flights/{ident}` call (ident = callsign, else the registration without
+   its dash; light aircraft are skipped). The call goes through the same
+   15-minute cache as the delay lookup, so route and delay never cost two
+   calls, and it spends the same daily cap. A found route or an "unknown"
+   answer is remembered for the rest of that aircraft's pass, so one
+   aircraft costs at most one route-only call per pass. Filters run before
+   this call; a paid route changes what is shown, not what is listed.
 6. **`logos`**: fetches the airline's square logo from the CDN, crops the
    wordmark out of its padding and fits it (`fit.go`). It serves RGB565 for
    the displays and PNG for the page, cached for a week.

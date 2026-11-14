@@ -376,7 +376,7 @@ func TestRoute_TwoPlausibleRowsFailClosed(t *testing.T) {
 	now := at(13, 30)
 	b := routeBoard(t, []Row{
 		{FlightICAO: "ABC123", DepIATA: "AGP", ArrIATA: "FCO", DepSched: at(13, 0)},
-		{FlightICAO: "ABC123", DepIATA: "AGP", ArrIATA: "MAD", DepSched: at(15, 0)},
+		{FlightICAO: "ABC123", DepIATA: "AGP", ArrIATA: "MAD", DepSched: at(13, 25)},
 	}, &now)
 	if _, ok := b.Route(flightstatus.Query{Callsign: "ABC123"}, now); ok {
 		t.Error("a tie must be a miss so the paid exact source can answer")
@@ -395,5 +395,47 @@ func TestRoute_StaleBoardAndOtherCallsignAreMisses(t *testing.T) {
 	later := now.Add(3*time.Hour + time.Minute)
 	if _, ok := b.Route(flightstatus.Query{Callsign: "ABC123"}, later); ok {
 		t.Error("a board older than maxAge must miss")
+	}
+}
+
+// The board's row must be the leg flying now: a callsign shared by legs of
+// one tag-on flight, or a row that has already landed or was cancelled, is
+// another flight instance and must not name the aircraft's route.
+func TestRoute_OnlyTheLegAirborneNow(t *testing.T) {
+	now := at(13, 30)
+	cases := []struct {
+		name string
+		row  Row
+		want bool
+	}{
+		{"departed 10 min ago", Row{DepIATA: "AGP", ArrIATA: "WAW", DepSched: at(13, 15), DepActual: at(13, 20)}, true},
+		{"no actual yet, 30 min behind schedule", Row{DepIATA: "AGP", ArrIATA: "WAW", DepSched: at(13, 0)}, true},
+		{"later leg, departs in 2 h", Row{DepIATA: "AGP", ArrIATA: "WAW", DepSched: at(15, 30)}, false},
+		{"departed 2 h ago", Row{DepIATA: "AGP", ArrIATA: "WAW", DepSched: at(11, 25), DepActual: at(11, 30)}, false},
+		{"arriving in 20 min", Row{DepIATA: "TFS", ArrIATA: "AGP", ArrSched: at(13, 50)}, true},
+		{"arrival 4 h away (an earlier leg flies now)", Row{DepIATA: "TFS", ArrIATA: "AGP", ArrSched: at(17, 30)}, false},
+		{"landed 30 min ago", Row{DepIATA: "TFS", ArrIATA: "AGP", ArrSched: at(13, 0), ArrActual: at(13, 0)}, false},
+		{"later leg, schedule recent but estimate 3 h out", Row{DepIATA: "AGP", ArrIATA: "WAW", DepSched: at(13, 0), DepEst: at(16, 30)}, false},
+		{"short inbound leg not departed yet", Row{DepIATA: "MLN", ArrIATA: "AGP", DepEst: at(13, 50), ArrEst: at(14, 20)}, false},
+		{"cancelled", Row{DepIATA: "AGP", ArrIATA: "WAW", DepSched: at(13, 20), Status: "cancelled"}, false},
+	}
+	for _, c := range cases {
+		r := c.row
+		r.FlightICAO = "WZZ2765"
+		b := routeBoard(t, []Row{r}, &now)
+		if _, ok := b.Route(flightstatus.Query{Callsign: "WZZ2765"}, now); ok != c.want {
+			t.Errorf("%s: ok=%v, want %v", c.name, ok, c.want)
+		}
+	}
+}
+
+func TestRoute_OtherLegDoesNotBlockTheAirborneOne(t *testing.T) {
+	now := at(13, 30)
+	b := routeBoard(t, []Row{
+		{FlightICAO: "WZZ2765", DepIATA: "TFS", ArrIATA: "AGP", ArrSched: at(12, 40), ArrActual: at(12, 35)},
+		{FlightICAO: "WZZ2765", DepIATA: "AGP", ArrIATA: "WAW", DepSched: at(13, 15), DepActual: at(13, 20)},
+	}, &now)
+	if got, ok := b.Route(flightstatus.Query{Callsign: "WZZ2765"}, now); !ok || got.DestIATA != "WAW" {
+		t.Errorf("the landed inbound leg must not tie with the outbound: %+v ok=%v", got, ok)
 	}
 }

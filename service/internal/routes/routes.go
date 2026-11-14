@@ -16,6 +16,11 @@ type Route struct {
 	// option. Empty when adsbdb has none; callers fall back to the code.
 	OriginName string
 	DestName   string
+	// Airport positions, when the source gives them; HasCoords guards the
+	// zero value so a route without them is never judged implausible.
+	HasCoords            bool
+	OriginLat, OriginLon float64
+	DestLat, DestLon     float64
 }
 
 // Lookup resolves one callsign. The bool distinguishes "definitely

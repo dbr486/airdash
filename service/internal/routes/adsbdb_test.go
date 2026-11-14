@@ -39,7 +39,8 @@ func TestADSBDB_KnownRoute(t *testing.T) {
 		t.Fatalf("expected route to be known")
 	}
 	want := Route{Airline: "British Airways", AirlineIATA: "BA", OriginIATA: "LHR", OriginICAO: "EGLL", DestIATA: "BCN", DestICAO: "LEBL",
-		OriginName: "London", DestName: "Barcelona"}
+		OriginName: "London", DestName: "Barcelona",
+		HasCoords: true, OriginLat: 51.4706, OriginLon: -0.461941, DestLat: 41.2971, DestLon: 2.07846}
 	if r != want {
 		t.Errorf("got %+v, want %+v", r, want)
 	}

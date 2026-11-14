@@ -158,6 +158,44 @@ func callsignRows(rows []Row, codes []string, cs string, arrival, dirKnown bool,
 	return best, bestDist, n
 }
 
+// airborneNow reports whether a row could be the flight an aircraft seen
+// airborne near the board airport is flying now, using the same windows as
+// Match: a departure that has left (or, with no recorded take-off, is due
+// within depLateMax of its schedule), or an arrival due within arrAfter that
+// has not landed.
+func airborneNow(r Row, arrival bool, now time.Time) bool {
+	if r.Status == "cancelled" {
+		return false
+	}
+	if arrival {
+		if !r.ArrActual.IsZero() && now.Sub(r.ArrActual) > landedGrace {
+			return false
+		}
+		// A short leg can be due within the hour yet not have left: then
+		// it is the next leg under the same number, not the one airborne.
+		if dep := first(r.DepActual, r.DepEst, r.DepSched); !dep.IsZero() && dep.Sub(now) > depAfter {
+			return false
+		}
+		ref := first(r.ArrEst, r.ArrSched)
+		d := now.Sub(ref)
+		return !ref.IsZero() && d <= arrBefore && d >= -arrAfter
+	}
+	if !r.DepActual.IsZero() {
+		d := now.Sub(r.DepActual)
+		return d <= depBefore && d >= -depAfter
+	}
+	// An estimate still well ahead puts the leg on the ground, however
+	// recent its schedule: it is a later leg under the same number.
+	if !r.DepEst.IsZero() && r.DepEst.Sub(now) > depAfter {
+		return false
+	}
+	ds := now.Sub(r.DepSched)
+	de := now.Sub(first(r.DepEst, r.DepSched))
+	okSched := !r.DepSched.IsZero() && ds <= depLateMax && ds >= -depAfter
+	okEst := !r.DepEst.IsZero() && de <= depBefore && de >= -depAfter
+	return okSched || okEst
+}
+
 // RouteOf reads the two ends off a board row. The board has no city or
 // operator names, so those stay empty rather than guessed.
 func RouteOf(r Row) flightstatus.FlightRoute {

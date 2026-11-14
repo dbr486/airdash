@@ -123,8 +123,8 @@ credit ≈ 1000 lookups/month) and set `AIRDASH_AEROAPI_KEY`. The service
 looks up on-time / delayed status only for the aircraft currently on
 screen, caches each result for 15 minutes, and caps lookups per UTC day
 via `delay_lookups_per_day` (default 65, editable on the page). The same
-key and cap also fill a missing route: when adsbdb and the airport board
-do not know the nearest aircraft's route and `paid_routes` is on (default
+key and cap also fill a missing route: when the airport board does not
+list the flight and adsbdb has no route the aircraft could be flying and `paid_routes` is on (default
 on with a key), one AeroAPI call names its origin and destination; that
 call also answers the delay, so one aircraft never costs two. Light
 aircraft are skipped, and an unknown answer is not retried while the

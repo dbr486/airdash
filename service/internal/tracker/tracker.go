@@ -92,7 +92,7 @@ type Options struct {
 	// cache instance that sits inside Delay: one entry per ident then serves
 	// both, so route and delay never cost two AeroAPI calls. nil disables it.
 	Flights flightstatus.FlightLookup
-	// BoardRoute is the free route source tried before Flights; nil = off.
+	// BoardRoute is the first route source, ahead of adsbdb; nil = off.
 	BoardRoute BoardRoute
 	Filter     filter.Filter
 	Settings   SettingsSource
@@ -193,6 +193,9 @@ type candidate struct {
 	bearing int
 	route   routes.Route
 	known   bool
+	// board is the route the airport board gave this tick, to be remembered
+	// for the rest of the pass once the aircraft has a sighting.
+	board *flightstatus.FlightRoute
 }
 
 func (t *Tracker) Tick(ctx context.Context) {
@@ -254,6 +257,7 @@ func (t *Tracker) Tick(ctx context.Context) {
 				c.route, c.known = r, ok
 			}
 		}
+		t.preferRoute(&c, fetchedAt)
 		if f.Active() && !(c.known && f.Match(c.route)) {
 			continue
 		}
@@ -285,6 +289,11 @@ func (t *Tracker) Tick(ctx context.Context) {
 	// range by identity, not just read the nearest.
 	sort.SliceStable(matched, func(i, j int) bool { return matched[i].distKm < matched[j].distKm })
 	seen := t.sightings(matched, fetchedAt)
+	for _, c := range matched {
+		if c.board != nil {
+			t.remember(c.ac.Hex, passRoute{state: passFound, route: *c.board})
+		}
+	}
 	list := make([]Snapshot, len(matched))
 	for i, c := range matched {
 		list[i] = toSnapshot(c, nearby, radiusKm)
@@ -332,7 +341,8 @@ func (t *Tracker) Tick(ctx context.Context) {
 			s := paid.fl.Status
 			snap.Delay = &s
 		}
-	} else if ident := t.delayIdent(best); ident != "" && snap.Delay == nil && t.o.Delay != nil && wantDelay {
+	} else if ident := t.delayIdent(best); ident != "" && snap.Delay == nil && t.o.Delay != nil && wantDelay &&
+		!t.passMemo(best.ac.Hex, fetchedAt).noFlight {
 		dctx, cancel := context.WithTimeout(ctx, t.o.DelayTimeout)
 		dq := queryFor(*best, seen[best.ac.Hex])
 		dq.Callsign = ident
@@ -392,28 +402,16 @@ type paidCall struct {
 	err    error
 }
 
-// fillRoute gives the nearest aircraft a route when the free route lookup
-// had none: first from this pass's memory, then the airport board, and only
-// then one AeroAPI call. Filters already ran on the free route, so a route
-// found here can change what is shown, never what is listed.
+// fillRoute gives the nearest aircraft a route with one AeroAPI call when
+// preferRoute left it none. Filters already ran, so a route found here can
+// change what is shown, never what is listed.
 func (t *Tracker) fillRoute(ctx context.Context, c *candidate, seen, now time.Time) (changed bool, paid paidCall) {
 	if hasRoute(c.route) {
 		return false, paid
 	}
 	hex := c.ac.Hex
-	switch m := t.passMemo(hex); m.state {
-	case passFound:
-		applyRoute(c, m.route)
-		return true, paid
-	case passUnknown:
+	if t.passMemo(hex, now).state == passUnknown {
 		return false, paid
-	}
-	if t.o.BoardRoute != nil {
-		if r, ok := t.o.BoardRoute.Route(queryFor(*c, seen), now); ok {
-			applyRoute(c, r)
-			t.remember(hex, passRoute{state: passFound, route: r})
-			return true, paid
-		}
 	}
 	if t.o.Flights == nil || t.o.Settings == nil || !t.o.Settings.PaidRoutesWanted() || light(c.ac) {
 		return false, paid
@@ -441,9 +439,57 @@ func (t *Tracker) fillRoute(ctx context.Context, c *candidate, seen, now time.Ti
 		// Remembered for the whole pass, not the cache's 15 minutes: an
 		// aircraft AeroAPI cannot name now will not become nameable
 		// overhead, and each retry would spend the shared daily cap.
-		t.remember(hex, passRoute{state: passUnknown})
+		t.remember(hex, passRoute{state: passUnknown, noFlight: !ok})
 	}
 	return changed, paid
+}
+
+// preferRoute settles which route an aircraft shows, before the filter sees
+// it. A route the board or AeroAPI gave earlier in this pass comes first, so
+// it cannot flap mid-pass. Then the airport board: it lists today's flights
+// with their times, while adsbdb keeps whatever a flight number last flew,
+// and airlines reuse numbers on other city pairs. adsbdb's route is kept only if the aircraft's
+// position could lie on it; otherwise its ends are dropped (the airline from
+// the callsign prefix stays) and fillRoute may ask AeroAPI.
+func (t *Tracker) preferRoute(c *candidate, now time.Time) {
+	if m := t.passMemo(c.ac.Hex, now); m.state == passFound {
+		useRoute(c, m.route)
+		return
+	}
+	if t.o.BoardRoute != nil && c.ac.Callsign != "" {
+		if r, ok := t.o.BoardRoute.Route(queryFor(*c, time.Time{}), now); ok {
+			useRoute(c, r)
+			c.board = &r
+			return
+		}
+	}
+	if hasRoute(c.route) && !c.route.Plausible(c.ac.Lat, c.ac.Lon) {
+		t.o.Logger.Debug("implausible route dropped", "callsign", c.ac.Callsign,
+			"route", firstNonEmpty(c.route.OriginIATA, c.route.OriginICAO)+"-"+firstNonEmpty(c.route.DestIATA, c.route.DestICAO))
+		c.route = routes.Route{Airline: c.route.Airline, AirlineIATA: c.route.AirlineIATA}
+	}
+}
+
+// useRoute puts a board or AeroAPI route on the candidate. When it names the
+// same airports as adsbdb, adsbdb's route is kept for its city names.
+func useRoute(c *candidate, r flightstatus.FlightRoute) {
+	c.known = true
+	if sameEnd(c.route.OriginIATA, c.route.OriginICAO, r.OriginIATA, r.OriginICAO) &&
+		sameEnd(c.route.DestIATA, c.route.DestICAO, r.DestIATA, r.DestICAO) {
+		return
+	}
+	applyRoute(c, r)
+}
+
+// sameEnd compares two airports by whichever code both sides have.
+func sameEnd(iataA, icaoA, iataB, icaoB string) bool {
+	switch {
+	case iataA != "" && iataB != "":
+		return iataA == iataB
+	case icaoA != "" && icaoB != "":
+		return icaoA == icaoB
+	}
+	return false
 }
 
 func hasRoute(r routes.Route) bool {
@@ -498,12 +544,21 @@ const (
 type passRoute struct {
 	state passState
 	route flightstatus.FlightRoute
+	// noFlight: AeroAPI has no such flight at all, so it has no delay either
+	// and the delay path must not pay to ask again once the cache expires.
+	noFlight bool
 }
 
-func (t *Tracker) passMemo(hex string) passRoute {
+// passMemo is read before sightings() forgets long-gone aircraft, so it
+// applies the same grace itself: a returning aircraft starts a new pass.
+func (t *Tracker) passMemo(hex string, now time.Time) passRoute {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	return t.seen[hex].route
+	s, ok := t.seen[hex]
+	if !ok || now.Sub(s.last) > sightingGrace {
+		return passRoute{}
+	}
+	return s.route
 }
 
 func (t *Tracker) remember(hex string, r passRoute) {

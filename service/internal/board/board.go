@@ -181,11 +181,22 @@ func (b *Board) Route(q flightstatus.Query, now time.Time) (flightstatus.FlightR
 	if cs == "" || airport == "" || len(rows) == 0 || now.Sub(fetchedAt) > b.maxAge {
 		return flightstatus.FlightRoute{}, false
 	}
-	r, _, n := callsignRows(rows, airportCodes(rows, airport), cs, false, false, now)
+	// Unlike Status, which may report on a flight still at the gate, the route
+	// names an aircraft already airborne, so only a row for the leg flying
+	// now counts. Tag-on flights reuse one number for several legs.
+	codes := airportCodes(rows, airport)
+	var hit Row
+	n := 0
+	for _, r := range rows {
+		if r.FlightICAO == cs && airborneNow(r, sameAirportAny(codes, r.ArrIATA, r.ArrICAO), now) {
+			hit = r
+			n++
+		}
+	}
 	if n != 1 {
 		return flightstatus.FlightRoute{}, false
 	}
-	return RouteOf(r), true
+	return RouteOf(hit), true
 }
 
 func (b *Board) Stats() Stats {

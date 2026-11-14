@@ -41,9 +41,11 @@ type adsbdbRoute struct {
 }
 
 type adsbdbAirport struct {
-	IATA         string `json:"iata_code"`
-	ICAO         string `json:"icao_code"`
-	Municipality string `json:"municipality"`
+	IATA         string   `json:"iata_code"`
+	ICAO         string   `json:"icao_code"`
+	Municipality string   `json:"municipality"`
+	Lat          *float64 `json:"latitude"`
+	Lon          *float64 `json:"longitude"`
 }
 
 func (a *ADSBDB) Route(ctx context.Context, callsign string) (Route, bool, error) {
@@ -107,7 +109,11 @@ func decodeADSBDB(body []byte) (Route, bool, error) {
 	if fr.Origin.IATA == "" && fr.Origin.ICAO == "" {
 		return Route{}, false, nil
 	}
+	o, d := fr.Origin, fr.Destination
 	return Route{
+		HasCoords: o.Lat != nil && o.Lon != nil && d.Lat != nil && d.Lon != nil,
+		OriginLat: deref(o.Lat), OriginLon: deref(o.Lon),
+		DestLat: deref(d.Lat), DestLon: deref(d.Lon),
 		Airline:     fr.Airline.Name,
 		AirlineIATA: airlineIATA(fr.Airline.IATA),
 		OriginIATA:  fr.Origin.IATA,
@@ -117,4 +123,11 @@ func decodeADSBDB(body []byte) (Route, bool, error) {
 		OriginName:  asciiFold(fr.Origin.Municipality),
 		DestName:    asciiFold(fr.Destination.Municipality),
 	}, true, nil
+}
+
+func deref(f *float64) float64 {
+	if f == nil {
+		return 0
+	}
+	return *f
 }
