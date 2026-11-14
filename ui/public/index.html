@@ -113,6 +113,11 @@
 <script>
 // --- settings form ---
 let current = null;
+// Unapplied edits in the settings form. mirror.js asks mirrorMayReload()
+// before reloading the page after a deploy, so a reload never throws
+// them away; fillForm (load or a successful Apply) clears it.
+let formDirty = false;
+function mirrorMayReload() { return !formDirty; }
 
 // Called by mirror.js after every poll. The service may have still been
 // down when the page first loaded, so settings were never fetched; a later
@@ -138,6 +143,7 @@ function updateStatus() {
 }
 function fillForm(s) {
   current = s;
+  formDirty = false;
   const set = [s.origin && 'origin', s.dest && 'dest', s.airport && 'airport'].filter(Boolean);
   let mode = 'all', codes = '';
   if (set.length === 1) { mode = set[0]; codes = s[mode]; }
@@ -166,6 +172,7 @@ function syncCodesEnabled() {
   $('codes').disabled = mode === 'all';
 }
 document.querySelectorAll('input[name=mode]').forEach((r) => r.addEventListener('change', syncCodesEnabled));
+for (const ev of ['input', 'change']) $('filters').addEventListener(ev, () => { formDirty = true; });
 
 async function loadSettings() {
   try {
@@ -266,6 +273,7 @@ $('find').addEventListener('click', async () => {
     if (!res.ok) throw new Error(out.error || `http ${res.status}`);
     $('lat').value = out.lat.toFixed(6);
     $('lon').value = out.lon.toFixed(6);
+    formDirty = true; // set from code, so no input event fired
     msg.textContent = `${out.name} — press Apply to move home there`;
   } catch (e) {
     msg.textContent = e.message;

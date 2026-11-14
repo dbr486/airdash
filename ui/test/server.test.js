@@ -147,3 +147,30 @@ test('settings page carries the Home Assistant snippet and the shared mirror', a
   assert.equal(js.status, 200);
   assert.match(await js.text(), /async function poll\(\)/);
 });
+
+test('page assets are refetched so a deploy reaches open browsers', async () => {
+  for (const p of ['/', '/widget', '/mirror.js']) {
+    const res = await fetch(`${appUrl}${p}`);
+    assert.equal(res.status, 200, p);
+    assert.equal(res.headers.get('cache-control'), 'no-cache', p);
+    assert.equal(res.headers.get('last-modified'), null, p);
+    assert.equal(res.headers.get('etag'), null, p);
+  }
+});
+
+test('api responses carry a stable UI version', async () => {
+  const a = await fetch(`${appUrl}/api/nearest`);
+  const b = await fetch(`${appUrl}/api/settings`);
+  const v = a.headers.get('x-airdash-ui');
+  assert.match(v ?? '', /^[0-9a-f]{12}$/);
+  assert.equal(b.headers.get('x-airdash-ui'), v);
+});
+
+test('the UI version is sent on upstream errors too', async () => {
+  const down = createApp({ apiBase: 'http://127.0.0.1:1', logger: () => {} }).listen(0, '127.0.0.1');
+  await new Promise((r) => down.once('listening', r));
+  const res = await fetch(`http://127.0.0.1:${down.address().port}/api/nearest`);
+  down.close();
+  assert.equal(res.status, 502);
+  assert.match(res.headers.get('x-airdash-ui') ?? '', /^[0-9a-f]{12}$/);
+});

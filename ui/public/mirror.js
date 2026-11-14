@@ -11,6 +11,10 @@ let dotOn = false, screen = 'boot', lastNearby = 0;
 let lastOkAt = null;
 // Aircraft being followed (its hex) after "Next aircraft"; '' = the nearest.
 let selectedHex = '', nextRequested = false;
+// UI version the page was loaded with (X-AirDash-UI on /api responses).
+// When a deploy changes it, the page reloads itself: a widget left open for
+// days would otherwise keep rendering with the old script.
+let uiVersion = null;
 // Poll sequence number: a slow interval poll must not overwrite the answer
 // to a later click (it would undo the step).
 let pollSeq = 0;
@@ -80,6 +84,19 @@ function render(n) {
   marks(n.age_s > STALE_AFTER_S, false);
 }
 
+function reloadIfUpdated(v) {
+  if (!v) return false;
+  if (uiVersion === null) { uiVersion = v; return false; }
+  if (v === uiVersion) return false;
+  // Never throw away what someone is typing or has not applied yet on the
+  // settings page; a later poll reloads once they are done.
+  const el = document.activeElement;
+  if (el && /^(INPUT|SELECT|TEXTAREA)$/.test(el.tagName)) return false;
+  if (typeof mirrorMayReload === 'function' && !mirrorMayReload()) return false;
+  location.reload();
+  return true;
+}
+
 async function poll() {
   let res;
   try {
@@ -88,6 +105,7 @@ async function poll() {
     const mine = ++pollSeq;
     res = await fetch('/api/nearest' + q, { cache: 'no-store' });
     if (mine !== pollSeq) return;
+    if (reloadIfUpdated(res.headers.get('X-AirDash-UI'))) return;
     if (!res.ok) throw new Error(`http ${res.status}`);
   } catch (e) {
     // Network/HTTP failure: the service itself is unreachable or erroring.
