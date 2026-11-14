@@ -15,6 +15,11 @@ import (
 // waiting for the normal consecutive-failure threshold.
 var ErrRateLimited = errors.New("provider: rate limited")
 
+// ErrBadBody marks an answer whose body is not a usable aircraft list,
+// such as an {"error":"..."} envelope sent with a 200: the transport saw a
+// clean call, so the tracker reports it as the feed's error.
+var ErrBadBody = errors.New("provider: bad response body")
+
 type Aircraft struct {
 	Hex      string
 	Callsign string

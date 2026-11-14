@@ -247,3 +247,39 @@ func TestGate_StaleSuccessKeepsStreak(t *testing.T) {
 		t.Fatal("second caller admitted while the probe is out")
 	}
 }
+
+func TestGatePausedUntil(t *testing.T) {
+	var status atomic.Int32
+	status.Store(http.StatusTooManyRequests)
+	srv, _ := gateServer(t, &status, "")
+	ck := &clock{t: time.Date(2026, 10, 31, 18, 0, 0, 0, time.UTC)}
+	g := NewGate(ck.now, slog.New(slog.DiscardHandler))
+	if !g.PausedUntil().IsZero() {
+		t.Fatal("open gate reports a pause")
+	}
+	_, _, _ = gateGet(t, g.Wrap(srv.Client()), srv.URL)
+	want := ck.now().Add(defaultRateLimit + rateLimitMargin)
+	if got := g.PausedUntil(); !got.Equal(want) {
+		t.Fatalf("PausedUntil = %v, want %v", got, want)
+	}
+	ck.advance(defaultRateLimit + rateLimitMargin + time.Second)
+	if !g.PausedUntil().IsZero() {
+		t.Fatal("expired pause still reported")
+	}
+}
+
+func TestGateOnRefuse(t *testing.T) {
+	var status atomic.Int32
+	status.Store(http.StatusTooManyRequests)
+	srv, _ := gateServer(t, &status, "")
+	ck := &clock{t: time.Date(2026, 10, 31, 18, 0, 0, 0, time.UTC)}
+	g := NewGate(ck.now, slog.New(slog.DiscardHandler))
+	var refused []string
+	g.OnRefuse(func(r *http.Request) { refused = append(refused, r.URL.Path) })
+	c := g.Wrap(srv.Client())
+	_, _, _ = gateGet(t, c, srv.URL+"/v0/callsign/RYR1")
+	_, _, _ = gateGet(t, c, srv.URL+"/v0/callsign/RYR2")
+	if len(refused) != 1 || refused[0] != "/v0/callsign/RYR2" {
+		t.Fatalf("refused = %v", refused)
+	}
+}

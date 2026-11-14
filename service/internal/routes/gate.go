@@ -40,10 +40,11 @@ type Gate struct {
 	now    func() time.Time
 	logger *slog.Logger
 
-	mu      sync.Mutex
-	until   time.Time
-	streak  int  // 429s since the last other answer
-	probing bool // a request is in flight while streak > 0
+	mu       sync.Mutex
+	until    time.Time
+	streak   int  // 429s since the last other answer
+	probing  bool // a request is in flight while streak > 0
+	onRefuse func(*http.Request)
 }
 
 func NewGate(now func() time.Time, logger *slog.Logger) *Gate {
@@ -70,6 +71,12 @@ func (t *gateTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	g := t.gate
 	ok, probe := g.admit()
 	if !ok {
+		g.mu.Lock()
+		fn := g.onRefuse
+		g.mu.Unlock()
+		if fn != nil {
+			fn(req)
+		}
 		if req.Body != nil {
 			req.Body.Close() // RoundTrip must close it, even on error
 		}
@@ -78,6 +85,23 @@ func (t *gateTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	resp, err := t.base.RoundTrip(req)
 	g.done(resp, err, probe)
 	return resp, err
+}
+
+// PausedUntil is when the current ban window ends; zero while open.
+func (g *Gate) PausedUntil() time.Time {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.now().Before(g.until) {
+		return g.until
+	}
+	return time.Time{}
+}
+
+// OnRefuse registers fn to hear every request the closed gate turns away.
+func (g *Gate) OnRefuse(fn func(*http.Request)) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.onRefuse = fn
 }
 
 // admit reports whether a request may go out now, and whether it holds the

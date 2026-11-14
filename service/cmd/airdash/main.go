@@ -29,6 +29,7 @@ import (
 	"airdash/internal/settings"
 	"airdash/internal/sourcelog"
 	"airdash/internal/tracker"
+	"airdash/internal/usage"
 )
 
 const version = "0.1.0"
@@ -63,7 +64,12 @@ func run() error {
 	}
 
 	client := &http.Client{Timeout: 10 * time.Second}
-	prov, err := provider.New(cfg.Provider, client, userAgent)
+	// One meter per outside service: every network round trip is counted
+	// at the transport, so cache hits and gate refusals never show as calls.
+	aeroMeter, airlabsMeter := usage.NewMeter(time.Now), usage.NewMeter(time.Now)
+	adsbdbMeter, hexdbMeter := usage.NewMeter(time.Now), usage.NewMeter(time.Now)
+	posMeter := usage.NewMeter(time.Now)
+	prov, err := provider.New(cfg.Provider, posMeter.Wrap(client, nil), userAgent)
 	if err != nil {
 		return err
 	}
@@ -91,11 +97,14 @@ func run() error {
 	// One gate for every adsbdb client: its rate limit is per IP, so an
 	// owner lookup during a ban would keep the route lookups banned too. It
 	// sits outside the capture so a request it refuses leaves no row.
+	// The meter sits inside the gate, so a request the gate refuses counts
+	// as refused rather than as a call.
 	adsbdbGate := routes.NewGate(time.Now, logger)
-	adsbdbClient := adsbdbGate.Wrap(capture.Wrap(client, sink, tracker.SourceADSBDB, capture.SubjectLastSegment, time.Now))
-	hexdbClient := capture.Wrap(client, sink, tracker.SourceHexDB, capture.SubjectHexDB, time.Now)
-	aeroClient := capture.Wrap(client, sink, tracker.SourceAeroAPI, capture.SubjectLastSegment, time.Now)
-	airlabsClient := capture.Wrap(client, sink, capture.SourceAirLabs, capture.SubjectAirLabs, time.Now)
+	adsbdbGate.OnRefuse(func(r *http.Request) { adsbdbMeter.Refuse(capture.SubjectLastSegment(r)) })
+	adsbdbClient := adsbdbGate.Wrap(adsbdbMeter.Wrap(capture.Wrap(client, sink, tracker.SourceADSBDB, capture.SubjectLastSegment, time.Now), capture.SubjectLastSegment))
+	hexdbClient := hexdbMeter.Wrap(capture.Wrap(client, sink, tracker.SourceHexDB, capture.SubjectHexDB, time.Now), capture.SubjectHexDB)
+	aeroClient := aeroMeter.Wrap(capture.Wrap(client, sink, tracker.SourceAeroAPI, capture.SubjectLastSegment, time.Now), capture.SubjectLastSegment)
+	airlabsClient := airlabsMeter.Wrap(capture.Wrap(client, sink, capture.SourceAirLabs, capture.SubjectAirLabs, time.Now), capture.SubjectAirLabs)
 	logoSrc := logos.New(client, logos.DefaultBaseURL, userAgent, time.Now)
 	lookup := routes.NewCache(
 		routes.NewADSBDB(adsbdbClient, routes.DefaultADSBDBURL, userAgent),
@@ -107,7 +116,7 @@ func run() error {
 	// Owner answers change rarely, so known ones are cached for a week;
 	// unknown ones for a day in case the registry gets filled in.
 	opResolver := operators.NewResolver(operators.NewCache(
-		operators.NewADSBDBOwner(adsbdbGate.Wrap(client), routes.DefaultADSBDBURL, userAgent),
+		operators.NewADSBDBOwner(adsbdbGate.Wrap(adsbdbMeter.Wrap(client, capture.SubjectLastSegment)), routes.DefaultADSBDBURL, userAgent),
 		7*24*time.Hour, 24*time.Hour, routeErrorCooldown, time.Now))
 
 	initial := settings.FromConfig(cfg)
@@ -136,6 +145,14 @@ func run() error {
 	var aero *flightstatus.Cache
 	if cfg.AeroAPIKey != "" {
 		budget = flightstatus.NewBudget(func() int { return cur.Settings().DelayLookupsPerDay }, time.Now, logger)
+		budget.OnRefuse(aeroMeter.Refuse)
+		if cfg.SettingsFile != "" {
+			// Like the board's month count, the day's count lives next to the
+			// settings so a redeploy cannot reset it and overspend the cap.
+			if err := budget.Persist(filepath.Join(filepath.Dir(cfg.SettingsFile), "aeroapi-budget.json")); err != nil {
+				logger.Warn("delay budget counter not loaded", "err", err)
+			}
+		}
 		aero = flightstatus.NewCache(
 			flightstatus.NewBudgeted(flightstatus.NewAeroAPI(aeroClient, cfg.AeroAPIURL, cfg.AeroAPIKey, userAgent), budget),
 			15*time.Minute, 15*time.Minute, time.Minute, time.Now)
@@ -157,6 +174,8 @@ func run() error {
 				logger.Warn("board call counter not loaded", "err", err)
 			}
 		}
+		brd.OnRefuse(airlabsMeter.Refuse)
+		brd.OnFail(airlabsMeter.Fail)
 		delay = board.Chain(brd, delay)
 		logger.Info("airport board enabled", "airport", cur.Settings().BoardAirport, "refresh", cfg.BoardRefresh, "cap", cfg.BoardCallsPerMonth)
 	}
@@ -177,6 +196,34 @@ func run() error {
 	if aero != nil {
 		opts.Flights = aero
 	}
+	opts.PositionFailure = func(msg string) { posMeter.Fail("", msg) }
+	limits := usage.NewRegistry(time.Now, logger)
+	aeroLimit := usage.Limit{Enabled: budget != nil, Period: "day"}
+	if budget != nil {
+		aeroLimit.Used = func() (int, int, time.Time) {
+			used, limit := budget.Today()
+			return used, limit, budget.CapHitAt()
+		}
+		aeroLimit.Blocked = budget.Blocked
+	}
+	limits.Add("aeroapi", "FlightAware", aeroMeter, aeroLimit)
+	airlabsLimit := usage.Limit{Enabled: brd != nil, Period: "month"}
+	if brd != nil {
+		airlabsLimit.Used = func() (int, int, time.Time) {
+			st := brd.Stats()
+			return st.CallsMonth, st.CallsCap, brd.CapHitAt()
+		}
+	}
+	limits.Add("airlabs", "AirLabs", airlabsMeter, airlabsLimit)
+	limits.Add("adsbdb", "adsbdb", adsbdbMeter, usage.Limit{Enabled: true, PausedUntil: adsbdbGate.PausedUntil})
+	limits.Add("hexdb", "hexdb", hexdbMeter, usage.Limit{Enabled: true})
+	limits.Add("positions", providerLabel(cfg.Provider), posMeter, usage.Limit{Enabled: true, PollS: int(cfg.Poll.Seconds())})
+	if cfg.SettingsFile != "" {
+		if err := limits.Persist(filepath.Join(filepath.Dir(cfg.SettingsFile), "usage.json")); err != nil {
+			logger.Warn("usage counters not loaded", "err", err)
+		}
+	}
+	apiOpts = append(apiOpts, api.WithLimits(limits))
 	if srcLog != nil {
 		opts.Recorder = srcLog
 		apiOpts = append(apiOpts, api.WithSourceLog(srcLog))
@@ -192,6 +239,8 @@ func run() error {
 	// what is queued when its own context ends.
 	logCtx, stopLog := context.WithCancel(context.Background())
 	defer stopLog()
+	limitsDone := make(chan struct{})
+	go func() { limits.Run(logCtx); close(limitsDone) }()
 	logDone := make(chan struct{})
 	if srcLog != nil {
 		go func() { srcLog.Run(logCtx); close(logDone) }()
@@ -235,12 +284,21 @@ func run() error {
 	<-trDone
 	stopLog()
 	<-logDone
+	<-limitsDone
 	if srcLog != nil {
 		if err := srcLog.Close(); err != nil {
 			logger.Warn("route source log close failed", "err", err)
 		}
 	}
 	return shutdownErr
+}
+
+// providerLabel names the position feed on the limits page.
+func providerLabel(name string) string {
+	if name == "adsblol" {
+		return "adsb.lol"
+	}
+	return "adsb.fi"
 }
 
 // delayStats answers /api/stats from the live settings and the budget.

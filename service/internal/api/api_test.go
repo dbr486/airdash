@@ -20,6 +20,7 @@ import (
 	"airdash/internal/settings"
 	"airdash/internal/sourcelog"
 	"airdash/internal/tracker"
+	"airdash/internal/usage"
 )
 
 type fakeSource struct {
@@ -989,5 +990,49 @@ func TestSourcesResponses_OffIs404(t *testing.T) {
 		if rec, _ := get(t, h, p); rec.Code != 404 {
 			t.Errorf("%s: want 404, got %d", p, rec.Code)
 		}
+	}
+}
+
+type fakeLimits struct{ svcs []usage.Service }
+
+func (f fakeLimits) Report() []usage.Service { return f.svcs }
+
+func TestLimitsEndpoint(t *testing.T) {
+	hit := time.Date(2026, 11, 2, 9, 28, 0, 0, time.UTC)
+	lim := fakeLimits{[]usage.Service{
+		{ID: "aeroapi", Label: "FlightAware", Enabled: true, Period: "day", Used: 65, Cap: 65,
+			State: "cap_reached", StateSince: &hit, Refused: 41, Calls: 65, RecentErrors: []usage.ErrorEvent{}},
+		{ID: "hexdb", Label: "hexdb", Enabled: true, Period: "day", Used: 3, Calls: 3, State: "ok",
+			RecentErrors: []usage.ErrorEvent{{At: hit, Message: "timeout", Subject: "RYR1"}}},
+	}}
+	h := NewHandler(&fakeSource{}, store(10), &fakeStats{}, nil, time.Now, WithLimits(lim))
+	code, body := get(t, h, "/api/limits")
+	if code.Code != http.StatusOK {
+		t.Fatalf("status %d", code.Code)
+	}
+	svcs, _ := body["services"].([]any)
+	if len(svcs) != 2 {
+		t.Fatalf("services = %v", body)
+	}
+	a := svcs[0].(map[string]any)
+	if a["id"] != "aeroapi" || a["used"] != 65.0 || a["cap"] != 65.0 || a["state"] != "cap_reached" ||
+		a["state_since"] != "2026-11-02T09:28:00Z" || a["state_until"] != nil || a["refused"] != 41.0 {
+		t.Errorf("aeroapi row = %v", a)
+	}
+	if _, has := a["state_until"]; !has {
+		t.Error("state_until must be present as null")
+	}
+	e := svcs[1].(map[string]any)["recent_errors"].([]any)[0].(map[string]any)
+	if e["message"] != "timeout" || e["subject"] != "RYR1" {
+		t.Errorf("recent error = %v", e)
+	}
+}
+
+func TestLimitsEndpointWithoutSource(t *testing.T) {
+	h := NewHandler(&fakeSource{}, store(10), &fakeStats{}, nil, time.Now)
+	code, body := get(t, h, "/api/limits")
+	svcs, ok := body["services"].([]any)
+	if code.Code != http.StatusOK || !ok || len(svcs) != 0 {
+		t.Fatalf("code=%d body=%v", code.Code, body)
 	}
 }

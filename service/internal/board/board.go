@@ -39,7 +39,10 @@ type Board struct {
 	month     time.Month
 	year      int
 	calls     int
+	capHitAt  time.Time
 	statePath string
+	onRefuse  func(subject string)
+	onFail    func(subject, msg string)
 }
 
 type Stats struct {
@@ -58,9 +61,10 @@ func New(f Fetcher, callsPerMonth int, maxAge time.Duration, now func() time.Tim
 }
 
 type counterState struct {
-	Year  int        `json:"year"`
-	Month time.Month `json:"month"`
-	Calls int        `json:"calls"`
+	Year     int        `json:"year"`
+	Month    time.Month `json:"month"`
+	Calls    int        `json:"calls"`
+	CapHitAt time.Time  `json:"cap_hit_at"`
 }
 
 // Persist loads this month's call count from path (if any) and writes it
@@ -81,7 +85,7 @@ func (b *Board) Persist(path string) error {
 		return fmt.Errorf("board state: %w", err)
 	}
 	if y, m, _ := b.now().UTC().Date(); y == st.Year && m == st.Month {
-		b.year, b.month, b.calls = st.Year, st.Month, st.Calls
+		b.year, b.month, b.calls, b.capHitAt = st.Year, st.Month, st.Calls, st.CapHitAt
 	}
 	return nil
 }
@@ -91,20 +95,56 @@ func (b *Board) Persist(path string) error {
 func (b *Board) reserve(n int) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	y, m, _ := b.now().UTC().Date()
-	if y != b.year || m != b.month {
-		b.year, b.month, b.calls = y, m, 0
-	}
+	b.rollMonth()
 	if b.calls+n > b.cap {
+		if b.capHitAt.IsZero() {
+			b.capHitAt = b.now().UTC()
+			b.save()
+		}
 		return false
 	}
 	b.calls += n
-	if b.statePath != "" {
-		if err := writeState(b.statePath, counterState{b.year, b.month, b.calls}); err != nil {
-			b.logger.Warn("board state not saved", "err", err)
-		}
-	}
+	b.save()
 	return true
+}
+
+// rollMonth starts a new month's count at the UTC boundary. Caller holds mu.
+func (b *Board) rollMonth() {
+	y, m, _ := b.now().UTC().Date()
+	if y != b.year || m != b.month {
+		b.year, b.month, b.calls, b.capHitAt = y, m, 0, time.Time{}
+	}
+}
+
+func (b *Board) save() {
+	if b.statePath == "" {
+		return
+	}
+	if err := writeState(b.statePath, counterState{b.year, b.month, b.calls, b.capHitAt}); err != nil {
+		b.logger.Warn("board state not saved", "err", err)
+	}
+}
+
+// CapHitAt is when this month's cap first refused a refresh; zero if not.
+func (b *Board) CapHitAt() time.Time {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.rollMonth()
+	return b.capHitAt
+}
+
+// OnRefuse registers fn to hear the airport of every refresh the cap
+// refuses; OnFail hears errors AirLabs sent inside a 200 body (ErrAPI).
+func (b *Board) OnRefuse(fn func(subject string)) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.onRefuse = fn
+}
+
+func (b *Board) OnFail(fn func(subject, msg string)) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.onFail = fn
 }
 
 func writeState(path string, st counterState) error {
@@ -130,6 +170,12 @@ func (b *Board) Refresh(ctx context.Context, airport string) error {
 		return nil
 	}
 	if !b.reserve(2) {
+		b.mu.RLock()
+		fn := b.onRefuse
+		b.mu.RUnlock()
+		if fn != nil {
+			fn(airport)
+		}
 		return ErrCap
 	}
 	dep, err := b.fetch.Fetch(ctx, airport, false)
@@ -257,6 +303,14 @@ func (b *Board) run(ctx context.Context, airport func() string, interval time.Du
 		case err != nil:
 			if ctx.Err() != nil {
 				return
+			}
+			b.mu.RLock()
+			fn := b.onFail
+			b.mu.RUnlock()
+			// Transport and status failures are already metered at the
+			// client; only an error hidden in a 200 body needs reporting.
+			if fn != nil && errors.Is(err, ErrAPI) {
+				fn(want, err.Error())
 			}
 			// Each attempt costs two counted calls, so a provider outage or a
 			// bad key must not be retried every minute.

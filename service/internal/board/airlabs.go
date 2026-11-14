@@ -92,13 +92,17 @@ type airlabsRow struct {
 	Status      *string `json:"status"`
 }
 
+// ErrAPI marks an error AirLabs sent inside an HTTP 200 body (bad key,
+// quota spent): the transport saw a clean answer, so the board reports it.
+var ErrAPI = errors.New("airlabs: api error")
+
 func ParseAirLabs(body []byte) ([]Row, error) {
 	var env airlabsEnvelope
 	if err := json.Unmarshal(body, &env); err != nil {
 		return nil, fmt.Errorf("airlabs: decode: %w", err)
 	}
 	if env.Error != nil {
-		return nil, fmt.Errorf("airlabs: %s (%s)", env.Error.Message, env.Error.Code)
+		return nil, fmt.Errorf("%w: %s (%s)", ErrAPI, env.Error.Message, env.Error.Code)
 	}
 	rows := make([]Row, 0, len(env.Response))
 	for _, r := range env.Response {

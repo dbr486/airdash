@@ -21,6 +21,7 @@ import (
 	"airdash/internal/settings"
 	"airdash/internal/sourcelog"
 	"airdash/internal/tracker"
+	"airdash/internal/usage"
 )
 
 type Source interface {
@@ -72,7 +73,11 @@ type handler struct {
 
 	geocoder geocode.Lookup // nil = address lookup disabled
 	sources  SourceLog      // nil = route source log disabled
+	limits   LimitsSource   // nil = /api/limits lists nothing
 }
+
+// LimitsSource reports every outside service's cap, usage and errors.
+type LimitsSource interface{ Report() []usage.Service }
 
 // Option configures optional handler dependencies.
 type Option func(*handler)
@@ -83,6 +88,9 @@ func WithGeocoder(g geocode.Lookup) Option { return func(h *handler) { h.geocode
 
 // WithSourceLog enables GET /api/sources/*; without it those routes answer 404.
 func WithSourceLog(l SourceLog) Option { return func(h *handler) { h.sources = l } }
+
+// WithLimits enables the rows of GET /api/limits.
+func WithLimits(l LimitsSource) Option { return func(h *handler) { h.limits = l } }
 
 func NewHandler(src Source, st SettingsStore, stats StatsSource, logos LogoSource, now func() time.Time, opts ...Option) http.Handler {
 	h := &handler{src: src, st: st, stats: stats, logos: logos, now: now}
@@ -97,6 +105,7 @@ func NewHandler(src Source, st SettingsStore, stats StatsSource, logos LogoSourc
 	mux.HandleFunc("GET /api/settings", h.getSettings)
 	mux.HandleFunc("PUT /api/settings", h.putSettings)
 	mux.HandleFunc("GET /api/stats", h.getStats)
+	mux.HandleFunc("GET /api/limits", h.getLimits)
 	mux.HandleFunc("GET /api/sources/summary", h.sourcesSummary)
 	mux.HandleFunc("GET /api/sources/passes", h.sourcesPasses)
 	mux.HandleFunc("GET /api/sources/disagreements", h.sourcesDisagreements)
@@ -109,7 +118,7 @@ func NewHandler(src Source, st SettingsStore, stats StatsSource, logos LogoSourc
 	})
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
-		_, _ = w.Write([]byte("airdash: GET /api/nearest for the closest aircraft, GET/PUT /api/settings for filters, GET /api/stats for delay lookup usage, GET /api/sources/{summary,passes,disagreements,responses} for the route source log\n"))
+		_, _ = w.Write([]byte("airdash: GET /api/nearest for the closest aircraft, GET/PUT /api/settings for filters, GET /api/stats for delay lookup usage, GET /api/limits for every service's cap, usage and errors, GET /api/sources/{summary,passes,disagreements,responses} for the route source log\n"))
 	})
 	return mux
 }
@@ -351,6 +360,14 @@ type statsResponse struct {
 	BoardCallsMonth   int    `json:"board_calls_month"`
 	BoardCallsCap     int    `json:"board_calls_cap"`
 	BoardSource       string `json:"board_source"`
+}
+
+func (h *handler) getLimits(w http.ResponseWriter, r *http.Request) {
+	svcs := []usage.Service{}
+	if h.limits != nil {
+		svcs = h.limits.Report()
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"services": svcs})
 }
 
 func (h *handler) getStats(w http.ResponseWriter, r *http.Request) {

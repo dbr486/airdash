@@ -1344,11 +1344,14 @@ func TestPaidRoute_DelayKeyedByIdentSharesTheCall(t *testing.T) {
 	}
 }
 
-func TestPaidRoute_BudgetRefusalRetriesAfterCooldown(t *testing.T) {
+// A refusal is not cached: asking the budget again is free, and a raised
+// cap must take effect on the very next tick rather than after a cooldown.
+func TestPaidRoute_BudgetRefusalIsAskedAgainEachTick(t *testing.T) {
 	h, msgs := newRecordingHandler()
 	ck := &clock{t: time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)}
 	inner := &fakeFlights{fl: flightstatus.Flight{Route: agpLGW, HasRoute: true}, ok: true}
-	budget := flightstatus.NewBudget(func() int { return 1 }, ck.now, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	limit := 1
+	budget := flightstatus.NewBudget(func() int { return limit }, ck.now, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	budget.Allow() // the day's only lookup is already spent
 	refusals := &countingFlights{inner: flightstatus.NewBudgeted(inner, budget)}
 	cache := flightstatus.NewCache(refusals, 15*time.Minute, 15*time.Minute, time.Minute, ck.now)
@@ -1359,20 +1362,20 @@ func TestPaidRoute_BudgetRefusalRetriesAfterCooldown(t *testing.T) {
 		Routes:   &fakeRoutes{}, Settings: src, Delay: cache, Flights: cache, Now: ck.now,
 		Logger: slog.New(h),
 	})
-	for i := 0; i < 12; i++ { // one minute of 5 s ticks
+	for i := 0; i < 3; i++ {
 		tr.Tick(t.Context())
 		if s, _ := tr.Current(); s.Origin != "" || s.Delay != nil {
 			t.Fatalf("refused budget must leave the route empty: %+v", s)
 		}
 		ck.t = ck.t.Add(5 * time.Second)
 	}
-	if refusals.n != 1 || inner.calls() != 0 {
-		t.Fatalf("within the cooldown: budget asked %d times, upstream %d", refusals.n, inner.calls())
+	if refusals.n != 3 || inner.calls() != 0 {
+		t.Fatalf("budget asked %d times, upstream %d; want 3 and 0", refusals.n, inner.calls())
 	}
-	ck.t = ck.t.Add(time.Second)
+	limit = 2 // raised in Settings
 	tr.Tick(t.Context())
-	if refusals.n != 2 {
-		t.Errorf("after the cooldown the refusal is not remembered as unknown: asked %d", refusals.n)
+	if inner.calls() != 1 {
+		t.Errorf("a raised cap must reach upstream on the next tick: upstream %d", inner.calls())
 	}
 	for _, m := range *msgs {
 		if m == "AeroAPI lookup failing" {
@@ -1814,6 +1817,12 @@ func TestRecord_SourceStatuses(t *testing.T) {
 			func(r PassRecord) bool { return r.ADSBDB.Status == StatusError && r.HexDB.Status == StatusUnknown }},
 		{"hexdb error", &fakeRoutes{}, &fakeRoutes{errFor: map[string]bool{"WZZ1": true}}, "WZZ1",
 			func(r PassRecord) bool { return r.HexDB.Status == StatusError }},
+		{"adsbdb cooldown", &fakeRoutes{errAll: routes.ErrCooldown}, &fakeRoutes{}, "WZZ1",
+			func(r PassRecord) bool { return r.ADSBDB.Status == StatusCooldown }},
+		{"adsbdb gate closed", &fakeRoutes{errAll: routes.ErrRateLimited}, &fakeRoutes{}, "WZZ1",
+			func(r PassRecord) bool { return r.ADSBDB.Status == StatusCooldown }},
+		{"hexdb cooldown", &fakeRoutes{}, &fakeRoutes{errAll: routes.ErrCooldown}, "WZZ1",
+			func(r PassRecord) bool { return r.HexDB.Status == StatusCooldown }},
 		{"hexdb implausible", &fakeRoutes{}, &fakeRoutes{byCallsign: map[string]routes.Route{"WZZ1": far}}, "WZZ1",
 			func(r PassRecord) bool {
 				return r.HexDB == SourceAnswer{StatusImplausible, "AGP-TFS"} && r.ShownSource == SourceNone
@@ -1972,7 +1981,8 @@ func TestRecord_FailedDelayLookupIsRecorded(t *testing.T) {
 	for _, tc := range []struct {
 		err  error
 		want string
-	}{{errors.New("down"), StatusError}, {flightstatus.ErrBudget, StatusSkipped}} {
+	}{{errors.New("down"), StatusError}, {flightstatus.ErrBudget, StatusSkipped},
+		{flightstatus.ErrCooldown, StatusCooldown}} {
 		rig := newPaidRig([]provider.Aircraft{airborne("a", "WZZ1", 51.48, -0.45)}, true, true)
 		rig.rts.byCallsign["WZZ1"] = lhrBUD
 		spy := &recorderSpy{}
@@ -1981,6 +1991,38 @@ func TestRecord_FailedDelayLookupIsRecorded(t *testing.T) {
 		rig.tick(t)
 		if r := spy.last(t)[0]; r.AeroAPI.Status != tc.want || rig.inner.calls() != 1 {
 			t.Errorf("%v: delay lookup outcome must be recorded as %s: calls=%d %+v", tc.err, tc.want, rig.inner.calls(), r.AeroAPI)
+		}
+	}
+}
+
+// The route-only paid call (no delay wanted) records a cooldown as such.
+func TestRecord_PaidRouteCooldownIsNotAnError(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want string
+	}{{errors.New("down"), StatusError}, {flightstatus.ErrCooldown, StatusCooldown}, {flightstatus.ErrBudget, StatusSkipped}} {
+		rig := newPaidRig([]provider.Aircraft{airborne("a", "WZZ1", 51.48, -0.45)}, false, true)
+		spy := &recorderSpy{}
+		rig.tr.o.Recorder = spy
+		rig.inner.err = tc.err
+		rig.tick(t)
+		if r := spy.last(t)[0]; r.AeroAPI.Status != tc.want || rig.inner.calls() != 1 {
+			t.Errorf("%v: want %s, calls=%d %+v", tc.err, tc.want, rig.inner.calls(), r.AeroAPI)
+		}
+	}
+}
+
+func TestPositionFailureHookOnlyForBadBody(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want int
+	}{{fmt.Errorf("%w: quota", provider.ErrBadBody), 1}, {errors.New("provider: status 503"), 0}} {
+		var got []string
+		tr := newTracker(&fakeProvider{err: tc.err}, &fakeRoutes{}, filter.Filter{}, &clock{t: time.Now()})
+		tr.o.PositionFailure = func(msg string) { got = append(got, msg) }
+		tr.Tick(t.Context())
+		if len(got) != tc.want {
+			t.Errorf("%v: hook calls = %v, want %d", tc.err, got, tc.want)
 		}
 	}
 }

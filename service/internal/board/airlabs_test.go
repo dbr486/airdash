@@ -2,6 +2,7 @@ package board
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -113,5 +114,12 @@ func TestAirLabs_ErrorNeverContainsTheKey(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "s3cr3tkey") || strings.Contains(err.Error(), "api_key") {
 		t.Errorf("the key must never reach an error message: %v", err)
+	}
+}
+
+func TestParseAirLabsErrorIsErrAPI(t *testing.T) {
+	_, err := ParseAirLabs([]byte(`{"error":{"message":"Monthly limit exceeded","code":"month_limit_exceeded"}}`))
+	if !errors.Is(err, ErrAPI) || !strings.Contains(err.Error(), "Monthly limit exceeded") {
+		t.Fatalf("err = %v", err)
 	}
 }

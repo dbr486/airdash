@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -251,5 +252,15 @@ func TestDecodeReadsb_Category(t *testing.T) {
 	}
 	if acs[0].Category != "A1" || acs[1].Category != "A3" || acs[2].Category != "" {
 		t.Errorf("categories = %q %q %q", acs[0].Category, acs[1].Category, acs[2].Category)
+	}
+}
+
+func TestDecodeReadsbErrorBodyIsErrBadBody(t *testing.T) {
+	_, err := decodeReadsb([]byte(`{"error":"quota"}`))
+	if !errors.Is(err, ErrBadBody) || !strings.Contains(err.Error(), "quota") {
+		t.Fatalf("err = %v", err)
+	}
+	if _, err := decodeReadsb([]byte(`not json`)); !errors.Is(err, ErrBadBody) {
+		t.Fatalf("decode failure err = %v", err)
 	}
 }

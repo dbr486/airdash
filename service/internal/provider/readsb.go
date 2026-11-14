@@ -74,6 +74,7 @@ func (p *readsbProvider) Fetch(ctx context.Context, lat, lon, radiusKm float64) 
 type readsbEnvelope struct {
 	AC       []readsbAircraft `json:"ac"`       // adsb.lol
 	Aircraft []readsbAircraft `json:"aircraft"` // adsb.fi
+	Error    any              `json:"error"`    // an upstream error envelope
 }
 
 type readsbAircraft struct {
@@ -93,13 +94,16 @@ type readsbAircraft struct {
 func decodeReadsb(body []byte) ([]Aircraft, error) {
 	var env readsbEnvelope
 	if err := json.Unmarshal(body, &env); err != nil {
-		return nil, fmt.Errorf("provider: decode: %w", err)
+		return nil, fmt.Errorf("%w: decode: %v", ErrBadBody, err)
 	}
 	// Neither key present (e.g. an upstream error body like {"error":"..."})
 	// is a decode failure, not a valid zero-aircraft result; an explicit
 	// empty list ("ac":[]) is still fine and falls through below.
 	if env.AC == nil && env.Aircraft == nil {
-		return nil, fmt.Errorf("provider: response has no aircraft list")
+		if env.Error != nil {
+			return nil, fmt.Errorf("%w: %v", ErrBadBody, env.Error)
+		}
+		return nil, fmt.Errorf("%w: no aircraft list", ErrBadBody)
 	}
 	list := env.AC
 	if list == nil {

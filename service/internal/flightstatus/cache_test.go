@@ -175,12 +175,12 @@ func TestCached_HitDoesNotConsumeBudget(t *testing.T) {
 	if used, _ := b.Today(); used != 1 || inner.calls != 1 {
 		t.Errorf("used=%d inner=%d, want 1/1", used, inner.calls)
 	}
-	// A second callsign exceeds the cap of 1: ErrBudget, cached as a cooldown.
-	if _, _, err := c.Status(t.Context(), Query{Callsign: "OTHER1"}); !errors.Is(err, ErrBudget) {
-		t.Errorf("expected ErrBudget, got %v", err)
-	}
-	if _, _, err := c.Status(t.Context(), Query{Callsign: "OTHER1"}); !errors.Is(err, ErrCooldown) {
-		t.Errorf("budget refusal should enter cooldown, got %v", err)
+	// A second callsign exceeds the cap of 1: ErrBudget every time, never
+	// cached as a cooldown (which the source log would read as an error).
+	for i := 0; i < 2; i++ {
+		if _, _, err := c.Status(t.Context(), Query{Callsign: "OTHER1"}); !errors.Is(err, ErrBudget) {
+			t.Errorf("ask %d: expected ErrBudget, got %v", i, err)
+		}
 	}
 }
 

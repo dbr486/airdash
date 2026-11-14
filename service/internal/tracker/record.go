@@ -11,6 +11,7 @@ const (
 	StatusMiss        = "miss"        // board only: no row for the leg flying now
 	StatusError       = "error"
 	StatusSkipped     = "skipped"   // this tick's lookup budget was spent
+	StatusCooldown    = "cooldown"  // held back after an earlier failure or a rate-limit ban
 	StatusOff         = "off"       // source not configured or switched off
 	StatusNone        = "none"      // no callsign to ask with
 	StatusNotAsked    = "not_asked" // not called: AeroAPI this pass, or hexdb with no log

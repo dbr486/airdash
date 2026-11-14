@@ -50,6 +50,12 @@
     <a href="board.html">Airport board</a>
   </header>
 
+  <div class="card" id="limits-card">
+    <h2>Service limits</h2>
+    <p class="what">Today's calls against each outside service's cap (UTC), whether it is blocked, and its real errors. Select a row with errors to see the last five.</p>
+    <div class="scroll"><table id="limits"></table></div>
+  </div>
+
   <div class="card" id="off"><p class="empty">The route source log is off. Set <code>AIRDASH_SOURCE_LOG_FILE</code> on the service to start recording.</p></div>
 
   <div id="dash">
@@ -99,6 +105,7 @@
 </main>
 <div id="tip" role="tooltip"></div>
 <script src="rawdata.js"></script>
+<script src="limits.js"></script>
 <script>
 const SOURCES = [
   { key: 'board', name: 'Board', note: 'AirLabs, airport schedule' },
@@ -107,16 +114,17 @@ const SOURCES = [
   { key: 'aeroapi', name: 'FlightAware', note: 'paid, nearest only' },
 ];
 const SHOWN = [...SOURCES.map((s) => ({ key: s.key, name: s.name })), { key: 'none', name: 'No route' }];
-// Answer states grouped into five buckets; each keeps a text label, so the
+// Answer states grouped into six buckets; each keeps a text label, so the
 // status colour never carries the meaning alone.
 const BUCKETS = [
   { key: 'route', name: 'Route', c: 'var(--good)', of: ['hit'] },
   { key: 'ruled', name: 'Ruled out by position', c: 'var(--serious)', of: ['implausible'] },
   { key: 'noroute', name: 'No route', c: 'var(--nodata)', of: ['unknown', 'miss'] },
   { key: 'failed', name: 'Failed or out of time', c: 'var(--critical)', of: ['error', 'skipped'] },
+  { key: 'held', name: 'Cooling down', c: 'var(--held)', of: ['cooldown'] },
   { key: 'na', name: 'Not asked or off', c: 'var(--off)', ink: 'var(--ink-2)', of: ['not_asked', 'off', 'none'] },
 ];
-const STATUS_TEXT = { hit: '', implausible: 'ruled out', unknown: 'no route', miss: 'not on board', error: 'error', skipped: 'out of time', not_asked: 'not asked', off: 'off', none: 'no callsign' };
+const STATUS_TEXT = { hit: '', implausible: 'ruled out', unknown: 'no route', miss: 'not on board', error: 'error', skipped: 'out of time', cooldown: 'cooling down', not_asked: 'not asked', off: 'off', none: 'no callsign' };
 
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -370,7 +378,29 @@ async function loadOlder() {
 
 // ---- refresh -------------------------------------------------------------
 let lastSummary = null, refreshSeq = 0;
+// The limits card loads on its own: it must show even when the source log
+// is off, and a failure here must not blank the rest of the page.
+async function refreshLimits() {
+  try {
+    const { services } = await getJSON('/api/limits');
+    Limits.renderLimits($('limits'), services);
+  } catch (err) {
+    $('limits').innerHTML = `<tbody><tr><td class="note">Could not load limits: ${esc(err.message)}</td></tr></tbody>`;
+  }
+}
+$('limits').addEventListener('click', (e) => toggleRecent(e.target.closest('tr.has-recent')));
+$('limits').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleRecent(e.target.closest('tr.has-recent')); }
+});
+function toggleRecent(tr) {
+  if (!tr) return;
+  const ul = tr.querySelector('.lim-recent');
+  ul.hidden = !ul.hidden;
+  tr.setAttribute('aria-expanded', String(!ul.hidden));
+}
+
 async function refresh() {
+  refreshLimits();
   // A slower answer for a range the viewer has since switched away from
   // must not overwrite the newer one.
   const seq = ++refreshSeq;

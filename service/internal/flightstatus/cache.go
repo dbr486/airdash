@@ -19,8 +19,8 @@ type entry struct {
 
 // Cache remembers the flight (route and status together) per ident, so
 // the aircraft overhead for ten minutes costs one AeroAPI result set
-// whether the route or the delay asked first. Errors (including a refused
-// budget) enter a short cooldown rather than being retried every tick.
+// whether the route or the delay asked first. Errors enter a short cooldown
+// rather than being retried every tick; a refused budget does not.
 type Cache struct {
 	inner         FlightLookup
 	knownTTL      time.Duration
@@ -90,6 +90,11 @@ func (c *Cache) Flight(ctx context.Context, q Query) (Flight, bool, error) {
 	fl, ok, err := c.inner.Flight(ctx, q)
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if errors.Is(err, ErrBudget) {
+		// Not a failure of this ident: asking the budget again is free, and
+		// a cached refusal would come back as ErrCooldown, read as an error.
+		return Flight{}, false, err
+	}
 	if err != nil {
 		cooldown := c.errorCooldown
 		if errors.Is(err, ErrAuth) {

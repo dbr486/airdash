@@ -6,7 +6,7 @@
   --page:#0d0d0d; --surface:#1a1a19; --ink:#f0efec; --ink-2:#c3c2b7; --muted:#898781;
   --grid:#2c2c2a; --axis:#383835; --ring:rgba(255,255,255,0.10);
   --board:#3987e5; --adsbdb:#d95926; --hexdb:#199e70; --aeroapi:#c98500; --none:#5b5a56;
-  --good:#0ca30c; --serious:#ec835a; --critical:#d03b3b; --nodata:#6b6a65; --off:#383835;
+  --good:#0ca30c; --serious:#ec835a; --critical:#d03b3b; --nodata:#6b6a65; --off:#383835; --held:#b8a03a;
   --mono:ui-monospace,Menlo,Consolas,monospace;
 }
 * { box-sizing:border-box; }
@@ -52,3 +52,14 @@ input[type=search] { background:#000; color:var(--ink); border:1px solid var(--a
 button.more { background:var(--surface); color:var(--ink); border:1px solid var(--axis); border-radius:6px; padding:6px 14px; font:inherit; cursor:pointer; margin-top:10px; }
 button.more:disabled { opacity:.5; cursor:default; }
 .empty { color:var(--muted); padding:18px 0; text-align:center; }
+
+/* Limits card: a flagged row (cap reached, paused, errors) gets a warm edge. */
+#limits tr.lim.flagged th { box-shadow:inset 3px 0 0 var(--serious); }
+#limits tr.lim.flagged .lim-state { color:var(--serious); }
+#limits tr.has-recent { cursor:pointer; }
+#limits tr.has-recent:focus-visible { outline:2px solid var(--board); outline-offset:-2px; }
+#limits td { white-space:normal; }
+.lim-meter { display:block; width:120px; max-width:100%; height:4px; margin-top:4px; background:var(--grid); border-radius:2px; overflow:hidden; }
+.lim-meter span { display:block; height:100%; background:var(--aeroapi); }
+#limits tr.flagged .lim-meter span { background:var(--serious); }
+.lim-recent { margin:6px 0 0; padding-left:16px; color:var(--ink-2); font-size:12px; }

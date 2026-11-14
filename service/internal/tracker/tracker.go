@@ -99,10 +99,14 @@ type Options struct {
 	FallbackRoutes routes.Lookup
 	// Recorder receives every tick's per-aircraft source answers; nil = off.
 	Recorder Recorder
-	Filter   filter.Filter
-	Settings SettingsSource
-	Now      func() time.Time
-	Logger   *slog.Logger
+	// PositionFailure hears a position answer whose body was unusable
+	// (provider.ErrBadBody). Transport failures are metered at the client,
+	// so only these reach it. nil disables it.
+	PositionFailure func(msg string)
+	Filter          filter.Filter
+	Settings        SettingsSource
+	Now             func() time.Time
+	Logger          *slog.Logger
 }
 
 const (
@@ -231,6 +235,9 @@ func (t *Tracker) Tick(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
+		if t.o.PositionFailure != nil && errors.Is(err, provider.ErrBadBody) {
+			t.o.PositionFailure(err.Error())
+		}
 		t.onFailure(err)
 		return
 	}
@@ -280,6 +287,9 @@ func (t *Tracker) Tick(ctx context.Context) {
 					routeErr = err
 				}
 				c.trace.adsbdb.Status = StatusError
+				if errors.Is(err, routes.ErrCooldown) {
+					c.trace.adsbdb.Status = StatusCooldown
+				}
 			} else {
 				c.route, c.known = r, ok
 				c.trace.adsbdb = answerOf(hasRoute(r), routeStr(r))
@@ -383,6 +393,8 @@ func (t *Tracker) Tick(ctx context.Context) {
 		switch {
 		case errors.Is(err, flightstatus.ErrBudget):
 			best.trace.aeroapi.Status = StatusSkipped
+		case errors.Is(err, flightstatus.ErrCooldown):
+			best.trace.aeroapi.Status = StatusCooldown
 		case err != nil:
 			best.trace.aeroapi.Status = StatusError
 		}
@@ -517,6 +529,8 @@ func (t *Tracker) fillRoute(ctx context.Context, c *candidate, seen, now time.Ti
 	switch {
 	case errors.Is(err, flightstatus.ErrBudget):
 		c.trace.aeroapi.Status = StatusSkipped
+	case errors.Is(err, flightstatus.ErrCooldown):
+		c.trace.aeroapi.Status = StatusCooldown
 	case err != nil:
 		c.trace.aeroapi.Status = StatusError
 		// A refusal or an outage says nothing about this flight; the
@@ -653,6 +667,8 @@ func (t *Tracker) askFallback(fallbackCtx func() context.Context, c *candidate) 
 	switch {
 	case err != nil && ctx.Err() != nil:
 		c.trace.hexdb.Status = StatusSkipped
+	case errors.Is(err, routes.ErrCooldown):
+		c.trace.hexdb.Status = StatusCooldown
 	case err != nil:
 		c.trace.hexdb.Status = StatusError
 		t.o.Logger.Debug("fallback route lookup failed", "callsign", c.ac.Callsign, "err", err)

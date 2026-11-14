@@ -3,8 +3,10 @@ package board
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -18,6 +20,7 @@ type fakeFetcher struct {
 	dep   []Row
 	arr   []Row
 	errOn string // "dep" or "arr" fails
+	err   error  // what the failing direction returns; nil is "boom"
 }
 
 func (f *fakeFetcher) Fetch(ctx context.Context, airport string, arrivals bool) ([]Row, error) {
@@ -29,6 +32,9 @@ func (f *fakeFetcher) Fetch(ctx context.Context, airport string, arrivals bool) 
 	}
 	f.calls = append(f.calls, dir+":"+airport)
 	if f.errOn == dir {
+		if f.err != nil {
+			return nil, f.err
+		}
 		return nil, errors.New("boom")
 	}
 	if arrivals {
@@ -437,5 +443,69 @@ func TestRoute_OtherLegDoesNotBlockTheAirborneOne(t *testing.T) {
 	}, &now)
 	if got, ok := b.Route(flightstatus.Query{Callsign: "WZZ2765"}, now); !ok || got.DestIATA != "WAW" {
 		t.Errorf("the landed inbound leg must not tie with the outbound: %+v ok=%v", got, ok)
+	}
+}
+
+func TestBoardCapHitAtPersistsForMonth(t *testing.T) {
+	path := t.TempDir() + "/board-calls.json"
+	f := &fakeFetcher{dep: deps(t), arr: arrs(t)}
+	now := at(13, 30)
+	clock := func() time.Time { return now }
+	b := New(f, 2, 3*time.Hour, clock, quiet())
+	_ = b.Persist(path)
+	var refused []string
+	b.OnRefuse(func(s string) { refused = append(refused, s) })
+	_ = b.Refresh(context.Background(), "AGP")
+	if !b.CapHitAt().IsZero() {
+		t.Fatal("cap not hit yet")
+	}
+	if err := b.Refresh(context.Background(), "AGP"); !errors.Is(err, ErrCap) {
+		t.Fatalf("err = %v, want ErrCap", err)
+	}
+	hit := now
+	now = now.Add(time.Hour)
+	_ = b.Refresh(context.Background(), "AGP")
+	if !b.CapHitAt().Equal(hit) || len(refused) != 2 || refused[0] != "AGP" {
+		t.Fatalf("CapHitAt=%v refused=%v", b.CapHitAt(), refused)
+	}
+	again := New(f, 2, 3*time.Hour, clock, quiet())
+	_ = again.Persist(path)
+	if !again.CapHitAt().Equal(hit) {
+		t.Fatalf("cap hit time lost on restart: %v", again.CapHitAt())
+	}
+	now = now.AddDate(0, 1, 0)
+	if !b.CapHitAt().IsZero() {
+		t.Fatal("a new month must clear the cap hit time")
+	}
+}
+
+func TestBoardOnFailOnlyForAPIErrors(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want int
+	}{
+		{fmt.Errorf("%w: invalid api_key (unknown_api_key)", ErrAPI), 1},
+		{errors.New("airlabs: status 503"), 0},
+	} {
+		f := &fakeFetcher{dep: deps(t), arr: arrs(t), errOn: "dep", err: tc.err}
+		b := New(f, 900, 2*time.Hour, func() time.Time { return at(13, 30) }, quiet())
+		var mu sync.Mutex
+		var got []string
+		b.OnFail(func(subject, msg string) { mu.Lock(); got = append(got, subject+"|"+msg); mu.Unlock() })
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() { b.run(ctx, func() string { return "AGP" }, 90*time.Minute, make(chan time.Time)); close(done) }()
+		deadline := time.Now().Add(2 * time.Second)
+		for f.count() == 0 && time.Now().Before(deadline) {
+			time.Sleep(5 * time.Millisecond)
+		}
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+		<-done
+		mu.Lock()
+		if len(got) != tc.want || (tc.want == 1 && !strings.Contains(got[0], "AGP|")) {
+			t.Errorf("err %v: hook calls = %v, want %d", tc.err, got, tc.want)
+		}
+		mu.Unlock()
 	}
 }
