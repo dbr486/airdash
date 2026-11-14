@@ -39,8 +39,8 @@ func TestLoad_Defaults(t *testing.T) {
 	if c.Origin != "" || c.Dest != "" || c.Airport != "" {
 		t.Errorf("filters should be empty by default")
 	}
-	if c.SettingsFile != "" {
-		t.Errorf("SettingsFile = %q", c.SettingsFile)
+	if c.SettingsFile != "" || c.SourceLogFile != "" {
+		t.Errorf("SettingsFile = %q, SourceLogFile = %q", c.SettingsFile, c.SourceLogFile)
 	}
 	if c.AeroAPIKey != "" {
 		t.Errorf("AeroAPIKey = %q", c.AeroAPIKey)
@@ -62,6 +62,7 @@ func TestLoad_Overrides(t *testing.T) {
 		"AIRDASH_DEST":              "BCN",
 		"AIRDASH_AIRPORT":           "EGLL",
 		"AIRDASH_SETTINGS_FILE":     "/data/settings.json",
+		"AIRDASH_SOURCE_LOG_FILE":   "/data/sources.db",
 		"AIRDASH_ROUTE_CACHE_HOURS": "2",
 		"AIRDASH_AEROAPI_KEY":       "k123",
 		"AIRDASH_AEROAPI_URL":       "http://127.0.0.1:1",
@@ -71,7 +72,7 @@ func TestLoad_Overrides(t *testing.T) {
 	}
 	if c.RadiusKm != 25.5 || c.Poll != 7*time.Second || c.Listen != "127.0.0.1:9000" ||
 		c.Provider != "adsblol" || c.Origin != "LHR,LGW" || c.Dest != "BCN" ||
-		c.Airport != "EGLL" || c.SettingsFile != "/data/settings.json" || c.RouteCacheTTL != 2*time.Hour {
+		c.Airport != "EGLL" || c.SettingsFile != "/data/settings.json" || c.SourceLogFile != "/data/sources.db" || c.RouteCacheTTL != 2*time.Hour {
 		t.Errorf("unexpected config: %+v", c)
 	}
 	if c.AeroAPIKey != "k123" || c.AeroAPIURL != "http://127.0.0.1:1" {

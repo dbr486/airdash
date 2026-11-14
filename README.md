@@ -111,6 +111,7 @@ overrides them at runtime.
 | `AIRDASH_UI_PORT` | `3000` | Host port for the web UI (docker compose) |
 | `AIRDASH_LISTEN` | `:8080` | Listen address, standalone binary only |
 | `AIRDASH_SETTINGS_FILE` | empty | Where runtime settings persist, standalone binary only (compose sets `/data/settings.json`) |
+| `AIRDASH_SOURCE_LOG_FILE` | empty | SQLite file recording what each route source answered per aircraft pass, kept 90 days; empty turns it off (compose sets `/data/sources.db`) |
 
 The display's settings live in `firmware/include/config.h`: `WIFI_SSID`,
 `WIFI_PASS`, `AIRDASH_URL` and `POLL_MS` (default 3000).

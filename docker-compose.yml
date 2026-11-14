@@ -11,6 +11,9 @@ services:
       # Runtime settings (filters, radius) changed from the web UI persist
       # here across restarts; env vars remain the defaults.
       AIRDASH_SETTINGS_FILE: /data/settings.json
+      # What each route source answered per aircraft pass (SQLite), for
+      # the dashboard at /sources.html; 90 days are kept.
+      AIRDASH_SOURCE_LOG_FILE: /data/sources.db
     volumes:
       - airdash-data:/data
     ports:

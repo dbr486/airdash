@@ -46,17 +46,34 @@ func (c *Cache) Status(ctx context.Context, q Query) (Status, bool, error) {
 	return statusOf(f, ok, err)
 }
 
+func passKey(q Query) string {
+	if q.Seen.IsZero() {
+		return q.Callsign
+	}
+	return q.Callsign + "@" + strconv.FormatInt(q.Seen.Unix(), 10)
+}
+
+// Cached returns this pass's stored answer, if any, and never calls
+// upstream: it lets the source log see what a paid lookup made for another
+// reason (the delay) said, without paying again. found is false for a
+// missing, expired or error entry.
+func (c *Cache) Cached(q Query) (fl Flight, ok, found bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, hit := c.entries[passKey(q)]
+	if !hit || e.err || !c.now().Before(e.expires) {
+		return Flight{}, false, false
+	}
+	return e.fl, e.ok, true
+}
+
 // Flight serves both Status and route readers from one entry keyed by the
 // ident and the pass (first sighting), so a route lookup and a delay lookup
 // for the same aircraft share a single paid call. The pass is in the key
 // because the chosen instance depends on it; errors stay keyed by ident
 // alone, so a cooldown (a bad key above all) is not reset by a new pass.
 func (c *Cache) Flight(ctx context.Context, q Query) (Flight, bool, error) {
-	callsign := q.Callsign
-	key := callsign
-	if !q.Seen.IsZero() {
-		key += "@" + strconv.FormatInt(q.Seen.Unix(), 10)
-	}
+	callsign, key := q.Callsign, passKey(q)
 	now := c.now()
 	c.mu.Lock()
 	e, hit := c.entries[callsign]

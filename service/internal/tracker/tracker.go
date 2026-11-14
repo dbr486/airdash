@@ -97,10 +97,12 @@ type Options struct {
 	// FallbackRoutes is a free route source (hexdb) asked only when the
 	// board and a plausible adsbdb route both miss; nil = off.
 	FallbackRoutes routes.Lookup
-	Filter         filter.Filter
-	Settings       SettingsSource
-	Now            func() time.Time
-	Logger         *slog.Logger
+	// Recorder receives every tick's per-aircraft source answers; nil = off.
+	Recorder Recorder
+	Filter   filter.Filter
+	Settings SettingsSource
+	Now      func() time.Time
+	Logger   *slog.Logger
 }
 
 const (
@@ -199,6 +201,15 @@ type candidate struct {
 	// board is the route the airport board gave this tick, to be remembered
 	// for the rest of the pass once the aircraft has a sighting.
 	board *flightstatus.FlightRoute
+	// trace is what each route source said, for the route source log.
+	trace trace
+	// compare: the fallback source is still to be asked, for the log only.
+	compare bool
+}
+
+type trace struct {
+	board, adsbdb, hexdb, aeroapi SourceAnswer
+	shown                         string
 }
 
 func (t *Tracker) Tick(ctx context.Context) {
@@ -239,14 +250,7 @@ func (t *Tracker) Tick(ctx context.Context) {
 	// otherwise cost one full timeout per aircraft before positions publish.
 	// It starts at the first fallback lookup, so slow adsbdb answers before
 	// it cannot spend it and push an aircraft on to the paid lookup.
-	var fbCtx context.Context
-	fbCancel := context.CancelFunc(func() {})
-	fallbackCtx := func() context.Context {
-		if fbCtx == nil {
-			fbCtx, fbCancel = context.WithTimeout(ctx, t.o.RouteTimeout)
-		}
-		return fbCtx
-	}
+	fallbackCtx, fbCancel := lazyBudget(ctx, t.o.RouteTimeout)
 	var routeErr error // first non-cooldown route lookup error this tick, if any
 	for _, ac := range acs {
 		if ac.OnGround || !ac.HasPos {
@@ -257,6 +261,7 @@ func (t *Tracker) Tick(ctx context.Context) {
 			continue
 		}
 		c := candidate{ac: ac, distKm: d, bearing: geo.BearingDeg(lat, lon, ac.Lat, ac.Lon)}
+		c.trace.adsbdb.Status = StatusNone
 		if ac.Callsign != "" {
 			rctx, cancel := context.WithTimeout(ctx, t.o.RouteTimeout)
 			r, ok, err := t.o.Routes.Route(rctx, ac.Callsign)
@@ -269,8 +274,10 @@ func (t *Tracker) Tick(ctx context.Context) {
 				if routeErr == nil && !errors.Is(err, routes.ErrCooldown) {
 					routeErr = err
 				}
+				c.trace.adsbdb.Status = StatusError
 			} else {
 				c.route, c.known = r, ok
+				c.trace.adsbdb = answerOf(hasRoute(r), routeStr(r))
 			}
 		}
 		t.preferRoute(fallbackCtx, &c, fetchedAt)
@@ -302,13 +309,14 @@ func (t *Tracker) Tick(ctx context.Context) {
 	}
 	opCancel()
 	fbCancel()
+	t.compareFallback(ctx, matched)
 	// Kept whole and ordered so a client can step through the aircraft in
 	// range by identity, not just read the nearest.
 	sort.SliceStable(matched, func(i, j int) bool { return matched[i].distKm < matched[j].distKm })
 	seen := t.sightings(matched, fetchedAt)
 	for _, c := range matched {
 		if c.board != nil {
-			t.remember(c.ac.Hex, passRoute{state: passFound, route: *c.board})
+			t.remember(c.ac.Hex, passRoute{state: passFound, route: *c.board, source: SourceBoard})
 		}
 	}
 	list := make([]Snapshot, len(matched))
@@ -366,6 +374,13 @@ func (t *Tracker) Tick(ctx context.Context) {
 		st, ok, err := t.o.Delay.Status(dctx, dq)
 		cancel()
 		delayState, delayErr = classifyDelay(err)
+		// A failed paid call leaves no cache entry for paidAnswer to read.
+		switch {
+		case errors.Is(err, flightstatus.ErrBudget):
+			best.trace.aeroapi.Status = StatusSkipped
+		case err != nil:
+			best.trace.aeroapi.Status = StatusError
+		}
 		if err == nil && ok {
 			s := st
 			snap.Delay = &s
@@ -375,7 +390,58 @@ func (t *Tracker) Tick(ctx context.Context) {
 	if best != nil {
 		list[0].Delay = snap.Delay
 	}
+	if t.o.Recorder != nil && len(matched) > 0 {
+		t.paidAnswer(best, seen)
+		t.o.Recorder.Record(passRecords(matched, seen, fetchedAt))
+	}
 	t.onSuccess(snap, list, fetchedAt, routeErr, delayState, delayErr)
+}
+
+// cachedFlights is the paid lookup's cache seen without calling upstream.
+type cachedFlights interface {
+	Cached(q flightstatus.Query) (fl flightstatus.Flight, ok, found bool)
+}
+
+// paidAnswer fills in what AeroAPI said this pass when the call was made for
+// the delay rather than the route (the shown route came from a free source),
+// by reading the shared cache entry: it never pays for the log.
+func (t *Tracker) paidAnswer(best *candidate, seen map[string]time.Time) {
+	cf, ok := t.o.Flights.(cachedFlights)
+	if !ok || best == nil || best.trace.aeroapi.Status != StatusNotAsked {
+		return
+	}
+	ident := t.delayIdent(best)
+	if ident == "" {
+		return
+	}
+	q := queryFor(*best, seen[best.ac.Hex])
+	q.Callsign = ident
+	fl, ok, found := cf.Cached(q)
+	switch {
+	case !found:
+	case ok && fl.HasRoute:
+		best.trace.aeroapi = SourceAnswer{Status: StatusHit, Route: flightRouteStr(fl.Route)}
+	default:
+		best.trace.aeroapi = SourceAnswer{Status: StatusUnknown}
+	}
+}
+
+func passRecords(matched []candidate, seen map[string]time.Time, now time.Time) []PassRecord {
+	recs := make([]PassRecord, len(matched))
+	for i, c := range matched {
+		r := PassRecord{
+			Hex: c.ac.Hex, Callsign: c.ac.Callsign, Reg: c.ac.Reg, Type: c.ac.Type, Airline: c.route.Airline,
+			FirstSeen: seen[c.ac.Hex], LastSeen: now,
+			DistKm: math.Round(c.distKm*10) / 10, AltFt: c.ac.AltFt, Nearest: i == 0,
+			Board: c.trace.board, ADSBDB: c.trace.adsbdb, HexDB: c.trace.hexdb, AeroAPI: c.trace.aeroapi,
+			ShownSource: c.trace.shown,
+		}
+		if r.ShownSource != SourceNone {
+			r.ShownRoute = routeStr(c.route)
+		}
+		recs[i] = r
+	}
+	return recs
 }
 
 // delayIdent is the cache key for the nearest aircraft's delay lookup, keyed
@@ -444,15 +510,21 @@ func (t *Tracker) fillRoute(ctx context.Context, c *candidate, seen, now time.Ti
 	cancel()
 	paid = paidCall{called: true, fl: fl, err: err}
 	switch {
+	case errors.Is(err, flightstatus.ErrBudget):
+		c.trace.aeroapi.Status = StatusSkipped
 	case err != nil:
+		c.trace.aeroapi.Status = StatusError
 		// A refusal or an outage says nothing about this flight; the
 		// cache's cooldown already spaces out the retries.
 		t.o.Logger.Debug("paid route lookup failed", "ident", ident, "err", err)
 	case ok && fl.HasRoute:
 		applyRoute(c, fl.Route)
-		t.remember(hex, passRoute{state: passFound, route: fl.Route})
+		t.remember(hex, passRoute{state: passFound, route: fl.Route, source: SourceAeroAPI})
+		c.trace.aeroapi = SourceAnswer{Status: StatusHit, Route: flightRouteStr(fl.Route)}
+		c.trace.shown = SourceAeroAPI
 		changed = true
 	default:
+		c.trace.aeroapi.Status = StatusUnknown
 		// Remembered for the whole pass, not the cache's 15 minutes: an
 		// aircraft AeroAPI cannot name now will not become nameable
 		// overhead, and each retry would spend the shared daily cap.
@@ -471,41 +543,178 @@ func (t *Tracker) fillRoute(ctx context.Context, c *candidate, seen, now time.Ti
 // fallback source under the same position check, and only then may
 // fillRoute pay AeroAPI.
 func (t *Tracker) preferRoute(fallbackCtx func() context.Context, c *candidate, now time.Time) {
-	if m := t.passMemo(c.ac.Hex, now); m.state == passFound {
+	// Every source is asked (the board and cached hexdb cost no upstream
+	// call) so the source log can compare them; which one is shown is
+	// decided afterwards, in the order above.
+	boardRoute, boardOK := t.askBoard(c, now)
+	plausible := hasRoute(c.route) && c.route.Plausible(c.ac.Lat, c.ac.Lon)
+	if hasRoute(c.route) && !plausible {
+		c.trace.adsbdb.Status = StatusImplausible
+	}
+	m := t.passMemo(c.ac.Hex, now)
+	c.trace.aeroapi = t.aeroAnswer(m)
+	var hexRoute routes.Route
+	var hexOK bool
+	if m.state == passFound || boardOK || plausible {
+		// Named already: hexdb's answer is only for the source log, asked
+		// after every aircraft that needs it (compareFallback).
+		c.compare = true
+	} else {
+		hexRoute, hexOK = t.askFallback(fallbackCtx, c)
+	}
+
+	switch {
+	case m.state == passFound:
 		useRoute(c, m.route)
-		return
-	}
-	if t.o.BoardRoute != nil && c.ac.Callsign != "" {
-		if r, ok := t.o.BoardRoute.Route(queryFor(*c, time.Time{}), now); ok {
-			useRoute(c, r)
-			c.board = &r
-			return
+		c.trace.shown = m.source
+	case boardOK:
+		useRoute(c, boardRoute)
+		c.board = &boardRoute
+		c.trace.shown = SourceBoard
+	case plausible:
+		c.trace.shown = SourceADSBDB
+	default:
+		// Dropped only now: a board or remembered route naming the same
+		// airports keeps adsbdb's city names (useRoute above).
+		if hasRoute(c.route) {
+			t.o.Logger.Debug("implausible route dropped", "callsign", c.ac.Callsign, "route", routeStr(c.route))
+			c.route = routes.Route{Airline: c.route.Airline, AirlineIATA: c.route.AirlineIATA}
 		}
-	}
-	if hasRoute(c.route) && !c.route.Plausible(c.ac.Lat, c.ac.Lon) {
-		t.o.Logger.Debug("implausible route dropped", "callsign", c.ac.Callsign,
-			"route", firstNonEmpty(c.route.OriginIATA, c.route.OriginICAO)+"-"+firstNonEmpty(c.route.DestIATA, c.route.DestICAO))
-		c.route = routes.Route{Airline: c.route.Airline, AirlineIATA: c.route.AirlineIATA}
-	}
-	if !hasRoute(c.route) && t.o.FallbackRoutes != nil && c.ac.Callsign != "" {
-		t.fallbackRoute(fallbackCtx(), c)
+		t.useFallback(c, hexRoute, hexOK)
 	}
 }
 
-// fallbackRoute fills the route ends from the free fallback source. Its
-// errors stay at debug level and off the failing/recovered state, which
-// tracks adsbdb: a fallback outage only means fewer routes, never stale ones.
-// ctx is the tick's shared fallback budget; once it is spent the cache still
-// answers from memory but makes no upstream call.
-func (t *Tracker) fallbackRoute(ctx context.Context, c *candidate) {
+// useFallback shows the fallback route, if it found one, in place of the
+// dropped or missing adsbdb route.
+func (t *Tracker) useFallback(c *candidate, hexRoute routes.Route, hexOK bool) {
+	switch {
+	case hexOK:
+		hexRoute.Airline, hexRoute.AirlineIATA = c.route.Airline, c.route.AirlineIATA
+		c.route, c.known = hexRoute, true
+		c.trace.shown = SourceHexDB
+	default:
+		c.trace.shown = SourceNone
+	}
+}
+
+// aeroAnswer is AeroAPI's answer before this tick's paid call, if any: what
+// it said earlier in the pass, else not asked. fillRoute updates it.
+func (t *Tracker) aeroAnswer(m passRoute) SourceAnswer {
+	switch {
+	case t.o.Flights == nil:
+		return SourceAnswer{Status: StatusOff}
+	case m.state == passFound && m.source == SourceAeroAPI:
+		return SourceAnswer{Status: StatusHit, Route: flightRouteStr(m.route)}
+	case m.state == passUnknown:
+		return SourceAnswer{Status: StatusUnknown}
+	}
+	return SourceAnswer{Status: StatusNotAsked}
+}
+
+func (t *Tracker) askBoard(c *candidate, now time.Time) (flightstatus.FlightRoute, bool) {
+	switch {
+	case t.o.BoardRoute == nil:
+		c.trace.board.Status = StatusOff
+	case c.ac.Callsign == "":
+		c.trace.board.Status = StatusNone
+	default:
+		r, ok := t.o.BoardRoute.Route(queryFor(*c, time.Time{}), now)
+		if ok {
+			c.trace.board = SourceAnswer{Status: StatusHit, Route: flightRouteStr(r)}
+			return r, true
+		}
+		c.trace.board.Status = StatusMiss
+	}
+	return flightstatus.FlightRoute{}, false
+}
+
+// askFallback asks the free fallback source (hexdb) and reports a route the
+// aircraft could be flying. Its errors stay at debug level and off the
+// failing/recovered state, which tracks adsbdb: a fallback outage only means
+// fewer routes, never stale ones. The context is the tick's shared fallback
+// budget; once it is spent the cache still answers from memory but makes no
+// upstream call.
+func (t *Tracker) askFallback(fallbackCtx func() context.Context, c *candidate) (routes.Route, bool) {
+	switch {
+	case t.o.FallbackRoutes == nil:
+		c.trace.hexdb.Status = StatusOff
+		return routes.Route{}, false
+	case c.ac.Callsign == "":
+		c.trace.hexdb.Status = StatusNone
+		return routes.Route{}, false
+	}
+	ctx := fallbackCtx()
 	r, ok, err := t.o.FallbackRoutes.Route(ctx, c.ac.Callsign)
 	switch {
+	case err != nil && ctx.Err() != nil:
+		c.trace.hexdb.Status = StatusSkipped
 	case err != nil:
+		c.trace.hexdb.Status = StatusError
 		t.o.Logger.Debug("fallback route lookup failed", "callsign", c.ac.Callsign, "err", err)
-	case ok && r.Plausible(c.ac.Lat, c.ac.Lon):
-		r.Airline, r.AirlineIATA = c.route.Airline, c.route.AirlineIATA
-		c.route, c.known = r, true
+	case !ok:
+		c.trace.hexdb.Status = StatusUnknown
+	case !r.Plausible(c.ac.Lat, c.ac.Lon):
+		c.trace.hexdb = SourceAnswer{Status: StatusImplausible, Route: routeStr(r)}
+	default:
+		c.trace.hexdb = SourceAnswer{Status: StatusHit, Route: routeStr(r)}
+		return r, true
 	}
+	return routes.Route{}, false
+}
+
+// lazyBudget returns a shared deadline that starts at its first use, and
+// the cancel for it (a no-op if it was never used).
+func lazyBudget(parent context.Context, d time.Duration) (get func() context.Context, cancel func()) {
+	var ctx context.Context
+	stop := context.CancelFunc(func() {})
+	get = func() context.Context {
+		if ctx == nil {
+			ctx, stop = context.WithTimeout(parent, d)
+		}
+		return ctx
+	}
+	return get, func() { stop() }
+}
+
+// compareFallback asks the fallback source, for the source log only, about
+// listed aircraft that were named without it. It runs after every lookup the
+// display needs and on a budget of its own, so a stall here can neither
+// starve those lookups nor push an aircraft on to the paid one; without a
+// recorder it costs nothing.
+func (t *Tracker) compareFallback(ctx context.Context, matched []candidate) {
+	if t.o.Recorder == nil {
+		for i := range matched {
+			if matched[i].compare {
+				matched[i].trace.hexdb.Status = StatusNotAsked
+			}
+		}
+		return
+	}
+	budget, cancel := lazyBudget(ctx, t.o.RouteTimeout)
+	defer cancel()
+	for i := range matched {
+		if matched[i].compare {
+			t.askFallback(budget, &matched[i])
+		}
+	}
+}
+
+func answerOf(found bool, route string) SourceAnswer {
+	if !found {
+		return SourceAnswer{Status: StatusUnknown}
+	}
+	return SourceAnswer{Status: StatusHit, Route: route}
+}
+
+func routeStr(r routes.Route) string {
+	if !hasRoute(r) {
+		return ""
+	}
+	return firstNonEmpty(r.OriginIATA, r.OriginICAO) + "-" + firstNonEmpty(r.DestIATA, r.DestICAO)
+}
+
+func flightRouteStr(r flightstatus.FlightRoute) string {
+	return routeStr(routes.Route{OriginIATA: r.OriginIATA, OriginICAO: r.OriginICAO, DestIATA: r.DestIATA, DestICAO: r.DestICAO})
 }
 
 // useRoute puts a board or AeroAPI route on the candidate. When it names the
@@ -582,6 +791,8 @@ const (
 type passRoute struct {
 	state passState
 	route flightstatus.FlightRoute
+	// source is the route source that found route, kept for the source log.
+	source string
 	// noFlight: AeroAPI has no such flight at all, so it has no delay either
 	// and the delay path must not pay to ask again once the cache expires.
 	noFlight bool

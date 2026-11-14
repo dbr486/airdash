@@ -253,3 +253,23 @@ func TestCache_ErrorCooldownSpansPasses(t *testing.T) {
 		t.Errorf("a bad key must stay in cooldown across passes: calls=%d err=%v", inner.calls, err)
 	}
 }
+
+func TestCache_CachedNeverCallsUpstream(t *testing.T) {
+	ck := &clock{t: time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)}
+	inner := &fakeLookup{route: FlightRoute{OriginIATA: "AGP"}, hasRt: true}
+	c := NewCache(inner, 15*time.Minute, 15*time.Minute, time.Minute, ck.now)
+	q := Query{Callsign: "RYR5EL", Seen: ck.t}
+	if _, _, found := c.Cached(q); found || inner.calls != 0 {
+		t.Fatalf("an empty cache has nothing and must not ask upstream: calls=%d", inner.calls)
+	}
+	if _, _, err := c.Flight(t.Context(), q); err != nil {
+		t.Fatal(err)
+	}
+	fl, ok, found := c.Cached(q)
+	if !found || !ok || fl.Route.OriginIATA != "AGP" || inner.calls != 1 {
+		t.Errorf("a cached answer is returned as is: found=%v ok=%v %+v calls=%d", found, ok, fl, inner.calls)
+	}
+	if _, _, found := c.Cached(Query{Callsign: "RYR5EL", Seen: ck.t.Add(time.Hour)}); found {
+		t.Error("another pass's entry must not be returned")
+	}
+}

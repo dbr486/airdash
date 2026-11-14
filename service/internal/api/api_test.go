@@ -18,6 +18,7 @@ import (
 	"airdash/internal/flightstatus"
 	"airdash/internal/geocode"
 	"airdash/internal/settings"
+	"airdash/internal/sourcelog"
 	"airdash/internal/tracker"
 )
 
@@ -810,5 +811,70 @@ func TestSettings_PaidRoutesPutChangesOnlyThat(t *testing.T) {
 	}
 	if _, body := get(t, h, "/api/settings"); body["paid_routes"] != false {
 		t.Errorf("GET = %v", body)
+	}
+}
+
+type fakeSourceLog struct {
+	days, limit int
+	before      time.Time
+	beforeHex   string
+	err         error
+}
+
+func (f *fakeSourceLog) Summary(ctx context.Context, days int) (sourcelog.Summary, error) {
+	f.days = days
+	return sourcelog.Summary{Days: []sourcelog.Day{{Day: "2026-10-30", Passes: 3}}}, f.err
+}
+
+func (f *fakeSourceLog) Passes(ctx context.Context, limit int, before time.Time, beforeHex string) ([]sourcelog.Pass, error) {
+	f.limit, f.before, f.beforeHex = limit, before, beforeHex
+	return []sourcelog.Pass{{Hex: "abc", Callsign: "RYR5EL"}}, f.err
+}
+
+func (f *fakeSourceLog) Disagreements(ctx context.Context, days, limit int) ([]sourcelog.Pass, error) {
+	f.days, f.limit = days, limit
+	return []sourcelog.Pass{{Hex: "def"}}, f.err
+}
+
+func TestSources_Endpoints(t *testing.T) {
+	sl := &fakeSourceLog{}
+	h := NewHandler(&fakeSource{at: time.Now()}, store(10), &fakeStats{}, nil, time.Now, WithSourceLog(sl))
+
+	rec, body := get(t, h, "/api/sources/summary")
+	if rec.Code != 200 || sl.days != 7 || len(body["days"].([]any)) != 1 {
+		t.Errorf("summary default: code=%d days=%d body=%v", rec.Code, sl.days, body)
+	}
+	if rec, _ := get(t, h, "/api/sources/summary?days=30"); rec.Code != 200 || sl.days != 30 {
+		t.Errorf("summary days: code=%d days=%d", rec.Code, sl.days)
+	}
+
+	rec, body = get(t, h, "/api/sources/passes?limit=10&before=1793391374&before_hex=4ca850")
+	if rec.Code != 200 || sl.limit != 10 || sl.before.Unix() != 1793391374 || sl.beforeHex != "4ca850" || len(body["passes"].([]any)) != 1 {
+		t.Errorf("passes: code=%d limit=%d before=%v body=%v", rec.Code, sl.limit, sl.before, body)
+	}
+	if rec, _ := get(t, h, "/api/sources/passes"); rec.Code != 200 || sl.limit != 50 || !sl.before.IsZero() {
+		t.Errorf("passes default: code=%d limit=%d before=%v", rec.Code, sl.limit, sl.before)
+	}
+
+	rec, body = get(t, h, "/api/sources/disagreements?days=3&limit=5")
+	if rec.Code != 200 || sl.days != 3 || sl.limit != 5 || len(body["passes"].([]any)) != 1 {
+		t.Errorf("disagreements: code=%d days=%d limit=%d", rec.Code, sl.days, sl.limit)
+	}
+
+	for _, bad := range []string{"/api/sources/summary?days=x", "/api/sources/passes?limit=-", "/api/sources/passes?before=soon", "/api/sources/disagreements?limit=1.5"} {
+		if rec, _ := get(t, h, bad); rec.Code != 400 {
+			t.Errorf("%s: want 400, got %d", bad, rec.Code)
+		}
+	}
+	sl.err = errors.New("disk")
+	if rec, _ := get(t, h, "/api/sources/summary"); rec.Code != 500 {
+		t.Errorf("store error should be 500, got %d", rec.Code)
+	}
+
+	plain := NewHandler(&fakeSource{at: time.Now()}, store(10), &fakeStats{}, nil, time.Now)
+	for _, p := range []string{"/api/sources/summary", "/api/sources/passes", "/api/sources/disagreements"} {
+		if rec, _ := get(t, plain, p); rec.Code != 404 {
+			t.Errorf("%s without a log: want 404, got %d", p, rec.Code)
+		}
 	}
 }

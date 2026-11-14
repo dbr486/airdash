@@ -1582,22 +1582,24 @@ func TestTick_FallbackImplausibleNotShown(t *testing.T) {
 	}
 }
 
-func TestTick_FallbackNotAskedWhenFreeRoutePlausible(t *testing.T) {
+// The fallback is asked for every aircraft (for the source log), but a
+// plausible free route still decides what is shown.
+func TestTick_PlausibleFreeRouteBeatsFallback(t *testing.T) {
 	fb := &fakeRoutes{byCallsign: map[string]routes.Route{"WZZ1": lhrWAW}}
 	tr := fallbackTracker(&fakeRoutes{byCallsign: map[string]routes.Route{"WZZ1": lhrBUD}}, fb, filter.Filter{})
 	tr.Tick(t.Context())
-	if s, _ := tr.Current(); s.Dest != "BUD" || fb.calls != 0 {
-		t.Errorf("a plausible free route must win without asking the fallback: calls=%d %+v", fb.calls, s)
+	if s, _ := tr.Current(); s.Dest != "BUD" {
+		t.Errorf("a plausible free route must win over the fallback: %+v", s)
 	}
 }
 
-func TestTick_FallbackNotAskedWhenBoardNames(t *testing.T) {
+func TestTick_BoardBeatsFallback(t *testing.T) {
 	fb := &fakeRoutes{byCallsign: map[string]routes.Route{"WZZ1": lhrWAW}}
 	tr := fallbackTracker(&fakeRoutes{}, fb, filter.Filter{})
 	tr.o.BoardRoute = &fakeBoardRoute{r: flightstatus.FlightRoute{OriginIATA: "LHR", DestIATA: "BUD"}, ok: true}
 	tr.Tick(t.Context())
-	if s, _ := tr.Current(); s.Dest != "BUD" || fb.calls != 0 {
-		t.Errorf("the board must win without asking the fallback: calls=%d %+v", fb.calls, s)
+	if s, _ := tr.Current(); s.Dest != "BUD" {
+		t.Errorf("the board must win over the fallback: %+v", s)
 	}
 }
 
@@ -1702,5 +1704,243 @@ func TestTick_SlowPrimaryDoesNotSpendFallbackBudget(t *testing.T) {
 	tr.Tick(t.Context())
 	if s, _ := tr.Current(); s.Dest != "WAW" {
 		t.Errorf("a stalled primary source must leave the fallback its own budget: %+v", s)
+	}
+}
+
+type recorderSpy struct{ batches [][]PassRecord }
+
+func (r *recorderSpy) Record(recs []PassRecord) { r.batches = append(r.batches, recs) }
+
+func (r *recorderSpy) last(t *testing.T) []PassRecord {
+	t.Helper()
+	if len(r.batches) == 0 {
+		t.Fatal("nothing recorded")
+	}
+	return r.batches[len(r.batches)-1]
+}
+
+func TestRecord_OneRecordPerListedAircraft(t *testing.T) {
+	p := &fakeProvider{acs: []provider.Aircraft{airborne("a", "WZZ1", 51.50, -0.45), airborne("b", "WZZ2", 51.48, -0.45)}}
+	tr := newTracker(p, &fakeRoutes{byCallsign: map[string]routes.Route{"WZZ2": lhrBUD}}, filter.Filter{}, &clock{t: time.Now()})
+	spy := &recorderSpy{}
+	tr.o.Recorder = spy
+	tr.Tick(t.Context())
+	recs := spy.last(t)
+	if len(recs) != 2 || recs[0].Hex != "b" || !recs[0].Nearest || recs[1].Nearest {
+		t.Fatalf("one record per aircraft, nearest first and only it marked: %+v", recs)
+	}
+	r := recs[0]
+	if r.FirstSeen.IsZero() || r.LastSeen.IsZero() || r.Callsign != "WZZ2" || r.Airline != "Wizz Air" {
+		t.Errorf("pass identity and context must be filled: %+v", r)
+	}
+	if r.ADSBDB != (SourceAnswer{StatusHit, "LHR-BUD"}) || r.Board.Status != StatusOff || r.HexDB.Status != StatusOff ||
+		r.AeroAPI.Status != StatusOff || r.ShownSource != SourceADSBDB || r.ShownRoute != "LHR-BUD" {
+		t.Errorf("adsbdb shown, other sources off: %+v", r)
+	}
+	if recs[1].ADSBDB.Status != StatusUnknown || recs[1].ShownSource != SourceNone || recs[1].ShownRoute != "" {
+		t.Errorf("an unknown route is recorded as such: %+v", recs[1])
+	}
+}
+
+func TestRecord_EverySourceAnswerAndTheShownOne(t *testing.T) {
+	fb := &fakeRoutes{byCallsign: map[string]routes.Route{"WZZ1": lhrWAW}}
+	tr := fallbackTracker(&fakeRoutes{byCallsign: map[string]routes.Route{"WZZ1": agpTFS}}, fb, filter.Filter{})
+	tr.o.BoardRoute = &fakeBoardRoute{}
+	spy := &recorderSpy{}
+	tr.o.Recorder = spy
+	tr.Tick(t.Context())
+	r := spy.last(t)[0]
+	if r.ADSBDB != (SourceAnswer{StatusImplausible, "AGP-TFS"}) || r.Board.Status != StatusMiss ||
+		r.HexDB != (SourceAnswer{StatusHit, "LHR-WAW"}) || r.ShownSource != SourceHexDB || r.ShownRoute != "LHR-WAW" {
+		t.Errorf("implausible adsbdb, board miss, hexdb shown: %+v", r)
+	}
+}
+
+func TestRecord_SourceStatuses(t *testing.T) {
+	far := agpTFS
+	far.Airline, far.AirlineIATA = "", ""
+	cases := []struct {
+		name  string
+		free  *fakeRoutes
+		fb    *fakeRoutes
+		cs    string
+		check func(PassRecord) bool
+	}{
+		{"no callsign", &fakeRoutes{}, &fakeRoutes{}, "",
+			func(r PassRecord) bool {
+				return r.ADSBDB.Status == StatusNone && r.Board.Status == StatusNone && r.HexDB.Status == StatusNone
+			}},
+		{"adsbdb error", &fakeRoutes{errFor: map[string]bool{"WZZ1": true}}, &fakeRoutes{}, "WZZ1",
+			func(r PassRecord) bool { return r.ADSBDB.Status == StatusError && r.HexDB.Status == StatusUnknown }},
+		{"hexdb error", &fakeRoutes{}, &fakeRoutes{errFor: map[string]bool{"WZZ1": true}}, "WZZ1",
+			func(r PassRecord) bool { return r.HexDB.Status == StatusError }},
+		{"hexdb implausible", &fakeRoutes{}, &fakeRoutes{byCallsign: map[string]routes.Route{"WZZ1": far}}, "WZZ1",
+			func(r PassRecord) bool {
+				return r.HexDB == SourceAnswer{StatusImplausible, "AGP-TFS"} && r.ShownSource == SourceNone
+			}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ac := airborne("a", tc.cs, 51.48, -0.45)
+			tr := newTracker(&fakeProvider{acs: []provider.Aircraft{ac}}, tc.free, filter.Filter{}, &clock{t: time.Now()})
+			tr.o.FallbackRoutes = tc.fb
+			tr.o.BoardRoute = &fakeBoardRoute{}
+			spy := &recorderSpy{}
+			tr.o.Recorder = spy
+			tr.Tick(t.Context())
+			if r := spy.last(t)[0]; !tc.check(r) {
+				t.Errorf("unexpected record: %+v", r)
+			}
+		})
+	}
+}
+
+func TestRecord_SpentFallbackBudgetIsSkipped(t *testing.T) {
+	ck := &clock{t: time.Now()}
+	p := &fakeProvider{acs: []provider.Aircraft{airborne("a", "WZZ1", 51.48, -0.45), airborne("b", "WZZ2", 51.49, -0.45)}}
+	tr := newTracker(p, &fakeRoutes{}, filter.Filter{}, ck)
+	tr.o.RouteTimeout = 20 * time.Millisecond
+	tr.o.FallbackRoutes = routes.NewCache(&stallOnce{stall: "WZZ1"}, time.Hour, time.Hour, time.Minute, ck.now)
+	spy := &recorderSpy{}
+	tr.o.Recorder = spy
+	tr.Tick(t.Context())
+	recs := spy.last(t)
+	if recs[0].HexDB.Status != StatusSkipped || recs[1].HexDB.Status != StatusSkipped {
+		t.Errorf("the stalled lookup and the one after it ran out of budget: %+v", recs)
+	}
+}
+
+func TestRecord_PaidRouteAndItsMemo(t *testing.T) {
+	rig := newPaidRig([]provider.Aircraft{airborne("a", "WZZ1", 51.48, -0.45)}, false, true)
+	spy := &recorderSpy{}
+	rig.tr.o.Recorder = spy
+	rig.inner.fl, rig.inner.ok = flightstatus.Flight{Route: agpLGW, HasRoute: true}, true
+	rig.tick(t)
+	r := spy.last(t)[0]
+	if r.AeroAPI != (SourceAnswer{StatusHit, "AGP-LGW"}) || r.ShownSource != SourceAeroAPI || r.ShownRoute != "AGP-LGW" {
+		t.Errorf("paid route recorded and shown: %+v", r)
+	}
+	rig.ck.t = rig.ck.t.Add(time.Minute)
+	rig.tick(t)
+	r = spy.last(t)[0]
+	if r.AeroAPI.Status != StatusHit || r.ShownSource != SourceAeroAPI || rig.inner.calls() != 1 {
+		t.Errorf("a remembered paid route keeps its source: calls=%d %+v", rig.inner.calls(), r)
+	}
+}
+
+func TestRecord_PaidUnknownAndNotAsked(t *testing.T) {
+	rig := newPaidRig([]provider.Aircraft{airborne("a", "WZZ1", 51.48, -0.45), airborne("b", "WZZ2", 51.50, -0.45)}, false, true)
+	spy := &recorderSpy{}
+	rig.tr.o.Recorder = spy
+	rig.tick(t)
+	recs := spy.last(t)
+	if recs[0].AeroAPI.Status != StatusUnknown || recs[1].AeroAPI.Status != StatusNotAsked {
+		t.Errorf("nearest asked and unknown, the other not asked: %+v", recs)
+	}
+}
+
+func TestRecord_BoardRouteShownAndRemembered(t *testing.T) {
+	rig := newPaidRig([]provider.Aircraft{airborne("a", "WZZ1", 51.48, -0.45)}, false, true)
+	brd := &fakeBoardRoute{r: flightstatus.FlightRoute{OriginIATA: "LHR", DestIATA: "WAW"}, ok: true}
+	rig.tr.o.BoardRoute = brd
+	spy := &recorderSpy{}
+	rig.tr.o.Recorder = spy
+	rig.tick(t)
+	brd.ok = false
+	rig.ck.t = rig.ck.t.Add(time.Minute)
+	rig.tick(t)
+	r := spy.last(t)[0]
+	if r.Board.Status != StatusMiss || r.ShownSource != SourceBoard || r.ShownRoute != "LHR-WAW" {
+		t.Errorf("a remembered board route keeps its source while the board now misses: %+v", r)
+	}
+}
+
+func TestTick_ComparisonLookupDoesNotStarveNeededOne(t *testing.T) {
+	ck := &clock{t: time.Now()}
+	// "a" is named by a plausible adsbdb route, so its hexdb answer is only
+	// for the log; it stalls. "b" needs hexdb and must still get it.
+	p := &fakeProvider{acs: []provider.Aircraft{airborne("a", "WZZ1", 51.48, -0.45), airborne("b", "WZZ2", 51.49, -0.45)}}
+	tr := newTracker(p, &fakeRoutes{byCallsign: map[string]routes.Route{"WZZ1": lhrBUD}}, filter.Filter{}, ck)
+	tr.o.RouteTimeout = 30 * time.Millisecond
+	tr.o.FallbackRoutes = routes.NewCache(&stallOnce{stall: "WZZ1", byCs: map[string]routes.Route{"WZZ2": lhrWAW}}, time.Hour, time.Hour, time.Minute, ck.now)
+	tr.Tick(t.Context())
+	l, _ := tr.List()
+	if len(l) != 2 || l[0].Dest != "BUD" || l[1].Dest != "WAW" {
+		t.Errorf("a stalled comparison-only lookup must not spend the budget a needed one relies on: %+v", l)
+	}
+}
+
+func TestTick_ComparisonStallBetweenNeededLookupsCostsNothing(t *testing.T) {
+	// A needs hexdb (fast), B only compares (stalls), C needs hexdb and is
+	// nearest: C must get its free route and no paid call may happen.
+	rig := newPaidRig([]provider.Aircraft{
+		airborne("c", "WZZ3", 51.471, -0.45),
+		airborne("a", "WZZ1", 51.48, -0.45),
+		airborne("b", "WZZ2", 51.49, -0.45),
+	}, false, true)
+	rig.rts.byCallsign["WZZ2"] = lhrBUD
+	rig.tr.o.RouteTimeout = 30 * time.Millisecond
+	rig.tr.o.Recorder = &recorderSpy{}
+	// Provider order puts "c" first; make A and B come before C in the loop.
+	p := rig.tr.o.Provider.(*fakeProvider)
+	p.acs = []provider.Aircraft{p.acs[1], p.acs[2], p.acs[0]}
+	rig.tr.o.FallbackRoutes = routes.NewCache(&stallOnce{stall: "WZZ2",
+		byCs: map[string]routes.Route{"WZZ1": lhrWAW, "WZZ3": lhrWAW}}, time.Hour, time.Hour, time.Minute, rig.ck.now)
+	s := rig.tick(t)
+	if s.Callsign != "WZZ3" || s.Dest != "WAW" || rig.inner.calls() != 0 {
+		t.Errorf("the nearest aircraft must get its free route without a paid call: calls=%d %+v", rig.inner.calls(), s)
+	}
+}
+
+func TestTick_NoComparisonLookupsWithoutRecorder(t *testing.T) {
+	fb := &fakeRoutes{byCallsign: map[string]routes.Route{"WZZ1": lhrWAW}}
+	tr := fallbackTracker(&fakeRoutes{byCallsign: map[string]routes.Route{"WZZ1": lhrBUD}}, fb, filter.Filter{})
+	tr.Tick(t.Context())
+	if fb.calls != 0 {
+		t.Errorf("without a source log, an aircraft with a route must not cost a fallback lookup: %d", fb.calls)
+	}
+}
+
+func TestRecord_AeroAPIRouteFromDelayLookup(t *testing.T) {
+	rig := newPaidRig([]provider.Aircraft{airborne("a", "WZZ1", 51.48, -0.45)}, true, true)
+	rig.rts.byCallsign["WZZ1"] = lhrBUD
+	spy := &recorderSpy{}
+	rig.tr.o.Recorder = spy
+	late := 20 * 60
+	rig.inner.fl, rig.inner.ok = flightstatus.Flight{Route: agpLGW, HasRoute: true, Status: flightstatus.Classify(late/60, "arrival"), HasStatus: true}, true
+	s := rig.tick(t)
+	r := spy.last(t)[0]
+	if s.Dest != "BUD" || r.ShownSource != SourceADSBDB || rig.inner.calls() != 1 {
+		t.Fatalf("display unchanged, one paid call for the delay: calls=%d %+v", rig.inner.calls(), s)
+	}
+	if r.AeroAPI != (SourceAnswer{StatusHit, "AGP-LGW"}) {
+		t.Errorf("the route the delay lookup paid for must be recorded: %+v", r.AeroAPI)
+	}
+}
+
+func TestTick_AgreeingBoardKeepsNamesOfImplausibleFreeRoute(t *testing.T) {
+	r := &fakeRoutes{byCallsign: map[string]routes.Route{"WZZ1": agpTFS}}
+	tr := newTracker(&fakeProvider{acs: []provider.Aircraft{airborne("a", "WZZ1", 51.48, -0.45)}}, r, filter.Filter{}, &clock{t: time.Now()})
+	tr.o.BoardRoute = &fakeBoardRoute{r: flightstatus.FlightRoute{OriginIATA: "AGP", DestIATA: "TFS"}, ok: true}
+	tr.Tick(t.Context())
+	if s, _ := tr.Current(); s.Origin != "AGP" || s.OriginName != "Malaga" || s.DestName != "Tenerife" {
+		t.Errorf("a board route that agrees must keep adsbdb's city names: %+v", s)
+	}
+}
+
+func TestRecord_FailedDelayLookupIsRecorded(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want string
+	}{{errors.New("down"), StatusError}, {flightstatus.ErrBudget, StatusSkipped}} {
+		rig := newPaidRig([]provider.Aircraft{airborne("a", "WZZ1", 51.48, -0.45)}, true, true)
+		rig.rts.byCallsign["WZZ1"] = lhrBUD
+		spy := &recorderSpy{}
+		rig.tr.o.Recorder = spy
+		rig.inner.err = tc.err
+		rig.tick(t)
+		if r := spy.last(t)[0]; r.AeroAPI.Status != tc.want || rig.inner.calls() != 1 {
+			t.Errorf("%v: delay lookup outcome must be recorded as %s: calls=%d %+v", tc.err, tc.want, rig.inner.calls(), r.AeroAPI)
+		}
 	}
 }

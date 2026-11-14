@@ -19,6 +19,7 @@ import (
 	"airdash/internal/geocode"
 	"airdash/internal/logos"
 	"airdash/internal/settings"
+	"airdash/internal/sourcelog"
 	"airdash/internal/tracker"
 )
 
@@ -47,6 +48,14 @@ type StatsSource interface {
 	Board() (airport string, flights, ageS, callsMonth, callsCap int, source string)
 }
 
+// SourceLog answers the route source history for the dashboard. The store
+// clamps days and limit itself, so only malformed values are rejected here.
+type SourceLog interface {
+	Summary(ctx context.Context, days int) (sourcelog.Summary, error)
+	Passes(ctx context.Context, limit int, before time.Time, beforeHex string) ([]sourcelog.Pass, error)
+	Disagreements(ctx context.Context, days, limit int) ([]sourcelog.Pass, error)
+}
+
 // LogoSource serves airline logos by IATA code; nil disables the endpoint.
 type LogoSource interface {
 	Get(ctx context.Context, iata string) ([]byte, bool, error)
@@ -60,6 +69,7 @@ type handler struct {
 	now   func() time.Time
 
 	geocoder geocode.Lookup // nil = address lookup disabled
+	sources  SourceLog      // nil = route source log disabled
 }
 
 // Option configures optional handler dependencies.
@@ -68,6 +78,9 @@ type Option func(*handler)
 // WithGeocoder enables GET /api/geocode for the settings page's address
 // lookup; without it the route answers 503.
 func WithGeocoder(g geocode.Lookup) Option { return func(h *handler) { h.geocoder = g } }
+
+// WithSourceLog enables GET /api/sources/*; without it those routes answer 404.
+func WithSourceLog(l SourceLog) Option { return func(h *handler) { h.sources = l } }
 
 func NewHandler(src Source, st SettingsStore, stats StatsSource, logos LogoSource, now func() time.Time, opts ...Option) http.Handler {
 	h := &handler{src: src, st: st, stats: stats, logos: logos, now: now}
@@ -82,13 +95,16 @@ func NewHandler(src Source, st SettingsStore, stats StatsSource, logos LogoSourc
 	mux.HandleFunc("GET /api/settings", h.getSettings)
 	mux.HandleFunc("PUT /api/settings", h.putSettings)
 	mux.HandleFunc("GET /api/stats", h.getStats)
+	mux.HandleFunc("GET /api/sources/summary", h.sourcesSummary)
+	mux.HandleFunc("GET /api/sources/passes", h.sourcesPasses)
+	mux.HandleFunc("GET /api/sources/disagreements", h.sourcesDisagreements)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		_, _ = w.Write([]byte("ok"))
 	})
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
-		_, _ = w.Write([]byte("airdash: GET /api/nearest for the closest aircraft, GET/PUT /api/settings for filters, GET /api/stats for delay lookup usage\n"))
+		_, _ = w.Write([]byte("airdash: GET /api/nearest for the closest aircraft, GET/PUT /api/settings for filters, GET /api/stats for delay lookup usage, GET /api/sources/{summary,passes,disagreements} for the route source log\n"))
 	})
 	return mux
 }
@@ -466,4 +482,101 @@ func (h *handler) getGeocode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"lat": res.Lat, "lon": res.Lon, "name": res.Name})
+}
+
+type passesResponse struct {
+	Passes []sourcelog.Pass `json:"passes"`
+}
+
+func passes(ps []sourcelog.Pass) passesResponse {
+	if ps == nil {
+		ps = []sourcelog.Pass{} // [] not null, so the dashboard can iterate
+	}
+	return passesResponse{Passes: ps}
+}
+
+// sourcesReady answers 404 when no log is configured, so the dashboard can
+// tell "turned off" from "no data yet".
+func (h *handler) sourcesReady(w http.ResponseWriter) bool {
+	if h.sources == nil {
+		writeError(w, http.StatusNotFound, "route source log is off")
+		return false
+	}
+	return true
+}
+
+// intParam reads an optional integer query parameter; ok is false (and a 400
+// already written) when the value is present but not an integer.
+func intParam(w http.ResponseWriter, r *http.Request, name string, def int) (int, bool) {
+	v := r.URL.Query().Get(name)
+	if v == "" {
+		return def, true
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, name+" must be an integer")
+		return 0, false
+	}
+	return n, true
+}
+
+func (h *handler) sourcesSummary(w http.ResponseWriter, r *http.Request) {
+	if !h.sourcesReady(w) {
+		return
+	}
+	days, ok := intParam(w, r, "days", 7)
+	if !ok {
+		return
+	}
+	sum, err := h.sources.Summary(r.Context(), days)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "source log unavailable")
+		return
+	}
+	writeJSON(w, http.StatusOK, sum)
+}
+
+func (h *handler) sourcesPasses(w http.ResponseWriter, r *http.Request) {
+	if !h.sourcesReady(w) {
+		return
+	}
+	limit, ok := intParam(w, r, "limit", 50)
+	if !ok {
+		return
+	}
+	beforeUnix, ok := intParam(w, r, "before", 0)
+	if !ok {
+		return
+	}
+	var before time.Time
+	if beforeUnix > 0 {
+		before = time.Unix(int64(beforeUnix), 0)
+	}
+	// before_hex continues a page that ended inside one second's passes.
+	ps, err := h.sources.Passes(r.Context(), limit, before, r.URL.Query().Get("before_hex"))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "source log unavailable")
+		return
+	}
+	writeJSON(w, http.StatusOK, passes(ps))
+}
+
+func (h *handler) sourcesDisagreements(w http.ResponseWriter, r *http.Request) {
+	if !h.sourcesReady(w) {
+		return
+	}
+	days, ok := intParam(w, r, "days", 7)
+	if !ok {
+		return
+	}
+	limit, ok := intParam(w, r, "limit", 50)
+	if !ok {
+		return
+	}
+	ps, err := h.sources.Disagreements(r.Context(), days, limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "source log unavailable")
+		return
+	}
+	writeJSON(w, http.StatusOK, passes(ps))
 }

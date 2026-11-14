@@ -12,15 +12,18 @@ import (
 )
 
 type Config struct {
-	Lat, Lon      float64
-	RadiusKm      float64
-	Poll          time.Duration
-	Listen        string
-	Provider      string
-	Origin        string
-	Dest          string
-	Airport       string
-	SettingsFile  string
+	Lat, Lon     float64
+	RadiusKm     float64
+	Poll         time.Duration
+	Listen       string
+	Provider     string
+	Origin       string
+	Dest         string
+	Airport      string
+	SettingsFile string
+	// SourceLogFile is the SQLite file recording what each route source
+	// answered per pass; empty turns the log off.
+	SourceLogFile string
 	RouteCacheTTL time.Duration
 	AeroAPIKey    string
 	AeroAPIURL    string
@@ -79,6 +82,7 @@ func Load(getenv func(string) string) (Config, error) {
 	c.Dest = getenv("AIRDASH_DEST")
 	c.Airport = getenv("AIRDASH_AIRPORT")
 	c.SettingsFile = getenv("AIRDASH_SETTINGS_FILE")
+	c.SourceLogFile = getenv("AIRDASH_SOURCE_LOG_FILE")
 
 	c.AeroAPIKey = getenv("AIRDASH_AEROAPI_KEY")
 	c.AeroAPIURL = getenv("AIRDASH_AEROAPI_URL")

@@ -26,6 +26,7 @@ import (
 	"airdash/internal/provider"
 	"airdash/internal/routes"
 	"airdash/internal/settings"
+	"airdash/internal/sourcelog"
 	"airdash/internal/tracker"
 )
 
@@ -145,19 +146,44 @@ func run() error {
 	if aero != nil {
 		opts.Flights = aero
 	}
+	// The source log is a diagnostic: a file that cannot be opened turns it
+	// off with a warning rather than keeping the display from starting.
+	var srcLog *sourcelog.Log
+	apiOpts := []api.Option{api.WithGeocoder(geocode.New(client, geocode.DefaultURL, userAgent+" +https://github.com/dbr486/airdash", time.Now))}
+	if cfg.SourceLogFile != "" {
+		if l, err := sourcelog.Open(cfg.SourceLogFile, time.Now, logger); err != nil {
+			logger.Warn("route source log disabled", "file", cfg.SourceLogFile, "err", err)
+		} else {
+			srcLog = l
+			opts.Recorder = l
+			apiOpts = append(apiOpts, api.WithSourceLog(l))
+			logger.Info("route source log enabled", "file", cfg.SourceLogFile)
+		}
+	}
 	tr := tracker.New(opts)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	go tr.Run(ctx)
+	trDone := make(chan struct{})
+	go func() { tr.Run(ctx); close(trDone) }()
+	// The writer stops only after the tracker has: a tick still finishing
+	// when ctx is cancelled may enqueue one last batch, and the writer drains
+	// what is queued when its own context ends.
+	logCtx, stopLog := context.WithCancel(context.Background())
+	defer stopLog()
+	logDone := make(chan struct{})
+	if srcLog != nil {
+		go func() { srcLog.Run(logCtx); close(logDone) }()
+	} else {
+		close(logDone)
+	}
 	if brd != nil {
 		go brd.Run(ctx, func() string { return cur.Settings().BoardAirport }, cfg.BoardRefresh)
 	}
 
 	srv := &http.Server{
-		Addr: cfg.Listen,
-		Handler: api.NewHandler(tr, cur, delayStats{cur: cur, budget: budget, board: brd}, logoSrc, time.Now,
-			api.WithGeocoder(geocode.New(client, geocode.DefaultURL, userAgent+" +https://github.com/dbr486/airdash", time.Now))),
+		Addr:              cfg.Listen,
+		Handler:           api.NewHandler(tr, cur, delayStats{cur: cur, budget: budget, board: brd}, logoSrc, time.Now, apiOpts...),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	errc := make(chan error, 1)
@@ -176,10 +202,24 @@ func run() error {
 	logger.Info("shutting down")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := srv.Shutdown(shutdownCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		return err
+	shutdownErr := srv.Shutdown(shutdownCtx)
+	if errors.Is(shutdownErr, http.ErrServerClosed) {
+		shutdownErr = nil
 	}
-	return nil
+	if shutdownErr != nil {
+		_ = srv.Close() // a request outlived the grace period; drop it
+	}
+	// The source log is flushed whatever happened above: the tracker stops
+	// first, then the writer drains what is queued, then the file closes.
+	<-trDone
+	stopLog()
+	<-logDone
+	if srcLog != nil {
+		if err := srcLog.Close(); err != nil {
+			logger.Warn("route source log close failed", "err", err)
+		}
+	}
+	return shutdownErr
 }
 
 // delayStats answers /api/stats from the live settings and the budget.

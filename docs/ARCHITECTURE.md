@@ -76,15 +76,27 @@ Wiring is in `cmd/airdash/main.go`; each package has one job.
    answer is remembered for the rest of that aircraft's pass, so one
    aircraft costs at most one route-only call per pass. Filters run before
    this call; a paid route changes what is shown, not what is listed.
-6. **`logos`**: fetches the airline's square logo from the CDN, crops the
+6. **Route source log** (`sourcelog`, with `AIRDASH_SOURCE_LOG_FILE`): every
+   tick the tracker records, per aircraft pass (hex + first sighting), what
+   the board, adsbdb, hexdb and AeroAPI answered (hit, implausible, unknown,
+   miss, error, skipped, off, none, not asked) and which route was shown. To
+   make the comparison complete, the board and hexdb are asked for every
+   aircraft with a callsign (the board has no network cost, hexdb is cached),
+   while the display order above is unchanged; AeroAPI is never asked just for
+   the log. Records go through a non-blocking queue to one SQLite writer (WAL,
+   one transaction per tick) that merges them into one row per pass (a hit
+   is never replaced by a later miss) and prunes rows older than 90 days.
+   `GET /api/sources/summary`, `/passes` and `/disagreements` serve it.
+
+7. **`logos`**: fetches the airline's square logo from the CDN, crops the
    wordmark out of its padding and fits it (`fit.go`). It serves RGB565 for
    the displays and PNG for the page, cached for a week.
-7. **`settings`**: runtime settings (home, filters, radius, toggles,
+8. **`settings`**: runtime settings (home, filters, radius, toggles,
    caps). Env vars are the defaults, `PUT /api/settings` changes them live,
    and `AIRDASH_SETTINGS_FILE` persists them.
-8. **`geocode`**: address → coordinates for the settings page, via
+9. **`geocode`**: address → coordinates for the settings page, via
    Nominatim, throttled to one request per second and cached for a day.
-9. **`api`**: the HTTP surface (`/api/nearest`, `/api/settings`,
+10. **`api`**: the HTTP surface (`/api/nearest`, `/api/settings`,
    `/api/logo/…`, `/api/geocode`, `/api/stats`, `/healthz`).
 
 The service has no third-party Go modules.
