@@ -53,6 +53,10 @@ settings. Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 Open `http://<server>:3000`. The page shows what the display will show,
 and lets you set home (with an address search), radius and filters.
+`http://<server>:3000/sources.html` shows what each route source (airport
+board, adsbdb, hexdb, FlightAware) answered for every aircraft that passed,
+which answer went on screen, and where the sources disagreed, from the log
+kept by `AIRDASH_SOURCE_LOG_FILE`.
 
 **2. Give the server a fixed LAN address.** Use a DHCP reservation on
 your router (or a static IP) so the display's URL keeps working.

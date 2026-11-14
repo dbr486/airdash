@@ -1,0 +1,458 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AirDash route sources</title>
+<style>
+  /* Dark only, like the rest of the AirDash pages. Series colours are the
+     validated dark categorical steps; answer states use the fixed status
+     palette and always carry a text label. */
+  :root {
+    color-scheme: dark;
+    --page:#0d0d0d; --surface:#1a1a19; --ink:#f0efec; --ink-2:#c3c2b7; --muted:#898781;
+    --grid:#2c2c2a; --axis:#383835; --ring:rgba(255,255,255,0.10);
+    --board:#3987e5; --adsbdb:#d95926; --hexdb:#199e70; --aeroapi:#c98500; --none:#5b5a56;
+    --good:#0ca30c; --serious:#ec835a; --critical:#d03b3b; --nodata:#6b6a65; --off:#383835;
+    --mono:ui-monospace,Menlo,Consolas,monospace;
+  }
+  * { box-sizing:border-box; }
+  html,body { margin:0; background:var(--page); color:var(--ink); font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif; }
+  main { max-width:1080px; margin:0 auto; padding:20px 16px 48px; }
+  header { display:flex; flex-wrap:wrap; align-items:flex-end; gap:12px 20px; margin-bottom:18px; }
+  h1 { font-size:20px; font-weight:650; margin:0; }
+  .sub { color:var(--ink-2); margin:2px 0 0; }
+  header .grow { flex:1 1 280px; }
+  a { color:var(--board); }
+  .seg { display:inline-flex; border:1px solid var(--axis); border-radius:8px; overflow:hidden; }
+  .seg button { background:none; border:0; color:var(--ink-2); font:inherit; padding:6px 12px; cursor:pointer; }
+  .seg button + button { border-left:1px solid var(--axis); }
+  .seg button[aria-pressed=true] { background:var(--surface); color:var(--ink); font-weight:600; }
+  .seg button:hover { background:#222220; }
+  .note { color:var(--muted); font-size:12px; }
+  .tiles { display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:10px; margin-bottom:14px; }
+  .tile, .card { background:var(--surface); border:1px solid var(--ring); border-radius:10px; }
+  .tile { padding:12px 14px; }
+  .tile .k { color:var(--ink-2); font-size:12px; }
+  .tile .v { font-size:28px; font-weight:650; margin-top:2px; }
+  .tile .d { color:var(--muted); font-size:12px; }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-bottom:14px; }
+  @media (max-width:820px) { .grid2 { grid-template-columns:1fr; } }
+  .card { padding:14px 16px 16px; margin-bottom:14px; min-width:0; }
+  .grid2 .card { margin-bottom:0; }
+  .card h2 { font-size:15px; font-weight:650; margin:0; }
+  .card .what { color:var(--ink-2); font-size:13px; margin:2px 0 10px; }
+  .legend { display:flex; flex-wrap:wrap; gap:4px 14px; margin:0 0 10px; color:var(--ink-2); font-size:12px; }
+  .legend span::before { content:""; display:inline-block; width:10px; height:10px; border-radius:3px; background:var(--c); margin-right:6px; vertical-align:-1px; }
+  svg { display:block; width:100%; overflow:visible; }
+  svg text { fill:var(--muted); font-size:11px; font-variant-numeric:tabular-nums; }
+  svg .lbl { fill:var(--ink); font-size:12px; }
+  svg .seglbl { fill:#0d0d0d; font-size:11px; font-weight:600; pointer-events:none; }
+  svg rect.hit { fill:transparent; }
+  .bars { display:grid; grid-template-columns:96px 1fr; gap:8px 10px; align-items:center; }
+  .bars .name { color:var(--ink); font-size:13px; }
+  .bars .name small { display:block; color:var(--muted); font-size:11px; }
+  .bar { display:flex; gap:2px; height:22px; }
+  .bar > div { height:100%; min-width:0; position:relative; color:#0d0d0d; font-size:11px; font-weight:600; line-height:22px; padding-left:5px; overflow:hidden; white-space:nowrap; }
+  .bar > div:first-child { border-radius:4px 0 0 4px; }
+  .bar > div:last-child { border-radius:0 4px 4px 0; }
+  .bar > div:only-child { border-radius:4px; }
+  .bar > div:hover, svg rect.seg:hover { filter:brightness(1.18); }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th { text-align:left; color:var(--muted); font-weight:500; font-size:12px; padding:6px 8px; border-bottom:1px solid var(--axis); white-space:nowrap; }
+  td { padding:6px 8px; border-bottom:1px solid var(--grid); vertical-align:top; white-space:nowrap; }
+  td.num, th.num { text-align:right; font-variant-numeric:tabular-nums; }
+  .scroll { overflow-x:auto; }
+  .cs { font-family:var(--mono); font-weight:600; }
+  .reg { color:var(--muted); font-family:var(--mono); font-size:12px; }
+  .ans { font-family:var(--mono); }
+  .ans .st { font-family:system-ui,sans-serif; font-size:11px; color:var(--muted); margin-left:4px; }
+  .ans.shown { font-weight:700; }
+  .ans.shown::after { content:" ●"; color:var(--ink-2); font-size:9px; vertical-align:2px; }
+  .ans.bad { color:var(--serious); }
+  .ans.odd { background:rgba(236,131,90,0.12); border-radius:4px; }
+  .dim { color:var(--muted); }
+  .toolbar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:0 0 10px; }
+  input[type=search] { background:#000; color:var(--ink); border:1px solid var(--axis); border-radius:6px; padding:6px 8px; font:inherit; width:16em; }
+  button.more { background:var(--surface); color:var(--ink); border:1px solid var(--axis); border-radius:6px; padding:6px 14px; font:inherit; cursor:pointer; margin-top:10px; }
+  button.more:disabled { opacity:.5; cursor:default; }
+  #tip { position:fixed; pointer-events:none; background:#000; color:var(--ink); border:1px solid var(--axis); border-radius:6px; padding:6px 9px; font-size:12px; line-height:1.4; box-shadow:0 4px 14px rgba(0,0,0,.5); z-index:10; display:none; max-width:280px; }
+  #tip b { font-weight:650; }
+  #tip i { display:inline-block; width:9px; height:9px; border-radius:2px; margin-right:6px; font-style:normal; }
+  .empty { color:var(--muted); padding:18px 0; text-align:center; }
+  #off { display:none; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="grow">
+      <h1>Route sources</h1>
+      <p class="sub">What each route source answered for every aircraft that passed, and which answer went on the screen.</p>
+    </div>
+    <div class="seg" id="range" role="group" aria-label="Time range">
+      <button type="button" data-days="1">Today</button>
+      <button type="button" data-days="7" aria-pressed="true">7 days</button>
+      <button type="button" data-days="30">30 days</button>
+      <button type="button" data-days="90">90 days</button>
+    </div>
+    <a href="/">← Display &amp; settings</a>
+  </header>
+
+  <div class="card" id="off"><p class="empty">The route source log is off. Set <code>AIRDASH_SOURCE_LOG_FILE</code> on the service to start recording.</p></div>
+
+  <div id="dash">
+    <div class="tiles" id="tiles"></div>
+
+    <div class="card">
+      <h2>Where the shown route came from</h2>
+      <p class="what">Aircraft passes per day (UTC), by the source of the route on screen.</p>
+      <div class="legend" id="shown-legend"></div>
+      <div id="shown-chart"></div>
+    </div>
+
+    <div class="grid2">
+      <div class="card">
+        <h2>How each source answered</h2>
+        <p class="what">Share of passes per answer. The board and hexdb are asked for every aircraft; FlightAware only for the nearest one without a free route.</p>
+        <div class="legend" id="ans-legend"></div>
+        <div class="bars" id="ans-bars"></div>
+      </div>
+      <div class="card">
+        <h2>Right or wrong</h2>
+        <p class="what">Free sources checked against the board or FlightAware, where either named the flight.</p>
+        <div class="legend" id="agr-legend"></div>
+        <div class="bars" id="agr-bars"></div>
+        <p class="note" id="agr-note"></p>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Where sources disagreed</h2>
+      <p class="what">Passes where two sources named different routes. <span class="dim">●</span> marks the one shown; orange means the aircraft's position ruled the route out.</p>
+      <div class="scroll"><table id="dis"></table></div>
+    </div>
+
+    <div class="card">
+      <h2>Recent passes</h2>
+      <div class="toolbar">
+        <input type="search" id="q" placeholder="Filter by callsign or registration" aria-label="Filter passes">
+        <span class="note" id="count"></span>
+      </div>
+      <div class="scroll"><table id="passes"></table></div>
+      <button type="button" class="more" id="more">Load older passes</button>
+    </div>
+    <p class="note" id="updated"></p>
+  </div>
+</main>
+<div id="tip" role="tooltip"></div>
+<script>
+const SOURCES = [
+  { key: 'board', name: 'Board', note: 'AirLabs, airport schedule' },
+  { key: 'adsbdb', name: 'adsbdb', note: 'free, by callsign' },
+  { key: 'hexdb', name: 'hexdb', note: 'free, by callsign' },
+  { key: 'aeroapi', name: 'FlightAware', note: 'paid, nearest only' },
+];
+const SHOWN = [...SOURCES.map((s) => ({ key: s.key, name: s.name })), { key: 'none', name: 'No route' }];
+// Answer states grouped into five buckets; each keeps a text label, so the
+// status colour never carries the meaning alone.
+const BUCKETS = [
+  { key: 'route', name: 'Route', c: 'var(--good)', of: ['hit'] },
+  { key: 'ruled', name: 'Ruled out by position', c: 'var(--serious)', of: ['implausible'] },
+  { key: 'noroute', name: 'No route', c: 'var(--nodata)', of: ['unknown', 'miss'] },
+  { key: 'failed', name: 'Failed or out of time', c: 'var(--critical)', of: ['error', 'skipped'] },
+  { key: 'na', name: 'Not asked or off', c: 'var(--off)', ink: 'var(--ink-2)', of: ['not_asked', 'off', 'none'] },
+];
+const STATUS_TEXT = { hit: '', implausible: 'ruled out', unknown: 'no route', miss: 'not on board', error: 'error', skipped: 'out of time', not_asked: 'not asked', off: 'off', none: 'no callsign' };
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const pct = (n, d) => (d ? Math.round((n / d) * 100) : 0);
+const fmt = (n) => n.toLocaleString();
+let days = 7;
+try { days = Number(localStorage.getItem('airdash.sources.days')) || 7; } catch {}
+
+// ---- tooltip -------------------------------------------------------------
+const tip = $('tip');
+function showTip(e, html) {
+  tip.innerHTML = html;
+  tip.style.display = 'block';
+  const w = tip.offsetWidth, h = tip.offsetHeight;
+  let x = e.clientX + 14, y = e.clientY + 14;
+  if (x + w > innerWidth - 8) x = e.clientX - w - 14;
+  if (y + h > innerHeight - 8) y = e.clientY - h - 14;
+  tip.style.left = x + 'px';
+  tip.style.top = y + 'px';
+}
+function hideTip() { tip.style.display = 'none'; }
+function bindTip(el, html) {
+  el.addEventListener('mousemove', (e) => showTip(e, html));
+  el.addEventListener('mouseleave', hideTip);
+}
+const swatch = (c) => `<i style="background:${c}"></i>`;
+
+function legend(el, items) {
+  el.innerHTML = items.map((i) => `<span style="--c:${i.c}">${esc(i.name)}</span>`).join('');
+}
+
+// ---- data ----------------------------------------------------------------
+async function getJSON(url) {
+  const r = await fetch(url, { cache: 'no-store' });
+  if (r.status === 404) throw Object.assign(new Error('off'), { off: true });
+  if (!r.ok) throw new Error(`${url}: ${r.status}`);
+  return r.json();
+}
+
+function bucketsOf(statuses) {
+  const out = Object.fromEntries(BUCKETS.map((b) => [b.key, 0]));
+  for (const [st, n] of Object.entries(statuses || {})) {
+    const b = BUCKETS.find((b) => b.of.includes(st)) || BUCKETS[2];
+    out[b.key] += n;
+  }
+  return out;
+}
+
+// ---- tiles ---------------------------------------------------------------
+function renderTiles(t) {
+  const shownRoute = t.passes - (t.shown.none || 0);
+  const aero = t.sources.aeroapi || {};
+  const paid = (aero.hit || 0) + (aero.unknown || 0) + (aero.error || 0);
+  const agr = (k) => {
+    const a = t.agreement[k] || { agree: 0, disagree: 0 };
+    const n = a.agree + a.disagree;
+    return n ? { v: pct(a.agree, n) + '%', d: `${fmt(a.agree)} of ${fmt(n)} checked` } : { v: '–', d: 'nothing to check yet' };
+  };
+  const tiles = [
+    { k: 'Aircraft passes', v: fmt(t.passes), d: days === 1 ? 'today' : `last ${days} days` },
+    { k: 'Shown with a route', v: t.passes ? pct(shownRoute, t.passes) + '%' : '–', d: `${fmt(shownRoute)} passes` },
+    { k: 'FlightAware answers', v: fmt(paid), d: `${fmt(aero.hit || 0)} with a route` },
+    { k: 'adsbdb right', ...agr('adsbdb') },
+    { k: 'hexdb right', ...agr('hexdb') },
+  ];
+  $('tiles').innerHTML = tiles.map((x) => `<div class="tile"><div class="k">${esc(x.k)}</div><div class="v">${esc(x.v)}</div><div class="d">${esc(x.d)}</div></div>`).join('');
+}
+
+// ---- stacked columns: shown source per day --------------------------------
+function niceMax(v) {
+  if (v <= 5) return 5;
+  const p = Math.pow(10, Math.floor(Math.log10(v)));
+  for (const m of [1, 2, 2.5, 5, 10]) if (m * p >= v) return m * p;
+  return 10 * p;
+}
+function renderShown(sum) {
+  legend($('shown-legend'), SHOWN.map((s) => ({ name: s.name, c: `var(--${s.key})` })));
+  const el = $('shown-chart');
+  const data = fillDays(sum.days);
+  if (!data.some((d) => d.passes)) { el.innerHTML = '<p class="empty">No passes recorded in this range yet.</p>'; return; }
+  const W = Math.max(el.clientWidth, 300), H = 220, L = 34, B = 22, T = 8;
+  const max = niceMax(Math.max(...data.map((d) => d.passes)));
+  // Whole-number gridlines: 5 steps when they divide evenly, else 4.
+  const steps = max % 5 === 0 ? 5 : 4;
+  const slot = (W - L) / data.length;
+  const bw = Math.min(44, Math.max(3, slot * 0.66));
+  const y = (v) => T + (H - T - B) * (1 - v / max);
+  let svg = `<svg viewBox="0 0 ${W} ${H}" height="${H}" role="img" aria-label="Passes per day by source of the shown route">`;
+  for (let i = 0; i <= steps; i++) {
+    const v = (max / steps) * i, yy = y(v);
+    svg += `<line x1="${L}" x2="${W}" y1="${yy}" y2="${yy}" stroke="${i ? 'var(--grid)' : 'var(--axis)'}" stroke-width="1"/>`;
+    svg += `<text x="${L - 6}" y="${yy + 4}" text-anchor="end">${fmt(Math.round(v))}</text>`;
+  }
+  const every = Math.ceil(data.length / Math.max(1, Math.floor((W - L) / 56)));
+  data.forEach((d, i) => {
+    const cx = L + slot * i + slot / 2, x = cx - bw / 2;
+    let acc = 0;
+    const segs = SHOWN.map((s) => ({ ...s, n: d.shown[s.key] || 0 })).filter((s) => s.n);
+    segs.forEach((s, j) => {
+      const y0 = y(acc), y1 = y(acc + s.n);
+      // 2px surface gap between stacked segments; rounded top on the last.
+      const h = Math.max(1, y0 - y1 - (j ? 2 : 0));
+      const r = j === segs.length - 1 ? Math.min(4, h / 2, bw / 2) : 0;
+      svg += r
+        ? `<path class="seg" fill="var(--${s.key})" d="M${x},${y1 + h} V${y1 + r} Q${x},${y1} ${x + r},${y1} H${x + bw - r} Q${x + bw},${y1} ${x + bw},${y1 + r} V${y1 + h} Z"/>`
+        : `<rect class="seg" fill="var(--${s.key})" x="${x}" y="${y1}" width="${bw}" height="${h}"/>`;
+      acc += s.n;
+    });
+    if (i % every === 0 || i === data.length - 1) svg += `<text x="${cx}" y="${H - 6}" text-anchor="middle">${shortDay(d.day)}</text>`;
+    svg += `<rect class="hit" data-i="${i}" x="${L + slot * i}" y="${T}" width="${slot}" height="${H - T - B}"/>`;
+  });
+  svg += '</svg>';
+  el.innerHTML = svg;
+  el.querySelectorAll('rect.hit').forEach((r) => {
+    const d = data[r.dataset.i];
+    const rows = SHOWN.map((s) => `${swatch(`var(--${s.key})`)}${esc(s.name)}: <b>${fmt(d.shown[s.key] || 0)}</b> (${pct(d.shown[s.key] || 0, d.passes)}%)`).join('<br>');
+    bindTip(r, `<b>${esc(longDay(d.day))}</b> · ${fmt(d.passes)} passes<br>${rows}`);
+  });
+}
+function fillDays(list) {
+  // One column per calendar day in the range, empty ones included, so the
+  // time axis is even.
+  const by = Object.fromEntries(list.map((d) => [d.day, d]));
+  const out = [];
+  const end = new Date(); end.setUTCHours(0, 0, 0, 0);
+  for (let i = days - 1; i >= 0; i--) {
+    const k = new Date(end.getTime() - i * 864e5).toISOString().slice(0, 10);
+    out.push(by[k] || { day: k, passes: 0, shown: {} });
+  }
+  return out;
+}
+const shortDay = (k) => { const d = new Date(k + 'T00:00:00Z'); return `${d.getUTCDate()} ${d.toLocaleString('en', { month: 'short', timeZone: 'UTC' })}`; };
+const longDay = (k) => new Date(k + 'T00:00:00Z').toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric', month: 'short', timeZone: 'UTC' });
+
+// ---- 100% bars: answers per source ---------------------------------------
+function hbar(parts, total, label) {
+  const bar = document.createElement('div');
+  bar.className = 'bar';
+  for (const p of parts.filter((p) => p.n)) {
+    const seg = document.createElement('div');
+    const share = pct(p.n, total);
+    seg.style.flex = `${p.n} 1 0`;
+    seg.style.background = p.c;
+    if (p.ink) seg.style.color = p.ink; // dark fills take light ink
+    if (share >= 12) seg.textContent = share + '%';
+    bindTip(seg, `<b>${esc(label)}</b><br>${swatch(p.c)}${esc(p.name)}: <b>${fmt(p.n)}</b> of ${fmt(total)} (${share}%)`);
+    bar.append(seg);
+  }
+  if (!bar.children.length) bar.innerHTML = '<span class="dim" style="line-height:22px;font-size:12px">no data</span>';
+  return bar;
+}
+function renderAnswers(t) {
+  legend($('ans-legend'), BUCKETS.map((b) => ({ name: b.name, c: b.c })));
+  const el = $('ans-bars');
+  el.replaceChildren();
+  for (const s of SOURCES) {
+    const b = bucketsOf(t.sources[s.key]);
+    const total = Object.values(b).reduce((a, n) => a + n, 0);
+    const name = document.createElement('div');
+    name.className = 'name';
+    name.innerHTML = `${esc(s.name)}<small>${esc(s.note)}</small>`;
+    el.append(name, hbar(BUCKETS.map((x) => ({ name: x.name, c: x.c, ink: x.ink, n: b[x.key] })), total, s.name));
+  }
+}
+function renderAgreement(t) {
+  const parts = [{ key: 'agree', name: 'Same route', c: 'var(--good)' }, { key: 'disagree', name: 'Different route', c: 'var(--serious)' }];
+  legend($('agr-legend'), parts);
+  const el = $('agr-bars');
+  el.replaceChildren();
+  let judged = 0;
+  for (const k of ['adsbdb', 'hexdb']) {
+    const a = t.agreement[k] || { agree: 0, disagree: 0 };
+    judged += a.agree + a.disagree;
+    const name = document.createElement('div');
+    name.className = 'name';
+    name.innerHTML = `${esc(k)}<small>${fmt(a.agree + a.disagree)} checked</small>`;
+    el.append(name, hbar(parts.map((p) => ({ ...p, n: a[p.key] })), a.agree + a.disagree, k));
+  }
+  $('agr-note').textContent = judged ? 'A route ruled out by position still counts: it was the source’s answer.' : 'Nothing to check yet: no pass had both a free answer and a board or FlightAware route.';
+}
+
+// ---- tables --------------------------------------------------------------
+const time = (u) => new Date(u * 1000).toLocaleString('en-GB', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+function answerCell(p, key, odd) {
+  const a = p[key] || {};
+  const cls = ['ans'];
+  if (p.shown_source === key && p.shown_route) cls.push('shown');
+  if (a.status === 'implausible') cls.push('bad');
+  if (odd && a.route && a.route !== odd) cls.push('odd');
+  const body = a.route ? esc(a.route) : '';
+  const st = STATUS_TEXT[a.status] ?? a.status ?? '';
+  return `<td class="${cls.join(' ')}">${body || '<span class="dim">–</span>'}${st && (a.status !== 'hit') ? `<span class="st">${esc(st)}</span>` : ''}</td>`;
+}
+const HEAD = '<tr><th>First seen</th><th>Callsign</th><th>Type</th><th>Board</th><th>adsbdb</th><th>hexdb</th><th>FlightAware</th><th class="num">Closest</th></tr>';
+function row(p, highlight) {
+  // In the disagreement table, answers that differ from the trusted one
+  // (board, else FlightAware) are tinted so the wrong source stands out.
+  const ref = highlight ? (p.board?.status === 'hit' && p.board.route) || (p.aeroapi?.status === 'hit' && p.aeroapi.route) || '' : '';
+  return `<tr><td class="dim">${time(p.first_seen)}</td>` +
+    `<td><span class="cs">${esc(p.callsign || '—')}</span> <span class="reg">${esc(p.reg)}</span></td>` +
+    `<td class="dim">${esc(p.type)}</td>` +
+    SOURCES.map((s) => answerCell(p, s.key, ref)).join('') +
+    `<td class="num dim">${p.min_dist_km.toFixed(1)} km</td></tr>`;
+}
+function renderDisagreements(list) {
+  $('dis').innerHTML = list.length ? HEAD + list.map((p) => row(p, true)).join('') : '<tr><td class="empty">No disagreements in this range.</td></tr>';
+}
+
+let passes = [], exhausted = false, loadingOlder = false;
+const passKey = (p) => `${p.first_seen}/${p.hex}`;
+function renderPasses() {
+  const q = $('q').value.trim().toUpperCase();
+  const shown = q ? passes.filter((p) => (p.callsign + ' ' + p.reg).toUpperCase().includes(q)) : passes;
+  $('passes').innerHTML = shown.length ? HEAD + shown.map((p) => row(p, false)).join('') : `<tr><td class="empty">${q ? 'No loaded pass matches.' : 'No passes yet.'}</td></tr>`;
+  $('count').textContent = `${fmt(shown.length)} of ${fmt(passes.length)} loaded`;
+  $('more').disabled = exhausted || loadingOlder;
+  $('more').textContent = exhausted ? 'No older passes' : 'Load older passes';
+}
+// The newest page is refetched every minute and merged with any older pages
+// the viewer loaded, so answers that arrive later in a pass show up too.
+async function loadNewest() {
+  const r = await getJSON('/api/sources/passes?limit=100');
+  // Every loaded pass not in the newest page is older than all of it (the
+  // page holds the 100 newest), so appending keeps the order and no gap.
+  const fresh = new Set(r.passes.map(passKey));
+  const pagedIn = passes.length > 100;
+  passes = r.passes.concat(passes.filter((p) => !fresh.has(passKey(p))));
+  if (!pagedIn) exhausted = r.passes.length < 100;
+  renderPasses();
+}
+async function loadOlder() {
+  if (loadingOlder || !passes.length) return;
+  loadingOlder = true;
+  renderPasses();
+  try {
+    const last = passes[passes.length - 1];
+    const r = await getJSON(`/api/sources/passes?limit=100&before=${last.first_seen}&before_hex=${encodeURIComponent(last.hex)}`);
+    const have = new Set(passes.map(passKey));
+    passes = passes.concat(r.passes.filter((p) => !have.has(passKey(p))));
+    exhausted = r.passes.length < 100;
+  } finally {
+    loadingOlder = false;
+    renderPasses();
+  }
+}
+
+// ---- refresh -------------------------------------------------------------
+let lastSummary = null, refreshSeq = 0;
+async function refresh() {
+  // A slower answer for a range the viewer has since switched away from
+  // must not overwrite the newer one.
+  const seq = ++refreshSeq;
+  try {
+    const [sum, dis] = await Promise.all([
+      getJSON(`/api/sources/summary?days=${days}`),
+      getJSON(`/api/sources/disagreements?days=${days}&limit=25`),
+    ]);
+    if (seq !== refreshSeq) return;
+    $('off').style.display = 'none';
+    $('dash').style.display = '';
+    lastSummary = sum;
+    renderTiles(sum.totals);
+    renderShown(sum);
+    renderAnswers(sum.totals);
+    renderAgreement(sum.totals);
+    renderDisagreements(dis.passes);
+    await loadNewest();
+    $('updated').textContent = `Updated ${new Date().toLocaleTimeString('en-GB')} · refreshes every minute · days are UTC`;
+  } catch (err) {
+    if (seq !== refreshSeq) return;
+    if (err.off) { $('off').style.display = 'block'; $('dash').style.display = 'none'; return; }
+    $('updated').textContent = `Could not load: ${err.message}`;
+  }
+}
+
+for (const b of $('range').querySelectorAll('button')) {
+  b.setAttribute('aria-pressed', String(Number(b.dataset.days) === days));
+  b.addEventListener('click', () => {
+    days = Number(b.dataset.days);
+    try { localStorage.setItem('airdash.sources.days', String(days)); } catch {}
+    for (const o of $('range').querySelectorAll('button')) o.setAttribute('aria-pressed', String(o === b));
+    refresh();
+  });
+}
+$('q').addEventListener('input', renderPasses);
+$('more').addEventListener('click', () => loadOlder().catch((e) => ($('updated').textContent = `Could not load: ${e.message}`)));
+addEventListener('resize', () => lastSummary && renderShown(lastSummary));
+refresh();
+setInterval(refresh, 60000);
+</script>
+</body>
+</html>
