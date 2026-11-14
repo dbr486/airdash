@@ -10,17 +10,18 @@ import (
 var ErrCooldown = errors.New("flightstatus: lookup in cooldown")
 
 type entry struct {
-	st      Status
+	fl      Flight
 	ok      bool
 	err     bool
 	expires time.Time
 }
 
-// Cache remembers a status per callsign so the aircraft overhead for ten
-// minutes costs one AeroAPI result set. Errors (including a refused
+// Cache remembers the flight (route and status together) per ident, so
+// the aircraft overhead for ten minutes costs one AeroAPI result set
+// whether the route or the delay asked first. Errors (including a refused
 // budget) enter a short cooldown rather than being retried every tick.
 type Cache struct {
-	inner         Lookup
+	inner         FlightLookup
 	knownTTL      time.Duration
 	unknownTTL    time.Duration
 	errorCooldown time.Duration
@@ -34,12 +35,20 @@ type Cache struct {
 	entries map[string]entry
 }
 
-func NewCache(inner Lookup, knownTTL, unknownTTL, errorCooldown time.Duration, now func() time.Time) *Cache {
+func NewCache(inner FlightLookup, knownTTL, unknownTTL, errorCooldown time.Duration, now func() time.Time) *Cache {
 	return &Cache{inner: inner, knownTTL: knownTTL, unknownTTL: unknownTTL, errorCooldown: errorCooldown,
 		authCooldown: time.Hour, now: now, entries: map[string]entry{}}
 }
 
 func (c *Cache) Status(ctx context.Context, q Query) (Status, bool, error) {
+	f, ok, err := c.Flight(ctx, q)
+	return statusOf(f, ok, err)
+}
+
+// Flight serves both Status and route readers from one entry keyed by the
+// ident, so a route lookup and a delay lookup for the same aircraft share
+// a single paid call.
+func (c *Cache) Flight(ctx context.Context, q Query) (Flight, bool, error) {
 	callsign := q.Callsign
 	now := c.now()
 	c.mu.Lock()
@@ -47,11 +56,11 @@ func (c *Cache) Status(ctx context.Context, q Query) (Status, bool, error) {
 	c.mu.Unlock()
 	if hit && now.Before(e.expires) {
 		if e.err {
-			return Status{}, false, ErrCooldown
+			return Flight{}, false, ErrCooldown
 		}
-		return e.st, e.ok, nil
+		return e.fl, e.ok, nil
 	}
-	st, ok, err := c.inner.Status(ctx, q)
+	fl, ok, err := c.inner.Flight(ctx, q)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if err != nil {
@@ -60,17 +69,17 @@ func (c *Cache) Status(ctx context.Context, q Query) (Status, bool, error) {
 			cooldown = c.authCooldown
 		}
 		c.entries[callsign] = entry{err: true, expires: now.Add(cooldown)}
-		return Status{}, false, err
+		return Flight{}, false, err
 	}
 	ttl := c.unknownTTL
 	if ok {
 		ttl = c.knownTTL
 	}
-	c.entries[callsign] = entry{st: st, ok: ok, expires: now.Add(ttl)}
+	c.entries[callsign] = entry{fl: fl, ok: ok, expires: now.Add(ttl)}
 	for k, v := range c.entries {
 		if !now.Before(v.expires) {
 			delete(c.entries, k)
 		}
 	}
-	return st, ok, nil
+	return fl, ok, nil
 }

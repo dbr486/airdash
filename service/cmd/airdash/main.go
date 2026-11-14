@@ -95,11 +95,16 @@ func run() error {
 	// entirely (see tracker.Tick), so the feature costs nothing when unset.
 	var delay flightstatus.Lookup
 	var budget *flightstatus.Budget
+	// aero is kept apart from delay because the tracker's route fallback must
+	// ask this very instance: one cache entry per ident then answers both the
+	// route and the delay, so one aircraft never costs two paid calls.
+	var aero *flightstatus.Cache
 	if cfg.AeroAPIKey != "" {
 		budget = flightstatus.NewBudget(func() int { return cur.Settings().DelayLookupsPerDay }, time.Now, logger)
-		delay = flightstatus.NewCache(
+		aero = flightstatus.NewCache(
 			flightstatus.NewBudgeted(flightstatus.NewAeroAPI(client, cfg.AeroAPIURL, cfg.AeroAPIKey, userAgent), budget),
 			15*time.Minute, 15*time.Minute, time.Minute, time.Now)
+		delay = aero
 		logger.Info("delay lookups enabled", "source", "aeroapi", "cap", cur.Settings().DelayLookupsPerDay)
 	} else {
 		logger.Info("delay lookups disabled (no AIRDASH_AEROAPI_KEY)")
@@ -132,6 +137,10 @@ func run() error {
 	}
 	if brd != nil { // a typed nil in the interface would not be nil
 		opts.BoardDelay = brd
+		opts.BoardRoute = brd
+	}
+	if aero != nil {
+		opts.Flights = aero
 	}
 	tr := tracker.New(opts)
 
@@ -179,6 +188,12 @@ type delayStats struct {
 
 func (d delayStats) DelayEnabled() bool {
 	return (d.budget != nil || d.board != nil) && d.cur.DelayWanted()
+}
+
+// PaidRoutesEnabled needs the budget (non-nil only with an AeroAPI key) so
+// the page never claims paid routes work when there is no key to pay with.
+func (d delayStats) PaidRoutesEnabled() bool {
+	return d.budget != nil && d.cur.PaidRoutesWanted()
 }
 func (d delayStats) DelayToday() (int, int) {
 	if d.budget == nil {

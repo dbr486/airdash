@@ -122,12 +122,18 @@ https://www.flightaware.com/commercial/aeroapi/ (Personal tier, $5 free
 credit ≈ 1000 lookups/month) and set `AIRDASH_AEROAPI_KEY`. The service
 looks up on-time / delayed status only for the aircraft currently on
 screen, caches each result for 15 minutes, and caps lookups per UTC day
-via `delay_lookups_per_day` (default 30, editable on the page). Even in
-the worst case (the cap hit every day) the default cap of 30/day cannot
-exceed the $5 credit; the cache keeps real usage far lower. The counter
-resets on restart. A `show_delay:false` saved to the settings file before
-a key existed stays off after the key is added, until you tick the box on
-the page.
+via `delay_lookups_per_day` (default 65, editable on the page). The same
+key and cap also fill a missing route: when adsbdb and the airport board
+do not know the nearest aircraft's route and `paid_routes` is on (default
+on with a key), one AeroAPI call names its origin and destination; that
+call also answers the delay, so one aircraft never costs two. Light
+aircraft are skipped, and an unknown answer is not retried while the
+aircraft stays in range. Even in the worst case (the cap hit every day)
+the default cap of 65/day stays near $10 a month (65 × 31 × $0.005), about
+$5 a month beyond the free credit; the cache keeps real usage far lower. The counter
+resets on restart. A `show_delay:false` or `paid_routes:false` saved to
+the settings file before a key existed stays off after the key is added,
+until you tick the box on the page.
 
 **AirLabs airport board.** With `AIRDASH_AIRLABS_KEY` set (free tier:
 1,000 calls/month, https://airlabs.co), the service downloads the
@@ -257,14 +263,15 @@ unknown or the delay feature is off.
 
     PUT /api/settings   {"lat":51.47,"lon":-0.45,
                           "origin":"","dest":"","airport":"LHR","radius_km":10,
-                          "show_delay":true,"delay_lookups_per_day":30,
+                          "show_delay":true,"delay_lookups_per_day":65,"paid_routes":true,
                           "show_names":false,"show_logos":true,
                           "board_airport":"LHR"}
 
 All keys are optional on PUT; codes are comma-separated IATA or ICAO. 400
 on a bad code or radius. `show_delay` toggles the delay feature (no effect
-without `AIRDASH_AEROAPI_KEY`); `delay_lookups_per_day` caps AeroAPI calls
-per UTC day (0–1000). `show_names` makes `origin_label`/`dest_label`
+without `AIRDASH_AEROAPI_KEY`); `paid_routes` lets AeroAPI fill a route
+the free sources lack; `delay_lookups_per_day` caps all AeroAPI calls, delay
+and route together, per UTC day (0–1000; 0 turns both off). `show_names` makes `origin_label`/`dest_label`
 carry city names instead of airport codes where adsbdb knows the
 municipality. `show_logos` turns airline logos on or off. `lat`/`lon`
 move the home position (defaults from `AIRDASH_LAT`/`AIRDASH_LON`).
@@ -278,7 +285,7 @@ move the home position (defaults from `AIRDASH_LAT`/`AIRDASH_LON`).
   `N.rgb565` forms are still served.
 - `GET /api/geocode?q=<address>` → `{"lat","lon","name"}`, backed by
   OpenStreetMap Nominatim (one lookup per second, cached a day).
-- `GET /api/stats` → `{"delay_enabled":true,"delay_lookups_today":12,"delay_lookups_cap":30,"delay_source":"aeroapi"}`,
+- `GET /api/stats` → `{"delay_enabled":true,"delay_lookups_today":12,"delay_lookups_cap":65,"delay_source":"aeroapi","paid_routes_enabled":true}`,
   plus `board_*` fields when the AirLabs board is enabled.
 - `GET /healthz`: liveness.
 

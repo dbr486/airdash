@@ -175,3 +175,47 @@ func TestClassify_DepartureBasis(t *testing.T) {
 		t.Errorf("got %+v ok=%v", got, ok)
 	}
 }
+
+func TestFlight_RouteAndStatusFromOneCall(t *testing.T) {
+	srv := serve(t, 200, "aeroapi_registration.json", nil, nil, nil)
+	defer srv.Close()
+	a := NewAeroAPI(srv.Client(), srv.URL, "k", "airdash/test")
+	f, ok, err := a.Flight(t.Context(), Query{Callsign: "EJU1848"})
+	if err != nil || !ok {
+		t.Fatalf("ok=%v err=%v", ok, err)
+	}
+	want := FlightRoute{OriginIATA: "IST", OriginICAO: "LTFM", OriginCity: "Istanbul",
+		DestIATA: "OTP", DestICAO: "LROP", DestCity: "Bucharest", Operator: "EJU", OperatorIATA: "U2"}
+	if !f.HasRoute || f.Route != want {
+		t.Errorf("route = %+v (has=%v), want %+v", f.Route, f.HasRoute, want)
+	}
+	if !f.HasStatus || f.Status.Kind != KindLate {
+		t.Errorf("status = %+v (has=%v)", f.Status, f.HasStatus)
+	}
+}
+
+func TestFlight_RouteWithoutDelayData(t *testing.T) {
+	body := `{"flights":[{"ident":"X1","status":"En Route","progress_percent":50,"actual_off":"2026-09-28T13:41:17Z","actual_on":null,
+"departure_delay":null,"arrival_delay":null,"origin":{"code_iata":"CDG","code_icao":"LFPG","city":"Paris"},"destination":{"code_iata":"OTP","code_icao":"LROP","city":"Bucharest"}}]}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(body)) }))
+	defer srv.Close()
+	a := NewAeroAPI(srv.Client(), srv.URL, "k", "airdash/test")
+	f, ok, err := a.Flight(t.Context(), Query{Callsign: "X1"})
+	if err != nil || !ok || !f.HasRoute || f.HasStatus {
+		t.Fatalf("flight=%+v ok=%v err=%v", f, ok, err)
+	}
+	if _, ok, _ := a.Status(t.Context(), Query{Callsign: "X1"}); ok {
+		t.Error("Status must not be ok without delay data")
+	}
+}
+
+func TestIdent(t *testing.T) {
+	for _, c := range []struct{ cs, reg, want string }{
+		{"EJU1848", "", "EJU1848"}, {"eju1848", "", "EJU1848"}, {"", "EC-MKO", "ECMKO"}, {"", "", ""},
+		{"  ", "g-ABCD", "GABCD"}, {"EJU1848", "EC-MKO", "EJU1848"},
+	} {
+		if got := Ident(c.cs, c.reg); got != c.want {
+			t.Errorf("Ident(%q,%q) = %q, want %q", c.cs, c.reg, got, c.want)
+		}
+	}
+}

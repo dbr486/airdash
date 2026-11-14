@@ -450,6 +450,7 @@ type fakeSettings struct {
 	radius float64
 	delay  bool
 	show   bool
+	paid   bool
 	lat    float64
 	lon    float64
 }
@@ -478,6 +479,12 @@ func (s *fakeSettings) set(f filter.Filter, r float64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.f, s.radius = f, r
+}
+
+func (s *fakeSettings) PaidRoutesWanted() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.paid
 }
 
 func (s *fakeSettings) DelayWanted() bool {
@@ -613,11 +620,11 @@ func TestTick_DelayCooldownDoesNotFlapLogs(t *testing.T) {
 	tr.Tick(t.Context())
 	tr.Tick(t.Context())
 
-	if got := countMsg(*msgs, "delay lookup failing"); got != 1 {
-		t.Errorf(`"delay lookup failing" logged %d times, want 1: %v`, got, *msgs)
+	if got := countMsg(*msgs, "AeroAPI lookup failing"); got != 1 {
+		t.Errorf(`"AeroAPI lookup failing" logged %d times, want 1: %v`, got, *msgs)
 	}
-	if got := countMsg(*msgs, "delay lookup recovered"); got != 0 {
-		t.Errorf(`"delay lookup recovered" logged %d times, want 0: %v`, got, *msgs)
+	if got := countMsg(*msgs, "AeroAPI lookup recovered"); got != 0 {
+		t.Errorf(`"AeroAPI lookup recovered" logged %d times, want 0: %v`, got, *msgs)
 	}
 }
 
@@ -1039,4 +1046,358 @@ func mustFilter(t *testing.T, o, d, a string) filter.Filter {
 		t.Fatal(err)
 	}
 	return f
+}
+
+// fakeFlights stands in for AeroAPI behind the real cache, so the tests
+// count upstream calls the way the paid budget does.
+type fakeFlights struct {
+	mu      sync.Mutex
+	queries []flightstatus.Query
+	fl      flightstatus.Flight
+	ok      bool
+	err     error
+}
+
+func (f *fakeFlights) Flight(ctx context.Context, q flightstatus.Query) (flightstatus.Flight, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.queries = append(f.queries, q)
+	return f.fl, f.ok, f.err
+}
+
+func (f *fakeFlights) calls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.queries)
+}
+
+type fakeBoardRoute struct {
+	r     flightstatus.FlightRoute
+	ok    bool
+	calls []string
+}
+
+func (b *fakeBoardRoute) Route(q flightstatus.Query, now time.Time) (flightstatus.FlightRoute, bool) {
+	b.calls = append(b.calls, q.Callsign)
+	return b.r, b.ok
+}
+
+var agpLGW = flightstatus.FlightRoute{
+	OriginIATA: "AGP", OriginICAO: "LEMG", OriginCity: "Malaga",
+	DestIATA: "LGW", DestICAO: "EGKK", DestCity: "London",
+	Operator: "EZY", OperatorIATA: "U2",
+}
+
+type paidRig struct {
+	tr    *Tracker
+	src   *fakeSettings
+	ck    *clock
+	inner *fakeFlights
+	rts   *fakeRoutes
+}
+
+// newPaidRig wires the same cache as both Delay and Flights, as main does,
+// so a route call and a delay call for one ident share an upstream call.
+func newPaidRig(acs []provider.Aircraft, delay, paid bool) *paidRig {
+	ck := &clock{t: time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)}
+	inner := &fakeFlights{}
+	cache := flightstatus.NewCache(inner, 15*time.Minute, 15*time.Minute, time.Minute, ck.now)
+	src := &fakeSettings{radius: 10, delay: delay, show: delay, paid: paid}
+	rts := &fakeRoutes{byCallsign: map[string]routes.Route{}}
+	tr := New(Options{
+		Lat: homeLat, Lon: homeLon, RadiusKm: 10, Poll: 5 * time.Second,
+		Provider: &fakeProvider{acs: acs}, Routes: rts, Settings: src,
+		Delay: cache, Flights: cache, Now: ck.now,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	return &paidRig{tr: tr, src: src, ck: ck, inner: inner, rts: rts}
+}
+
+func (r *paidRig) tick(t *testing.T) Snapshot {
+	t.Helper()
+	r.tr.Tick(t.Context())
+	s, _ := r.tr.Current()
+	return s
+}
+
+func TestPaidRoute_FreeRouteMeansNoPaidCall(t *testing.T) {
+	rig := newPaidRig([]provider.Aircraft{airborne("a", "BAW466", 51.48, -0.45)}, false, true)
+	rig.rts.byCallsign["BAW466"] = routes.Route{OriginIATA: "LHR", DestIATA: "BCN"}
+	rig.inner.fl, rig.inner.ok = flightstatus.Flight{Route: agpLGW, HasRoute: true}, true
+	s := rig.tick(t)
+	if rig.inner.calls() != 0 || s.Origin != "LHR" || s.Dest != "BCN" {
+		t.Errorf("free route must win with no paid call: calls=%d %+v", rig.inner.calls(), s)
+	}
+}
+
+func TestPaidRoute_BoardBeforePaying(t *testing.T) {
+	rig := newPaidRig([]provider.Aircraft{airborne("a", "EZY12", 51.48, -0.45)}, false, true)
+	brd := &fakeBoardRoute{r: flightstatus.FlightRoute{OriginIATA: "AGP", OriginICAO: "LEMG", DestIATA: "LGW", DestICAO: "EGKK"}, ok: true}
+	rig.tr.o.BoardRoute = brd
+	rig.inner.fl, rig.inner.ok = flightstatus.Flight{Route: agpLGW, HasRoute: true}, true
+	s := rig.tick(t)
+	if rig.inner.calls() != 0 || s.Origin != "AGP" || s.Dest != "LGW" {
+		t.Fatalf("board route must be used before paying: calls=%d %+v", rig.inner.calls(), s)
+	}
+	if len(brd.calls) != 1 || brd.calls[0] != "EZY12" {
+		t.Errorf("board asked with %v", brd.calls)
+	}
+	// The board row ageing out mid-pass must not cost a paid call.
+	brd.ok = false
+	rig.ck.t = rig.ck.t.Add(time.Minute)
+	if s := rig.tick(t); rig.inner.calls() != 0 || s.Origin != "AGP" {
+		t.Errorf("remembered board route: calls=%d %+v", rig.inner.calls(), s)
+	}
+}
+
+func TestPaidRoute_FillsRouteNamesAndAirline(t *testing.T) {
+	rig := newPaidRig([]provider.Aircraft{
+		airborne("near", "EZY12", 51.475, -0.45),
+		airborne("far", "FAR1", 51.50, -0.45),
+	}, false, true)
+	rig.inner.fl, rig.inner.ok = flightstatus.Flight{Route: agpLGW, HasRoute: true}, true
+	s := rig.tick(t)
+	if s.Origin != "AGP" || s.Dest != "LGW" || s.OriginName != "Malaga" || s.DestName != "London" ||
+		s.Airline != "EZY" || s.AirlineIATA != "U2" {
+		t.Fatalf("paid route not applied: %+v", s)
+	}
+	if s.Index != 0 || s.Nearby != 2 || s.Hex != "near" {
+		t.Errorf("snapshot identity lost: %+v", s)
+	}
+	list, _ := rig.tr.List()
+	if len(list) != 2 || list[0].Origin != "AGP" || list[0].Index != 0 || list[1].Origin != "" || list[1].Index != 1 {
+		t.Errorf("list head must carry the route, others untouched: %+v", list)
+	}
+	if rig.inner.calls() != 1 || rig.inner.queries[0].Callsign != "EZY12" {
+		t.Errorf("only the nearest is looked up: %+v", rig.inner.queries)
+	}
+}
+
+func TestPaidRoute_KeepsAirlineFromFreeSources(t *testing.T) {
+	rig := newPaidRig([]provider.Aircraft{airborne("a", "EZY12", 51.48, -0.45)}, false, true)
+	rig.tr.o.Operators = &fakeOperators{res: standing.Airline{Name: "easyJet Europe", IATA: "EC"}, ok: true}
+	rig.inner.fl, rig.inner.ok = flightstatus.Flight{Route: agpLGW, HasRoute: true}, true
+	s := rig.tick(t)
+	if s.Origin != "AGP" || s.Airline != "easyJet Europe" || s.AirlineIATA != "EC" {
+		t.Errorf("free airline must be kept: %+v", s)
+	}
+}
+
+func TestPaidRoute_UnknownRememberedForThePass(t *testing.T) {
+	rig := newPaidRig([]provider.Aircraft{airborne("a", "PRIV1", 51.48, -0.45)}, false, true)
+	rig.inner.ok = false
+	for i := 0; i < 20; i++ { // 20 minutes overhead: past the 15-min cache entry
+		if s := rig.tick(t); s.Origin != "" {
+			t.Fatalf("unknown must stay empty: %+v", s)
+		}
+		rig.ck.t = rig.ck.t.Add(time.Minute)
+	}
+	if rig.inner.calls() != 1 {
+		t.Errorf("one route-only call per pass, got %d", rig.inner.calls())
+	}
+}
+
+func TestPaidRoute_FoundRouteKeptForThePassThenNewPassMayCall(t *testing.T) {
+	ac := airborne("a", "EZY12", 51.48, -0.45)
+	rig := newPaidRig([]provider.Aircraft{ac}, false, true)
+	rig.inner.fl, rig.inner.ok = flightstatus.Flight{Route: agpLGW, HasRoute: true}, true
+	rig.tick(t)
+	rig.inner.fl, rig.inner.ok = flightstatus.Flight{}, false // AeroAPI would now say nothing
+	for i := 0; i < 20; i++ {
+		rig.ck.t = rig.ck.t.Add(time.Minute)
+		if s := rig.tick(t); s.Origin != "AGP" {
+			t.Fatalf("route must stay for the pass (minute %d): %+v", i+1, s)
+		}
+	}
+	if rig.inner.calls() != 1 {
+		t.Fatalf("calls within the pass = %d, want 1", rig.inner.calls())
+	}
+	// Gone past the sighting grace: the pass, and its memory, end.
+	rig.tr.o.Provider = &fakeProvider{}
+	rig.tick(t)
+	rig.ck.t = rig.ck.t.Add(10 * time.Minute)
+	rig.tr.o.Provider = &fakeProvider{acs: []provider.Aircraft{ac}}
+	rig.tick(t)
+	if rig.inner.calls() != 2 {
+		t.Errorf("a new pass may call again: calls=%d", rig.inner.calls())
+	}
+}
+
+func TestPaidRoute_LightAircraftSkipped(t *testing.T) {
+	a1 := airborne("a", "GLIDE1", 51.48, -0.45)
+	a1.Category = "A1"
+	anon := airborne("b", "", 51.48, -0.45) // no category, no callsign: local GA
+	for _, ac := range []provider.Aircraft{a1, anon} {
+		rig := newPaidRig([]provider.Aircraft{ac}, false, true)
+		rig.inner.fl, rig.inner.ok = flightstatus.Flight{Route: agpLGW, HasRoute: true}, true
+		if s := rig.tick(t); rig.inner.calls() != 0 || s.Origin != "" {
+			t.Errorf("%s: light aircraft must not be paid for: calls=%d %+v", ac.Hex, rig.inner.calls(), s)
+		}
+	}
+}
+
+func TestPaidRoute_RegistrationIdent(t *testing.T) {
+	ac := airborne("a", "", 51.48, -0.45)
+	ac.Reg, ac.Category = "EC-MKO", "A3"
+	rig := newPaidRig([]provider.Aircraft{ac}, false, true)
+	rig.inner.fl, rig.inner.ok = flightstatus.Flight{Route: agpLGW, HasRoute: true}, true
+	s := rig.tick(t)
+	if rig.inner.calls() != 1 || rig.inner.queries[0].Callsign != "ECMKO" || s.Origin != "AGP" {
+		t.Errorf("registration ident: %+v %+v", rig.inner.queries, s)
+	}
+}
+
+func TestPaidRoute_DelayAndRouteShareOneCall(t *testing.T) {
+	rig := newPaidRig([]provider.Aircraft{airborne("a", "EZY12", 51.48, -0.45)}, true, true)
+	late := flightstatus.Status{Kind: flightstatus.KindLate, DelayMin: 20, Basis: "arrival"}
+	rig.inner.fl = flightstatus.Flight{Route: agpLGW, HasRoute: true, Status: late, HasStatus: true}
+	rig.inner.ok = true
+	s := rig.tick(t)
+	if rig.inner.calls() != 1 {
+		t.Errorf("route and delay must share one AeroAPI call, got %d", rig.inner.calls())
+	}
+	if s.Origin != "AGP" || s.Delay == nil || s.Delay.DelayMin != 20 {
+		t.Errorf("route and delay both shown: %+v delay=%+v", s, s.Delay)
+	}
+	if list, _ := rig.tr.List(); list[0].Delay == nil || list[0].Origin != "AGP" {
+		t.Errorf("list head: %+v", list[0])
+	}
+}
+
+func TestPaidRoute_OffKeepsDelayAsToday(t *testing.T) {
+	rig := newPaidRig([]provider.Aircraft{airborne("a", "EZY12", 51.48, -0.45)}, true, false)
+	rig.inner.fl = flightstatus.Flight{Route: agpLGW, HasRoute: true,
+		Status: flightstatus.Status{Kind: flightstatus.KindOnTime}, HasStatus: true}
+	rig.inner.ok = true
+	s := rig.tick(t)
+	if s.Origin != "" || s.Dest != "" || s.Airline != "" {
+		t.Errorf("paid_routes off: no AeroAPI route may be used: %+v", s)
+	}
+	if s.Delay == nil || s.Delay.Kind != flightstatus.KindOnTime || rig.inner.calls() != 1 {
+		t.Errorf("delay as today: %+v calls=%d", s.Delay, rig.inner.calls())
+	}
+}
+
+func TestPaidRoute_OnWithShowDelayOff(t *testing.T) {
+	rig := newPaidRig([]provider.Aircraft{airborne("a", "EZY12", 51.48, -0.45)}, false, true)
+	rig.inner.fl = flightstatus.Flight{Route: agpLGW, HasRoute: true,
+		Status: flightstatus.Status{Kind: flightstatus.KindLate, DelayMin: 30}, HasStatus: true}
+	rig.inner.ok = true
+	s := rig.tick(t)
+	if s.Origin != "AGP" || s.Delay != nil {
+		t.Errorf("route shown, delay hidden: %+v delay=%+v", s, s.Delay)
+	}
+}
+
+func TestPaidRoute_DelayKeyedByIdentSharesTheCall(t *testing.T) {
+	rig := newPaidRig([]provider.Aircraft{airborne("a", "ezy12 ", 51.48, -0.45)}, false, true)
+	rig.inner.fl = flightstatus.Flight{Route: agpLGW, HasRoute: true,
+		Status: flightstatus.Status{Kind: flightstatus.KindOnTime}, HasStatus: true}
+	rig.inner.ok = true
+	rig.tick(t)
+	rig.src.delay, rig.src.show = true, true
+	rig.ck.t = rig.ck.t.Add(5 * time.Second)
+	s := rig.tick(t)
+	if rig.inner.calls() != 1 || s.Delay == nil {
+		t.Errorf("delay must hit the route call's cache entry: calls=%d delay=%+v", rig.inner.calls(), s.Delay)
+	}
+}
+
+func TestPaidRoute_BudgetRefusalRetriesAfterCooldown(t *testing.T) {
+	h, msgs := newRecordingHandler()
+	ck := &clock{t: time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)}
+	inner := &fakeFlights{fl: flightstatus.Flight{Route: agpLGW, HasRoute: true}, ok: true}
+	budget := flightstatus.NewBudget(func() int { return 1 }, ck.now, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	budget.Allow() // the day's only lookup is already spent
+	refusals := &countingFlights{inner: flightstatus.NewBudgeted(inner, budget)}
+	cache := flightstatus.NewCache(refusals, 15*time.Minute, 15*time.Minute, time.Minute, ck.now)
+	src := &fakeSettings{radius: 10, delay: true, paid: true}
+	tr := New(Options{
+		Lat: homeLat, Lon: homeLon, RadiusKm: 10, Poll: 5 * time.Second,
+		Provider: &fakeProvider{acs: []provider.Aircraft{airborne("a", "EZY12", 51.48, -0.45)}},
+		Routes:   &fakeRoutes{}, Settings: src, Delay: cache, Flights: cache, Now: ck.now,
+		Logger: slog.New(h),
+	})
+	for i := 0; i < 12; i++ { // one minute of 5 s ticks
+		tr.Tick(t.Context())
+		if s, _ := tr.Current(); s.Origin != "" || s.Delay != nil {
+			t.Fatalf("refused budget must leave the route empty: %+v", s)
+		}
+		ck.t = ck.t.Add(5 * time.Second)
+	}
+	if refusals.n != 1 || inner.calls() != 0 {
+		t.Fatalf("within the cooldown: budget asked %d times, upstream %d", refusals.n, inner.calls())
+	}
+	ck.t = ck.t.Add(time.Second)
+	tr.Tick(t.Context())
+	if refusals.n != 2 {
+		t.Errorf("after the cooldown the refusal is not remembered as unknown: asked %d", refusals.n)
+	}
+	for _, m := range *msgs {
+		if m == "AeroAPI lookup failing" {
+			t.Errorf("a budget refusal is not a failure: %v", *msgs)
+		}
+	}
+}
+
+type countingFlights struct {
+	inner flightstatus.FlightLookup
+	n     int
+}
+
+func (c *countingFlights) Flight(ctx context.Context, q flightstatus.Query) (flightstatus.Flight, bool, error) {
+	c.n++
+	return c.inner.Flight(ctx, q)
+}
+
+func TestPaidRoute_FiltersUseTheFreeRouteOnly(t *testing.T) {
+	rig := newPaidRig([]provider.Aircraft{airborne("a", "EZY12", 51.48, -0.45)}, false, true)
+	rig.src.f = mustFilter(t, "AGP", "", "")
+	rig.inner.fl, rig.inner.ok = flightstatus.Flight{Route: agpLGW, HasRoute: true}, true
+	if s := rig.tick(t); s.Found || rig.inner.calls() != 0 {
+		t.Errorf("a paid route must not let a filtered aircraft through: %+v calls=%d", s, rig.inner.calls())
+	}
+}
+
+func TestPaidRoute_RegistrationIdentKeepsDelayAcrossTicks(t *testing.T) {
+	ac := airborne("a", "", 51.48, -0.45)
+	ac.Reg, ac.Category = "EC-MKO", "A3"
+	rig := newPaidRig([]provider.Aircraft{ac}, true, true)
+	late := flightstatus.Status{Kind: flightstatus.KindLate, DelayMin: 15, Basis: "arrival"}
+	rig.inner.fl = flightstatus.Flight{Route: agpLGW, HasRoute: true, Status: late, HasStatus: true}
+	rig.inner.ok = true
+	for i := 1; i <= 2; i++ {
+		s := rig.tick(t)
+		if s.Origin != "AGP" || s.Delay == nil || s.Delay.DelayMin != 15 {
+			t.Fatalf("tick %d: route and delay must both show: %+v delay=%+v", i, s, s.Delay)
+		}
+		rig.ck.t = rig.ck.t.Add(5 * time.Second)
+	}
+	if rig.inner.calls() != 1 {
+		t.Errorf("one upstream call for both ticks, got %d: %+v", rig.inner.calls(), rig.inner.queries)
+	}
+}
+
+func TestPaidRoute_OffMeansNoCallForNoCallsign(t *testing.T) {
+	ac := airborne("a", "", 51.48, -0.45)
+	ac.Reg, ac.Category = "EC-MKO", "A3"
+	rig := newPaidRig([]provider.Aircraft{ac}, true, false)
+	rig.inner.fl = flightstatus.Flight{Route: agpLGW, HasRoute: true,
+		Status: flightstatus.Status{Kind: flightstatus.KindOnTime}, HasStatus: true}
+	rig.inner.ok = true
+	rig.tick(t)
+	rig.tick(t)
+	if rig.inner.calls() != 0 {
+		t.Errorf("paid_routes off: a registration ident must not be looked up: %+v", rig.inner.queries)
+	}
+}
+
+func TestPaidRoute_LightNoCallsignGetsNoDelayCall(t *testing.T) {
+	ac := airborne("a", "", 51.48, -0.45) // no category, no callsign: local GA
+	rig := newPaidRig([]provider.Aircraft{ac}, true, true)
+	rig.inner.fl, rig.inner.ok = flightstatus.Flight{Status: flightstatus.Status{Kind: flightstatus.KindOnTime}, HasStatus: true}, true
+	rig.tick(t)
+	if rig.inner.calls() != 0 {
+		t.Errorf("light aircraft must not be paid for via the delay path: %+v", rig.inner.queries)
+	}
 }

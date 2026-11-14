@@ -55,15 +55,26 @@ Wiring is in `cmd/airdash/main.go`; each package has one job.
    - **`flightstatus`** (with `AIRDASH_AEROAPI_KEY`): a per-flight AeroAPI
      lookup, only for the aircraft on screen. Results are cached for
      15 minutes and capped per UTC day.
-5. **`logos`**: fetches the airline's square logo from the CDN, crops the
+5. **Route fallback** (tracker): when the free `routes` lookup has no route
+   for the nearest aircraft after filters, the tracker tries, in order, the
+   airport board's row with the same callsign (free) and then, with
+   `paid_routes` on, one AeroAPI `/flights/{ident}` call (ident = callsign,
+   else the registration without its dash; light aircraft are skipped). The
+   AeroAPI call goes through the same 15-minute cache as the delay lookup,
+   so route and delay never cost two calls, and it spends the same daily
+   cap. A found route or an "unknown" answer is remembered for the rest of
+   that aircraft's pass, so one aircraft costs at most one route-only call
+   per pass. Filters keep using the free route only; a filled route changes
+   what is shown, not what is listed.
+6. **`logos`**: fetches the airline's square logo from the CDN, crops the
    wordmark out of its padding and fits it (`fit.go`). It serves RGB565 for
    the displays and PNG for the page, cached for a week.
-6. **`settings`**: runtime settings (home, filters, radius, toggles,
+7. **`settings`**: runtime settings (home, filters, radius, toggles,
    caps). Env vars are the defaults, `PUT /api/settings` changes them live,
    and `AIRDASH_SETTINGS_FILE` persists them.
-7. **`geocode`**: address → coordinates for the settings page, via
+8. **`geocode`**: address → coordinates for the settings page, via
    Nominatim, throttled to one request per second and cached for a day.
-8. **`api`**: the HTTP surface (`/api/nearest`, `/api/settings`,
+9. **`api`**: the HTTP surface (`/api/nearest`, `/api/settings`,
    `/api/logo/…`, `/api/geocode`, `/api/stats`, `/healthz`).
 
 The service has no third-party Go modules.
@@ -103,4 +114,4 @@ the host.
 | adsb.lol | ~8 requests/min | use `AIRDASH_POLL_SECONDS` ≥ 10 |
 | Nominatim | 1 request/s | `geocode` throttle and 1-day cache |
 | AirLabs | plan quota (free: 1,000/month) | `AIRDASH_BOARD_CALLS_PER_MONTH` (default 900), persisted counter |
-| AeroAPI | paid per call | `delay_lookups_per_day` setting (default 30), 15-min cache |
+| AeroAPI | paid per call | `delay_lookups_per_day` setting (default 65, shared by delay and paid routes), 15-min cache |

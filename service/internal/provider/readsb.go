@@ -81,6 +81,7 @@ type readsbAircraft struct {
 	Flight  string          `json:"flight"`
 	Reg     string          `json:"r"`
 	Type    string          `json:"t"`
+	Cat     string          `json:"category"` // ADS-B emitter category, e.g. A1 light, A3 large
 	AltBaro json.RawMessage `json:"alt_baro"` // number, or the string "ground"
 	GS      float64         `json:"gs"`
 	Track   float64         `json:"track"`
@@ -126,6 +127,7 @@ func decodeReadsb(body []byte) ([]Aircraft, error) {
 			Callsign: strings.TrimSpace(r.Flight),
 			Type:     r.Type,
 			Reg:      r.Reg,
+			Category: r.Cat,
 			GroundKt: int(math.Round(r.GS)),
 			Track:    ((int(math.Round(r.Track)) % 360) + 360) % 360,
 		}

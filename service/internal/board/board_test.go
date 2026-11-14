@@ -336,3 +336,64 @@ func TestStatus_UsesTheSightingForDepartures(t *testing.T) {
 		t.Errorf("seen 15:20 → departed ~15:10 → 70 min late: ok=%v st=%+v", ok, st)
 	}
 }
+
+func routeBoard(t *testing.T, rows []Row, now *time.Time) *Board {
+	t.Helper()
+	b := New(&fakeFetcher{dep: rows}, 900, 3*time.Hour, func() time.Time { return *now }, quiet())
+	if err := b.Refresh(context.Background(), "AGP"); err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func TestRoute_UniqueCallsignGivesBothEnds(t *testing.T) {
+	now := at(13, 30)
+	b := routeBoard(t, []Row{{FlightICAO: "ABC123", DepIATA: "AGP", DepICAO: "LEMG", ArrIATA: "FCO", ArrICAO: "LIRF", DepSched: at(13, 20)}}, &now)
+	got, ok := b.Route(flightstatus.Query{Callsign: " abc123 "}, now)
+	want := flightstatus.FlightRoute{OriginIATA: "AGP", OriginICAO: "LEMG", DestIATA: "FCO", DestICAO: "LIRF"}
+	if !ok || got != want {
+		t.Errorf("got %+v ok=%v", got, ok)
+	}
+}
+
+func TestRoute_ArrivalRowUsesArrivalTime(t *testing.T) {
+	now := at(13, 30)
+	b := routeBoard(t, []Row{{FlightICAO: "ABC123", DepIATA: "JCU", DepICAO: "LTAF", ArrIATA: "AGP", ArrICAO: "LEMG", DepSched: at(9, 0), ArrSched: at(13, 40)}}, &now)
+	if got, ok := b.Route(flightstatus.Query{Callsign: "ABC123"}, now); !ok || got.OriginIATA != "JCU" || got.DestICAO != "LEMG" {
+		t.Errorf("got %+v ok=%v", got, ok)
+	}
+}
+
+func TestRoute_YesterdaysFlightIsAMiss(t *testing.T) {
+	now := at(13, 30)
+	b := routeBoard(t, []Row{{FlightICAO: "ABC123", DepIATA: "AGP", ArrIATA: "FCO", DepSched: at(13, 20).Add(-20 * time.Hour)}}, &now)
+	if _, ok := b.Route(flightstatus.Query{Callsign: "ABC123"}, now); ok {
+		t.Error("a row 20 h away is another day's flight")
+	}
+}
+
+func TestRoute_TwoPlausibleRowsFailClosed(t *testing.T) {
+	now := at(13, 30)
+	b := routeBoard(t, []Row{
+		{FlightICAO: "ABC123", DepIATA: "AGP", ArrIATA: "FCO", DepSched: at(13, 0)},
+		{FlightICAO: "ABC123", DepIATA: "AGP", ArrIATA: "MAD", DepSched: at(15, 0)},
+	}, &now)
+	if _, ok := b.Route(flightstatus.Query{Callsign: "ABC123"}, now); ok {
+		t.Error("a tie must be a miss so the paid exact source can answer")
+	}
+}
+
+func TestRoute_StaleBoardAndOtherCallsignAreMisses(t *testing.T) {
+	now := at(13, 30)
+	b := routeBoard(t, []Row{{FlightICAO: "ABC123", DepIATA: "AGP", ArrIATA: "FCO", DepSched: at(13, 20)}}, &now)
+	if _, ok := b.Route(flightstatus.Query{Callsign: "XYZ9"}, now); ok {
+		t.Error("non-matching callsign must miss")
+	}
+	if _, ok := b.Route(flightstatus.Query{}, now); ok {
+		t.Error("no callsign must miss")
+	}
+	later := now.Add(3*time.Hour + time.Minute)
+	if _, ok := b.Route(flightstatus.Query{Callsign: "ABC123"}, later); ok {
+		t.Error("a board older than maxAge must miss")
+	}
+}

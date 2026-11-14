@@ -13,12 +13,15 @@ type fakeLookup struct {
 	calls int
 	st    Status
 	ok    bool
+	route FlightRoute
+	hasRt bool
 	err   error
 }
 
-func (f *fakeLookup) Status(ctx context.Context, q Query) (Status, bool, error) {
+func (f *fakeLookup) Flight(ctx context.Context, q Query) (Flight, bool, error) {
 	f.calls++
-	return f.st, f.ok, f.err
+	fl := Flight{Status: f.st, HasStatus: f.ok, Route: f.route, HasRoute: f.hasRt}
+	return fl, f.ok || f.hasRt, f.err
 }
 
 type clock struct{ t time.Time }
@@ -178,5 +181,44 @@ func TestCached_HitDoesNotConsumeBudget(t *testing.T) {
 	}
 	if _, _, err := c.Status(t.Context(), Query{Callsign: "OTHER1"}); !errors.Is(err, ErrCooldown) {
 		t.Errorf("budget refusal should enter cooldown, got %v", err)
+	}
+}
+
+func TestCache_FlightThenStatusIsOneInnerCall(t *testing.T) {
+	ck := &clock{t: time.Now()}
+	inner := &fakeLookup{st: Status{Kind: KindOnTime}, ok: true, route: FlightRoute{OriginIATA: "CDG"}, hasRt: true}
+	c := NewCache(inner, 15*time.Minute, 15*time.Minute, time.Minute, ck.now)
+	f, ok, err := c.Flight(t.Context(), Query{Callsign: "EJU1848"})
+	if err != nil || !ok || !f.HasRoute || f.Route.OriginIATA != "CDG" {
+		t.Fatalf("flight=%+v ok=%v err=%v", f, ok, err)
+	}
+	if _, ok, _ := c.Status(t.Context(), Query{Callsign: "EJU1848"}); !ok {
+		t.Error("Status should be served from the same entry")
+	}
+	if inner.calls != 1 {
+		t.Errorf("inner calls = %d, want 1", inner.calls)
+	}
+}
+
+func TestCache_RouteOnlyStatusNotOk(t *testing.T) {
+	ck := &clock{t: time.Now()}
+	inner := &fakeLookup{route: FlightRoute{OriginIATA: "CDG"}, hasRt: true}
+	c := NewCache(inner, 15*time.Minute, 15*time.Minute, time.Minute, ck.now)
+	if _, ok, _ := c.Flight(t.Context(), Query{Callsign: "A"}); !ok {
+		t.Error("Flight should be ok with a route")
+	}
+	if _, ok, _ := c.Status(t.Context(), Query{Callsign: "A"}); ok {
+		t.Error("Status must not be ok for a route-only flight")
+	}
+}
+
+func TestBudgeted_OneUnitPerInnerCallForEitherMethod(t *testing.T) {
+	ck := &clock{t: time.Now()}
+	b := NewBudget(func() int { return 10 }, ck.now, quiet())
+	bl := NewBudgeted(&fakeLookup{st: Status{Kind: KindOnTime}, ok: true}, b)
+	_, _, _ = bl.Flight(t.Context(), Query{Callsign: "A"})
+	_, _, _ = bl.Status(t.Context(), Query{Callsign: "A"})
+	if used, _ := b.Today(); used != 2 {
+		t.Errorf("used = %d, want 2 (one per inner call)", used)
 	}
 }

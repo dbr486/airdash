@@ -20,6 +20,10 @@ type Aircraft struct {
 	Callsign string
 	Type     string
 	Reg      string
+	// Category is the ADS-B emitter category ("A1" light … "A7" rotorcraft),
+	// empty when the feed lacks it; it lets callers skip paid lookups for
+	// light aircraft that never carry a scheduled route.
+	Category string
 	Lat, Lon float64
 	HasPos   bool
 	AltFt    int

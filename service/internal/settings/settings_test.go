@@ -19,7 +19,7 @@ func quiet() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)
 
 func TestFromConfig(t *testing.T) {
 	s := FromConfig(config.Config{Origin: "LHR,LGW", Dest: "", Airport: "AGP", RadiusKm: 12.5})
-	want := Settings{Origin: "LHR,LGW", Dest: "", Airport: "AGP", RadiusKm: 12.5, DelayLookupsPerDay: 30, ShowLogos: true}
+	want := Settings{Origin: "LHR,LGW", Dest: "", Airport: "AGP", RadiusKm: 12.5, DelayLookupsPerDay: 65, ShowLogos: true}
 	if s != want {
 		t.Errorf("got %+v want %+v", s, want)
 	}
@@ -246,11 +246,11 @@ func TestCurrent_UpdateMergesUnderLock(t *testing.T) {
 
 func TestFromConfig_DelayDefaults(t *testing.T) {
 	s := FromConfig(config.Config{RadiusKm: 10, AeroAPIKey: "k"})
-	if !s.ShowDelay || s.DelayLookupsPerDay != 30 {
+	if !s.ShowDelay || s.DelayLookupsPerDay != 65 || !s.PaidRoutes {
 		t.Errorf("with key: %+v", s)
 	}
 	s = FromConfig(config.Config{RadiusKm: 10})
-	if s.ShowDelay || s.DelayLookupsPerDay != 30 {
+	if s.ShowDelay || s.DelayLookupsPerDay != 65 || s.PaidRoutes {
 		t.Errorf("without key: %+v", s)
 	}
 }
@@ -389,5 +389,50 @@ func TestHome_FromConfigNormalizeAndValidate(t *testing.T) {
 	_ = os.WriteFile(path, []byte(`{"radius_km":50}`), 0o644)
 	if s, _, err := Load(path, Settings{RadiusKm: 10, Lat: 36.6, Lon: -4.4}); err != nil || s.Lat != 36.6 {
 		t.Errorf("missing keys keep the configured home: %+v err=%v", s, err)
+	}
+}
+
+func TestLoad_FileWithoutPaidRoutesKeepsTheDefault(t *testing.T) {
+	// The live deployment's file predates the key; decoding onto zero would
+	// silently turn paid routes off for a user who has a key.
+	path := filepath.Join(t.TempDir(), "settings.json")
+	_ = os.WriteFile(path, []byte(`{"radius_km":50,"show_delay":true,"delay_lookups_per_day":30}`), 0o644)
+	s, found, err := Load(path, FromConfig(config.Config{RadiusKm: 10, AeroAPIKey: "k"}))
+	if err != nil || !found || !s.PaidRoutes || s.DelayLookupsPerDay != 30 {
+		t.Errorf("found=%v err=%v %+v", found, err, s)
+	}
+	_ = os.WriteFile(path, []byte(`{"radius_km":50,"paid_routes":false}`), 0o644)
+	if s, _, _ = Load(path, FromConfig(config.Config{RadiusKm: 10, AeroAPIKey: "k"})); s.PaidRoutes {
+		t.Errorf("an explicit false must win: %+v", s)
+	}
+}
+
+func TestPaidRoutes_RoundTripsAndNormalizeKeepsIt(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.json")
+	if err := Save(path, Settings{RadiusKm: 10, PaidRoutes: true}); err != nil {
+		t.Fatal(err)
+	}
+	s, _, err := Load(path, Settings{RadiusKm: 10})
+	if err != nil || !s.PaidRoutes {
+		t.Errorf("err=%v %+v", err, s)
+	}
+}
+
+func TestCurrent_PaidRoutesWanted(t *testing.T) {
+	c, _ := NewCurrent(Settings{RadiusKm: 10, PaidRoutes: true, DelayLookupsPerDay: 65}, "", quiet())
+	if !c.PaidRoutesWanted() {
+		t.Error("want true")
+	}
+	_, _ = c.Set(Settings{RadiusKm: 10, PaidRoutes: true, DelayLookupsPerDay: 0})
+	if c.PaidRoutesWanted() {
+		t.Error("cap 0 turns paid routes off")
+	}
+	_, _ = c.Set(Settings{RadiusKm: 10, PaidRoutes: false, DelayLookupsPerDay: 65})
+	if c.PaidRoutesWanted() {
+		t.Error("paid_routes false → false")
+	}
+	_, _ = c.Set(Settings{RadiusKm: 10, ShowDelay: false, PaidRoutes: true, DelayLookupsPerDay: 65})
+	if !c.PaidRoutesWanted() {
+		t.Error("independent of show_delay")
 	}
 }

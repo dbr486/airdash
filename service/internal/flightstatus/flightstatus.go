@@ -6,6 +6,7 @@ package flightstatus
 
 import (
 	"context"
+	"strings"
 	"time"
 )
 
@@ -44,6 +45,54 @@ type Query struct {
 // data (cacheable); err for transient failures (never cached as a result).
 type Lookup interface {
 	Status(ctx context.Context, q Query) (Status, bool, error)
+}
+
+// FlightRoute is the route half of an AeroAPI flight. It rides on the same
+// /flights/{ident} response as the delay, so reading it costs nothing extra.
+type FlightRoute struct {
+	OriginIATA, OriginICAO, OriginCity string
+	DestIATA, DestICAO, DestCity       string
+	Operator, OperatorIATA             string
+}
+
+// Flight is everything one AeroAPI call yields. The two halves are
+// independent: a flight can have a route but no delay data yet, or the
+// reverse.
+type Flight struct {
+	Status    Status
+	HasStatus bool
+	Route     FlightRoute
+	HasRoute  bool
+}
+
+// FlightLookup resolves one aircraft to its route and status together.
+// ok when either part is known; err semantics match Lookup.
+type FlightLookup interface {
+	Flight(ctx context.Context, q Query) (Flight, bool, error)
+}
+
+// Source is what the budget wrapper and cache expose: the legacy
+// status-only view plus the combined one, both backed by one upstream call.
+type Source interface {
+	Lookup
+	FlightLookup
+}
+
+// Ident is the AeroAPI ident for an aircraft: its callsign, else its
+// registration (AeroAPI accepts registrations without the dash).
+func Ident(callsign, reg string) string {
+	if cs := strings.ToUpper(strings.TrimSpace(callsign)); cs != "" {
+		return cs
+	}
+	return strings.ToUpper(strings.ReplaceAll(strings.TrimSpace(reg), "-", ""))
+}
+
+// statusOf derives the legacy Status view from a Flight.
+func statusOf(f Flight, ok bool, err error) (Status, bool, error) {
+	if err != nil || !ok || !f.HasStatus {
+		return Status{}, false, err
+	}
+	return f.Status, true, nil
 }
 
 // onTimeWindowMin is the |delay| below which a flight counts as on time.

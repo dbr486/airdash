@@ -55,6 +55,7 @@ func store(radius float64) *fakeStore { return &fakeStore{s: settings.Settings{R
 
 type fakeStats struct {
 	enabled bool
+	paid    bool
 	used    int
 	limit   int
 	source  string
@@ -69,6 +70,7 @@ func (f *fakeStats) Board() (string, int, int, int, int, string) {
 }
 
 func (f *fakeStats) DelayEnabled() bool            { return f.enabled }
+func (f *fakeStats) PaidRoutesEnabled() bool       { return f.paid }
 func (f *fakeStats) DelayToday() (used, limit int) { return f.used, f.limit }
 func (f *fakeStats) DelaySource() string           { return f.source }
 
@@ -212,7 +214,7 @@ func TestSettings_GetReturnsCurrent(t *testing.T) {
 			t.Errorf("%s = %v want %v", k, body[k], v)
 		}
 	}
-	if len(body) != 11 {
+	if len(body) != 12 {
 		t.Errorf("unexpected keys: %v", body)
 	}
 }
@@ -352,7 +354,7 @@ func TestSettings_DelayKeysRoundTrip(t *testing.T) {
 	st := &fakeStore{s: settings.Settings{RadiusKm: 10, ShowDelay: true, DelayLookupsPerDay: 40}}
 	h := NewHandler(&fakeSource{at: time.Now()}, st, &fakeStats{}, nil, time.Now)
 	_, body := get(t, h, "/api/settings")
-	if body["show_delay"] != true || body["delay_lookups_per_day"] != 40.0 || len(body) != 11 {
+	if body["show_delay"] != true || body["delay_lookups_per_day"] != 40.0 || len(body) != 12 {
 		t.Errorf("GET = %v", body)
 	}
 	rec, body := put(t, h, `{"show_delay":false,"delay_lookups_per_day":5}`)
@@ -366,20 +368,20 @@ func TestSettings_DelayKeysRoundTrip(t *testing.T) {
 }
 
 func TestStats(t *testing.T) {
-	h := NewHandler(&fakeSource{at: time.Now()}, store(10), &fakeStats{enabled: true, used: 12, limit: 40, source: "aeroapi",
+	h := NewHandler(&fakeSource{at: time.Now()}, store(10), &fakeStats{enabled: true, paid: true, used: 12, limit: 40, source: "aeroapi",
 		boardAirport: "AGP", boardFlights: 187, boardAge: 720, boardCalls: 34, boardCap: 900, boardSource: "airlabs"}, nil, time.Now)
 	rec, body := get(t, h, "/api/stats")
 	if rec.Code != 200 || rec.Header().Get("Cache-Control") != "no-store" {
 		t.Fatalf("code=%d", rec.Code)
 	}
-	want := map[string]any{"delay_enabled": true, "delay_lookups_today": 12.0, "delay_lookups_cap": 40.0, "delay_source": "aeroapi",
+	want := map[string]any{"delay_enabled": true, "delay_lookups_today": 12.0, "delay_lookups_cap": 40.0, "delay_source": "aeroapi", "paid_routes_enabled": true,
 		"board_airport": "AGP", "board_flights": 187.0, "board_age_s": 720.0, "board_calls_month": 34.0, "board_calls_cap": 900.0, "board_source": "airlabs"}
 	for k, v := range want {
 		if body[k] != v {
 			t.Errorf("%s = %v want %v", k, body[k], v)
 		}
 	}
-	if len(body) != 10 {
+	if len(body) != 11 {
 		t.Errorf("unexpected keys: %v", body)
 	}
 }
@@ -407,7 +409,7 @@ func TestNearest_LabelFallsBackToCode(t *testing.T) {
 func TestSettings_ShowNamesRoundTrip(t *testing.T) {
 	h := NewHandler(&fakeSource{at: time.Now()}, store(10), &fakeStats{}, nil, time.Now)
 	_, body := get(t, h, "/api/settings")
-	if body["show_names"] != false || len(body) != 11 {
+	if body["show_names"] != false || len(body) != 12 {
 		t.Errorf("GET = %v", body)
 	}
 	rec, body := put(t, h, `{"show_names":true}`)
@@ -420,7 +422,7 @@ func TestSettings_ShowLogosRoundTrip(t *testing.T) {
 	st := &fakeStore{s: settings.Settings{RadiusKm: 10, ShowLogos: true}}
 	h := NewHandler(&fakeSource{at: time.Now()}, st, &fakeStats{}, nil, time.Now)
 	_, body := get(t, h, "/api/settings")
-	if body["show_logos"] != true || len(body) != 11 {
+	if body["show_logos"] != true || len(body) != 12 {
 		t.Errorf("GET = %v", body)
 	}
 	rec, body := put(t, h, `{"show_logos":false}`)
@@ -711,7 +713,7 @@ func TestLogoBitmap_LegacySquareKeepsAspect(t *testing.T) {
 func TestSettings_BoardAirportRoundTrip(t *testing.T) {
 	h := NewHandler(&fakeSource{at: time.Now()}, store(10), &fakeStats{}, nil, time.Now)
 	_, body := get(t, h, "/api/settings")
-	if body["board_airport"] != "" || len(body) != 11 {
+	if body["board_airport"] != "" || len(body) != 12 {
 		t.Errorf("GET = %v", body)
 	}
 	rec, body := put(t, h, `{"board_airport":"lemg"}`)
@@ -788,5 +790,25 @@ func TestNearest_TypeName(t *testing.T) {
 		if !strings.Contains(rec.Body.String(), want) {
 			t.Errorf("body %s missing %s", rec.Body.String(), want)
 		}
+	}
+}
+
+func TestStats_PaidRoutesEnabledFalse(t *testing.T) {
+	h := NewHandler(&fakeSource{at: time.Now()}, store(10), &fakeStats{enabled: true}, nil, time.Now)
+	_, body := get(t, h, "/api/stats")
+	if body["paid_routes_enabled"] != false {
+		t.Errorf("paid_routes_enabled = %v", body["paid_routes_enabled"])
+	}
+}
+
+func TestSettings_PaidRoutesPutChangesOnlyThat(t *testing.T) {
+	st := &fakeStore{s: settings.Settings{RadiusKm: 10, ShowDelay: true, DelayLookupsPerDay: 65, PaidRoutes: true}}
+	h := NewHandler(&fakeSource{at: time.Now()}, st, &fakeStats{}, nil, time.Now)
+	rec, body := put(t, h, `{"paid_routes":false}`)
+	if rec.Code != 200 || body["paid_routes"] != false || body["show_delay"] != true || body["delay_lookups_per_day"] != 65.0 || body["radius_km"] != 10.0 {
+		t.Errorf("PUT = %d %v", rec.Code, body)
+	}
+	if _, body := get(t, h, "/api/settings"); body["paid_routes"] != false {
+		t.Errorf("GET = %v", body)
 	}
 }

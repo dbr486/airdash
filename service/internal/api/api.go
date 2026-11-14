@@ -37,6 +37,8 @@ type SettingsStore interface {
 // settings page can show today's usage without exposing the budget type.
 type StatsSource interface {
 	DelayEnabled() bool
+	// PaidRoutesEnabled is paid_routes with a key and a non-zero cap.
+	PaidRoutesEnabled() bool
 	DelayToday() (used, limit int)
 	DelaySource() string
 	// Board reports the airport board feeding delay status: airport ("" when
@@ -233,6 +235,7 @@ type settingsPatch struct {
 	ShowNames          *bool    `json:"show_names"`
 	ShowLogos          *bool    `json:"show_logos"`
 	BoardAirport       *string  `json:"board_airport"`
+	PaidRoutes         *bool    `json:"paid_routes"`
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
@@ -296,6 +299,9 @@ func (h *handler) putSettings(w http.ResponseWriter, r *http.Request) {
 		if p.BoardAirport != nil {
 			cur.BoardAirport = *p.BoardAirport
 		}
+		if p.PaidRoutes != nil {
+			cur.PaidRoutes = *p.PaidRoutes
+		}
 		return cur
 	})
 	if err != nil {
@@ -317,6 +323,7 @@ type statsResponse struct {
 	DelayLookupsToday int    `json:"delay_lookups_today"`
 	DelayLookupsCap   int    `json:"delay_lookups_cap"`
 	DelaySource       string `json:"delay_source"`
+	PaidRoutesEnabled bool   `json:"paid_routes_enabled"`
 	BoardAirport      string `json:"board_airport"`
 	BoardFlights      int    `json:"board_flights"`
 	BoardAgeS         int    `json:"board_age_s"`
@@ -330,7 +337,8 @@ func (h *handler) getStats(w http.ResponseWriter, r *http.Request) {
 	airport, flights, age, calls, cap, source := h.stats.Board()
 	writeJSON(w, http.StatusOK, statsResponse{
 		DelayEnabled: h.stats.DelayEnabled(), DelayLookupsToday: used, DelayLookupsCap: limit, DelaySource: h.stats.DelaySource(),
-		BoardAirport: airport, BoardFlights: flights, BoardAgeS: age, BoardCallsMonth: calls, BoardCallsCap: cap, BoardSource: source,
+		PaidRoutesEnabled: h.stats.PaidRoutesEnabled(),
+		BoardAirport:      airport, BoardFlights: flights, BoardAgeS: age, BoardCallsMonth: calls, BoardCallsCap: cap, BoardSource: source,
 	})
 }
 

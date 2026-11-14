@@ -74,23 +74,29 @@ func (b *Budget) Today() (used, limit int) {
 }
 
 type budgeted struct {
-	inner Lookup
+	inner FlightLookup
 	b     *Budget
 }
 
 // NewBudgeted refuses upstream calls once the day's budget is spent. Put
 // it inside the cache so cache hits never consume budget.
-func NewBudgeted(inner Lookup, b *Budget) Lookup { return &budgeted{inner: inner, b: b} }
+func NewBudgeted(inner FlightLookup, b *Budget) Source { return &budgeted{inner: inner, b: b} }
 
 func (l *budgeted) Status(ctx context.Context, q Query) (Status, bool, error) {
+	f, ok, err := l.Flight(ctx, q)
+	return statusOf(f, ok, err)
+}
+
+// Flight charges one unit per upstream call whichever method asked.
+func (l *budgeted) Flight(ctx context.Context, q Query) (Flight, bool, error) {
 	if !l.b.Allow() {
-		return Status{}, false, ErrBudget
+		return Flight{}, false, ErrBudget
 	}
-	st, ok, err := l.inner.Status(ctx, q)
+	f, ok, err := l.inner.Flight(ctx, q)
 	if errors.Is(err, ErrAuth) {
 		// A bad key was never going to succeed; don't let it count against
 		// today's cap alongside the calls that could have.
 		l.b.Refund()
 	}
-	return st, ok, err
+	return f, ok, err
 }

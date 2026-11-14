@@ -42,6 +42,18 @@ type flight struct {
 	ArrivalDelay    *int    `json:"arrival_delay"`
 	Cancelled       bool    `json:"cancelled"`
 	Diverted        bool    `json:"diverted"`
+	Operator        string  `json:"operator"`
+	OperatorIATA    string  `json:"operator_iata"`
+	Origin          *place  `json:"origin"`
+	Destination     *place  `json:"destination"`
+}
+
+// place is an AeroAPI airport reference; the object is null for flights
+// FlightAware has no endpoint for.
+type place struct {
+	CodeIATA string `json:"code_iata"`
+	CodeICAO string `json:"code_icao"`
+	City     string `json:"city"`
 }
 
 type flightsResponse struct {
@@ -49,41 +61,49 @@ type flightsResponse struct {
 }
 
 func (a *AeroAPI) Status(ctx context.Context, q Query) (Status, bool, error) {
+	f, ok, err := a.Flight(ctx, q)
+	return statusOf(f, ok, err)
+}
+
+func (a *AeroAPI) Flight(ctx context.Context, q Query) (Flight, bool, error) {
 	u := a.baseURL + "/flights/" + url.PathEscape(q.Callsign) + "?max_pages=1"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
-		return Status{}, false, err
+		return Flight{}, false, err
 	}
 	req.Header.Set("x-apikey", a.apiKey)
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", a.userAgent)
 	resp, err := a.client.Do(req)
 	if err != nil {
-		return Status{}, false, fmt.Errorf("aeroapi: %w", err)
+		return Flight{}, false, fmt.Errorf("aeroapi: %w", err)
 	}
 	defer resp.Body.Close()
 	switch {
 	case resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusNotFound:
-		return Status{}, false, nil // ident FlightAware cannot resolve: stable unknown
+		return Flight{}, false, nil // ident FlightAware cannot resolve: stable unknown
 	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
-		return Status{}, false, fmt.Errorf("%w (status %d)", ErrAuth, resp.StatusCode)
+		return Flight{}, false, fmt.Errorf("%w (status %d)", ErrAuth, resp.StatusCode)
 	case resp.StatusCode != http.StatusOK:
-		return Status{}, false, fmt.Errorf("aeroapi: status %d", resp.StatusCode)
+		return Flight{}, false, fmt.Errorf("aeroapi: status %d", resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return Status{}, false, fmt.Errorf("aeroapi: %w", err)
+		return Flight{}, false, fmt.Errorf("aeroapi: %w", err)
 	}
 	var fr flightsResponse
 	if err := json.Unmarshal(body, &fr); err != nil {
-		return Status{}, false, fmt.Errorf("aeroapi: decode: %w", err)
+		return Flight{}, false, fmt.Errorf("aeroapi: decode: %w", err)
 	}
 	f, ok := pickFlight(fr.Flights)
 	if !ok {
-		return Status{}, false, nil
+		return Flight{}, false, nil
 	}
-	st, ok := classify(f)
-	return st, ok, nil
+	out := Flight{Route: routeOf(f)}
+	out.HasRoute = out.Route.OriginIATA != "" || out.Route.OriginICAO != "" ||
+		out.Route.DestIATA != "" || out.Route.DestICAO != ""
+	out.Status, out.HasStatus = classify(f)
+	return out, out.HasRoute || out.HasStatus, nil
 }
 
 // pickFlight chooses the instance that is in the air now; AeroAPI returns
@@ -130,4 +150,15 @@ func classify(f flight) (Status, bool) {
 		return Status{}, false
 	}
 	return Classify(int(math.Round(float64(secs)/60)), basis), true
+}
+
+func routeOf(f flight) FlightRoute {
+	r := FlightRoute{Operator: f.Operator, OperatorIATA: f.OperatorIATA}
+	if o := f.Origin; o != nil {
+		r.OriginIATA, r.OriginICAO, r.OriginCity = o.CodeIATA, o.CodeICAO, asciiFold(o.City)
+	}
+	if d := f.Destination; d != nil {
+		r.DestIATA, r.DestICAO, r.DestCity = d.CodeIATA, d.CodeICAO, asciiFold(d.City)
+	}
+	return r
 }

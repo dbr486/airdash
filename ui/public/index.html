@@ -80,9 +80,10 @@
     <fieldset id="display">
       <legend>Display</legend>
       <label><input type="checkbox" id="show_delay"> Show delay status (on time / late)</label>
+      <label><input type="checkbox" id="paid_routes" disabled> Look up missing routes on FlightAware</label>
       <label><input type="checkbox" id="show_names"> Show city names instead of airport codes</label>
       <label><input type="checkbox" id="show_logos"> Show airline logos</label>
-      <label>Delay lookups per day <input type="number" id="delay_cap" min="0" max="1000" step="1" style="width:6em"></label>
+      <label>AeroAPI lookups per day <input type="number" id="delay_cap" min="0" max="1000" step="1" style="width:6em"></label>
       <label>Airport board (IATA/ICAO) <input type="text" id="board_airport" placeholder="AGP" maxlength="4" style="width:5em" autocomplete="off"></label>
       <div id="delay-note" class="hidden"></div>
       <div id="lookups"></div>
@@ -156,6 +157,7 @@ function fillForm(s) {
   $('lat').value = s.lat;
   $('lon').value = s.lon;
   $('show_delay').checked = !!s.show_delay;
+  $('paid_routes').checked = !!s.paid_routes;
   $('show_names').checked = !!s.show_names;
   $('show_logos').checked = !!s.show_logos;
   $('delay_cap').value = s.delay_lookups_per_day;
@@ -210,12 +212,16 @@ $('filters').addEventListener('submit', async (ev) => {
     const capRaw = $('delay_cap').value.trim();
     const cap = Number(capRaw);
     if (capRaw === '' || !Number.isInteger(cap) || cap < 0 || cap > 1000) {
-      $('apply-msg').textContent = 'delay lookups per day must be 0-1000';
+      $('apply-msg').textContent = 'AeroAPI lookups per day must be 0-1000';
       return;
     }
     body.show_delay = $('show_delay').checked;
     body.delay_lookups_per_day = cap;
   }
+  // Same reasoning for paid routes, which need the AeroAPI key itself: with
+  // only the AirLabs board configured, saving false here would keep paid
+  // routes off after a key is added later.
+  if (!$('paid_routes').disabled) body.paid_routes = $('paid_routes').checked;
   $('apply').disabled = true; $('apply-msg').textContent = '';
   try {
     const res = await fetch('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
@@ -245,10 +251,11 @@ async function loadStats() {
     const st = await res.json();
     const noKey = !st.delay_source;
     $('show_delay').disabled = noKey;
+    $('paid_routes').disabled = noKey || !st.delay_source.includes('aeroapi');
     $('delay_cap').disabled = noKey;
     $('delay-note').classList.toggle('hidden', !noKey);
     if (noKey) $('delay-note').textContent = 'No delay source configured (AIRDASH_AEROAPI_KEY or AIRDASH_AIRLABS_KEY)';
-    $('lookups').textContent = (noKey || !st.delay_source.includes('aeroapi')) ? '' : `AeroAPI lookups today: ${st.delay_lookups_today} / ${st.delay_lookups_cap}${st.delay_enabled ? '' : ' (off)'}`;
+    $('lookups').textContent = (noKey || !st.delay_source.includes('aeroapi')) ? '' : `AeroAPI lookups today: ${st.delay_lookups_today} / ${st.delay_lookups_cap}${st.delay_enabled ? '' : ' (delay off)'} · routes: ${st.paid_routes_enabled ? 'on' : 'off'}`;
     const b = $('board');
     if (!st.board_source) b.textContent = '';
     else if (!st.board_airport) b.textContent = `Airport board: off (set an airport) · ${st.board_calls_month}/${st.board_calls_cap} calls this month`;

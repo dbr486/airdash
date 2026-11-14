@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -164,6 +165,27 @@ func (b *Board) Status(_ context.Context, q flightstatus.Query) (flightstatus.St
 	}
 	arrival := sameAirportAny(airportCodes(rows, airport), r.ArrIATA, r.ArrICAO)
 	return StatusOf(r, arrival, q.Seen), true, nil
+}
+
+// Route gives the route of the one board row whose ICAO flight id equals
+// the callsign, without any network call. The aircraft's direction is
+// unknown here (that is what is being asked), so both ends are tried and
+// two plausible rows fail closed: a wrong route would be shown as fact,
+// and the caller can still pay for the exact one. A stale board is a miss
+// for the same reason as in Status.
+func (b *Board) Route(q flightstatus.Query, now time.Time) (flightstatus.FlightRoute, bool) {
+	b.mu.RLock()
+	airport, rows, fetchedAt := b.airport, b.rows, b.fetchedAt
+	b.mu.RUnlock()
+	cs := strings.ToUpper(strings.TrimSpace(q.Callsign))
+	if cs == "" || airport == "" || len(rows) == 0 || now.Sub(fetchedAt) > b.maxAge {
+		return flightstatus.FlightRoute{}, false
+	}
+	r, _, n := callsignRows(rows, airportCodes(rows, airport), cs, false, false, now)
+	if n != 1 {
+		return flightstatus.FlightRoute{}, false
+	}
+	return RouteOf(r), true
 }
 
 func (b *Board) Stats() Stats {

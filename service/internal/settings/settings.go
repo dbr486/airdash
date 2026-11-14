@@ -44,17 +44,25 @@ type Settings struct {
 	// BoardAirport is the airport whose departures/arrivals board supplies
 	// delay status; "" = off.
 	BoardAirport string `json:"board_airport"`
+	// PaidRoutes lets an AeroAPI lookup fill in a route the free sources
+	// could not find. It spends the same daily cap as delay lookups, so it
+	// has its own switch independent of ShowDelay.
+	PaidRoutes bool `json:"paid_routes"`
 }
 
 // DefaultDelayLookupsPerDay caps AeroAPI calls so the worst case (the cap
-// hit every day) still fits the Personal tier's free credit: 30/day x 31
-// days = 930 result sets ≈ $4.65, inside the $5 credit even in the worst
-// case.
-const DefaultDelayLookupsPerDay = 30
+// hit every day) stays near $10 a month: 65/day x 31 days x $0.005 ≈
+// $10.08, about $5 beyond the Personal tier's $5 monthly credit, a spend
+// the owner accepted for paid routes. The cap is shared by delay and paid
+// route lookups.
+const DefaultDelayLookupsPerDay = 65
 
 func FromConfig(c config.Config) Settings {
 	return Settings{Lat: c.Lat, Lon: c.Lon, Origin: c.Origin, Dest: c.Dest, Airport: c.Airport, RadiusKm: c.RadiusKm,
-		ShowDelay: c.AeroAPIKey != "" || c.AirLabsKey != "", DelayLookupsPerDay: DefaultDelayLookupsPerDay, ShowLogos: true, BoardAirport: c.BoardAirport}
+		ShowDelay: c.AeroAPIKey != "" || c.AirLabsKey != "", DelayLookupsPerDay: DefaultDelayLookupsPerDay, ShowLogos: true, BoardAirport: c.BoardAirport,
+		// Paid routes follow the key alone: a route-only call is useless without
+		// one, and a persisted file without this key must inherit this default.
+		PaidRoutes: c.AeroAPIKey != ""}
 }
 
 // Normalize upper-cases and trims the code lists, validates them through
@@ -92,6 +100,7 @@ func Normalize(s Settings) (Settings, filter.Filter, error) {
 		DelayLookupsPerDay: s.DelayLookupsPerDay,
 		ShowNames:          s.ShowNames,
 		ShowLogos:          s.ShowLogos,
+		PaidRoutes:         s.PaidRoutes,
 	}
 	f, err := filter.Parse(n.Origin, n.Dest, n.Airport)
 	if err != nil {
@@ -260,7 +269,7 @@ func (c *Current) setLocked(s Settings) (Settings, error) {
 	c.settings, c.filter = n, f
 	c.mu.Unlock()
 	c.logger.Info("settings changed", "origin", n.Origin, "dest", n.Dest, "airport", n.Airport, "radius_km", n.RadiusKm,
-		"show_delay", n.ShowDelay, "delay_cap", n.DelayLookupsPerDay)
+		"show_delay", n.ShowDelay, "delay_cap", n.DelayLookupsPerDay, "paid_routes", n.PaidRoutes)
 	return n, nil
 }
 
@@ -271,6 +280,15 @@ func (c *Current) DelayWanted() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.settings.ShowDelay && c.settings.DelayLookupsPerDay > 0
+}
+
+// PaidRoutesWanted reports whether a route-only AeroAPI call may run:
+// switched on and the shared daily cap not zero (cap 0 turns every paid
+// lookup off). The key check is main's concern, as for DelayWanted.
+func (c *Current) PaidRoutesWanted() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.settings.PaidRoutes && c.settings.DelayLookupsPerDay > 0
 }
 
 // ShowDelay is the user's wish alone, without the paid cap: the airport

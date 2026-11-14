@@ -243,3 +243,13 @@ func TestDecodeReadsb_QNHSkipsUnknownAndGround(t *testing.T) {
 		t.Errorf("ground: OnGround=%v AltFt=%d, want true/0", acs[2].OnGround, acs[2].AltFt)
 	}
 }
+
+func TestDecodeReadsb_Category(t *testing.T) {
+	acs, err := decodeReadsb([]byte(`{"ac":[{"hex":"a1","t":"C172","category":"A1"},{"hex":"a2","t":"A320","category":"A3"},{"hex":"a3"}]}`))
+	if err != nil || len(acs) != 3 {
+		t.Fatalf("err=%v n=%d", err, len(acs))
+	}
+	if acs[0].Category != "A1" || acs[1].Category != "A3" || acs[2].Category != "" {
+		t.Errorf("categories = %q %q %q", acs[0].Category, acs[1].Category, acs[2].Category)
+	}
+}

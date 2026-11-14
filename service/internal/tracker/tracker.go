@@ -64,6 +64,13 @@ type SettingsSource interface {
 	Home() (lat, lon float64, ok bool) // ok false: use the Options position
 	DelayWanted() bool                 // paid lookups: show_delay and a cap above zero
 	ShowDelay() bool                   // the free board only needs the wish
+	PaidRoutesWanted() bool            // route-only AeroAPI calls: paid_routes and a cap above zero
+}
+
+// BoardRoute names a route from the cached airport board by exact callsign,
+// with no network call.
+type BoardRoute interface {
+	Route(q flightstatus.Query, now time.Time) (flightstatus.FlightRoute, bool)
 }
 
 type Options struct {
@@ -81,6 +88,12 @@ type Options struct {
 	// so it is asked for every aircraft in the list; Delay (which may chain
 	// the same board with a paid lookup) is only asked for the nearest.
 	BoardDelay flightstatus.Lookup
+	// Flights fills the nearest aircraft's missing route. It must be the same
+	// cache instance that sits inside Delay: one entry per ident then serves
+	// both, so route and delay never cost two AeroAPI calls. nil disables it.
+	Flights flightstatus.FlightLookup
+	// BoardRoute is the free route source tried before Flights; nil = off.
+	BoardRoute BoardRoute
 	Filter     filter.Filter
 	Settings   SettingsSource
 	Now        func() time.Time
@@ -300,24 +313,35 @@ func (t *Tracker) Tick(ctx context.Context) {
 
 	delayState := delayNoInfo
 	var delayErr error
-	if best != nil && snap.Delay == nil && t.o.Delay != nil && best.ac.Callsign != "" && wantDelay {
+	var paid paidCall
+	if best != nil {
+		var changed bool
+		changed, paid = t.fillRoute(ctx, best, seen[best.ac.Hex], fetchedAt)
+		if changed {
+			d := list[0].Delay
+			list[0] = toSnapshot(*best, nearby, radiusKm)
+			list[0].Index, list[0].Delay = 0, d
+			snap = list[0]
+		}
+	}
+	if paid.called {
+		// The same cache answers the delay path, so asking it again would
+		// only replay this result; take the delay from here instead.
+		delayState, delayErr = classifyDelay(paid.err)
+		if paid.err == nil && wantDelay && snap.Delay == nil && paid.fl.HasStatus {
+			s := paid.fl.Status
+			snap.Delay = &s
+		}
+	} else if ident := t.delayIdent(best); ident != "" && snap.Delay == nil && t.o.Delay != nil && wantDelay {
 		dctx, cancel := context.WithTimeout(ctx, t.o.DelayTimeout)
-		st, ok, err := t.o.Delay.Status(dctx, queryFor(*best, seen[best.ac.Hex]))
+		dq := queryFor(*best, seen[best.ac.Hex])
+		dq.Callsign = ident
+		st, ok, err := t.o.Delay.Status(dctx, dq)
 		cancel()
-		switch {
-		case err != nil && (errors.Is(err, flightstatus.ErrCooldown) || errors.Is(err, flightstatus.ErrBudget)):
-			// A cooldown/budget refusal is a consequence of an earlier
-			// failure (or the daily cap), not fresh information: leave
-			// delayState at delayNoInfo so it neither logs a fresh
-			// "failing" nor a spurious "recovered".
-		case err != nil:
-			delayState, delayErr = delayFailed, err
-		default:
-			delayState = delayOK
-			if ok {
-				s := st
-				snap.Delay = &s
-			}
+		delayState, delayErr = classifyDelay(err)
+		if err == nil && ok {
+			s := st
+			snap.Delay = &s
 		}
 	}
 
@@ -327,13 +351,169 @@ func (t *Tracker) Tick(ctx context.Context) {
 	t.onSuccess(snap, list, fetchedAt, routeErr, delayState, delayErr)
 }
 
+// delayIdent is the cache key for the nearest aircraft's delay lookup, keyed
+// like the paid route call so both share one entry (a lower-case or padded
+// callsign would otherwise miss it and cost a second paid call). Without a
+// callsign the registration is used only when paid routes are on and the
+// aircraft is one fillRoute would pay for: that is the only way a
+// registration lookup is authorised, and it lets a route found by
+// registration keep its delay on later ticks, from the same cache entry.
+func (t *Tracker) delayIdent(best *candidate) string {
+	if best == nil {
+		return ""
+	}
+	if id := flightstatus.Ident(best.ac.Callsign, ""); id != "" {
+		return id
+	}
+	if t.o.Settings == nil || !t.o.Settings.PaidRoutesWanted() || light(best.ac) {
+		return ""
+	}
+	return flightstatus.Ident("", best.ac.Reg)
+}
+
+func classifyDelay(err error) (delayOutcome, error) {
+	switch {
+	case err != nil && (errors.Is(err, flightstatus.ErrCooldown) || errors.Is(err, flightstatus.ErrBudget)):
+		// A cooldown/budget refusal is a consequence of an earlier
+		// failure (or the daily cap), not fresh information: report
+		// delayNoInfo so it neither logs a fresh "failing" nor a
+		// spurious "recovered".
+		return delayNoInfo, nil
+	case err != nil:
+		return delayFailed, err
+	}
+	return delayOK, nil
+}
+
+// paidCall is the outcome of this tick's route-only AeroAPI call, if any.
+type paidCall struct {
+	called bool
+	fl     flightstatus.Flight
+	err    error
+}
+
+// fillRoute gives the nearest aircraft a route when the free route lookup
+// had none: first from this pass's memory, then the airport board, and only
+// then one AeroAPI call. Filters already ran on the free route, so a route
+// found here can change what is shown, never what is listed.
+func (t *Tracker) fillRoute(ctx context.Context, c *candidate, seen, now time.Time) (changed bool, paid paidCall) {
+	if hasRoute(c.route) {
+		return false, paid
+	}
+	hex := c.ac.Hex
+	switch m := t.passMemo(hex); m.state {
+	case passFound:
+		applyRoute(c, m.route)
+		return true, paid
+	case passUnknown:
+		return false, paid
+	}
+	if t.o.BoardRoute != nil {
+		if r, ok := t.o.BoardRoute.Route(queryFor(*c, seen), now); ok {
+			applyRoute(c, r)
+			t.remember(hex, passRoute{state: passFound, route: r})
+			return true, paid
+		}
+	}
+	if t.o.Flights == nil || t.o.Settings == nil || !t.o.Settings.PaidRoutesWanted() || light(c.ac) {
+		return false, paid
+	}
+	ident := flightstatus.Ident(c.ac.Callsign, c.ac.Reg)
+	if ident == "" {
+		return false, paid
+	}
+	q := queryFor(*c, seen)
+	q.Callsign = ident // the cache key, shared with the delay lookup
+	fctx, cancel := context.WithTimeout(ctx, t.o.DelayTimeout)
+	fl, ok, err := t.o.Flights.Flight(fctx, q)
+	cancel()
+	paid = paidCall{called: true, fl: fl, err: err}
+	switch {
+	case err != nil:
+		// A refusal or an outage says nothing about this flight; the
+		// cache's cooldown already spaces out the retries.
+		t.o.Logger.Debug("paid route lookup failed", "ident", ident, "err", err)
+	case ok && fl.HasRoute:
+		applyRoute(c, fl.Route)
+		t.remember(hex, passRoute{state: passFound, route: fl.Route})
+		changed = true
+	default:
+		// Remembered for the whole pass, not the cache's 15 minutes: an
+		// aircraft AeroAPI cannot name now will not become nameable
+		// overhead, and each retry would spend the shared daily cap.
+		t.remember(hex, passRoute{state: passUnknown})
+	}
+	return changed, paid
+}
+
+func hasRoute(r routes.Route) bool {
+	return firstNonEmpty(r.OriginIATA, r.OriginICAO) != "" || firstNonEmpty(r.DestIATA, r.DestICAO) != ""
+}
+
+// light reports aircraft not worth a paid lookup: local general aviation
+// files no flight AeroAPI could find. A1 is the "light" emitter category; an
+// aircraft with neither a category nor a callsign is almost always the same.
+func light(ac provider.Aircraft) bool {
+	return ac.Category == "A1" || (ac.Category == "" && ac.Callsign == "")
+}
+
+// applyRoute fills the route ends from a board or AeroAPI route. The airline
+// is only filled when still empty: the callsign/registry operator is the
+// better authority, and the logo code must follow the name shown.
+func applyRoute(c *candidate, r flightstatus.FlightRoute) {
+	c.route.OriginIATA, c.route.OriginICAO, c.route.OriginName = r.OriginIATA, r.OriginICAO, r.OriginCity
+	c.route.DestIATA, c.route.DestICAO, c.route.DestName = r.DestIATA, r.DestICAO, r.DestCity
+	if c.route.Airline == "" && r.Operator != "" {
+		c.route.Airline = r.Operator
+		if r.OperatorIATA != "" {
+			c.route.AirlineIATA = r.OperatorIATA
+		}
+	}
+}
+
 func queryFor(c candidate, seen time.Time) flightstatus.Query {
 	return flightstatus.Query{Callsign: c.ac.Callsign, AirlineIATA: c.route.AirlineIATA,
 		Origin: firstNonEmpty(c.route.OriginIATA, c.route.OriginICAO), Dest: firstNonEmpty(c.route.DestIATA, c.route.DestICAO),
 		Seen: seen}
 }
 
-type sighting struct{ first, last time.Time }
+// sighting is one pass of an aircraft through range. The route memory rides
+// on it so it is forgotten exactly when the pass ends.
+type sighting struct {
+	first, last time.Time
+	route       passRoute
+}
+
+type passState int
+
+const (
+	passNone passState = iota
+	passFound
+	passUnknown
+)
+
+// passRoute is what the board or AeroAPI said about the route during this
+// pass. A found route outlives the 15-minute flightstatus cache entry so it
+// does not vanish mid-pass; an unknown one caps the cost at one call.
+type passRoute struct {
+	state passState
+	route flightstatus.FlightRoute
+}
+
+func (t *Tracker) passMemo(hex string) passRoute {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.seen[hex].route
+}
+
+func (t *Tracker) remember(hex string, r passRoute) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if s, ok := t.seen[hex]; ok {
+		s.route = r
+		t.seen[hex] = s
+	}
+}
 
 // sightingGrace is how long an aircraft may drop out of the feed (a weak
 // signal right after takeoff, a missed position) before its first sighting
@@ -429,9 +609,9 @@ func (t *Tracker) onSuccess(snap Snapshot, list []Snapshot, fetchedAt time.Time,
 		failing := delayState == delayFailed
 		switch {
 		case failing && !t.delayFailing:
-			t.o.Logger.Warn("delay lookup failing", "err", delayErr)
+			t.o.Logger.Warn("AeroAPI lookup failing", "err", delayErr)
 		case !failing && t.delayFailing:
-			t.o.Logger.Info("delay lookup recovered")
+			t.o.Logger.Info("AeroAPI lookup recovered")
 		}
 		t.delayFailing = failing
 	}

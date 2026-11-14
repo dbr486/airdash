@@ -34,30 +34,8 @@ func Match(rows []Row, airport string, q flightstatus.Query, now time.Time) (Row
 	arrival, dirKnown := isArrival(codes, q)
 
 	if cs := strings.ToUpper(strings.TrimSpace(q.Callsign)); cs != "" {
-		var best Row
-		var bestDist time.Duration
-		found := false
-		for _, r := range rows {
-			if r.FlightICAO != cs {
-				continue
-			}
-			rowArr := sameAirportAny(codes, r.ArrIATA, r.ArrICAO)
-			if dirKnown && rowArr != arrival {
-				continue
-			}
-			ref := first(r.DepActual, r.DepEst, r.DepSched)
-			if rowArr {
-				ref = first(r.ArrActual, r.ArrEst, r.ArrSched)
-			}
-			d := abs(now.Sub(ref))
-			if ref.IsZero() || d > callsignMax {
-				continue
-			}
-			if !found || d < bestDist {
-				best, bestDist, found = r, d, true
-			}
-		}
-		if found {
+		best, _, n := callsignRows(rows, codes, cs, arrival, dirKnown, now)
+		if n > 0 {
 			return best, true
 		}
 	}
@@ -148,6 +126,45 @@ func Match(rows []Row, airport string, q flightstatus.Query, now time.Time) (Row
 		return Row{}, false
 	}
 	return best.r, true
+}
+
+// callsignRows returns the plausible rows for an exact callsign: within
+// callsignMax of now at the end that touches the board airport, and, when
+// the direction is known, leaving or arriving as the route says. It
+// returns the nearest one and how many qualified, so Route can fail
+// closed on ties while Match keeps taking the nearest.
+func callsignRows(rows []Row, codes []string, cs string, arrival, dirKnown bool, now time.Time) (best Row, bestDist time.Duration, n int) {
+	for _, r := range rows {
+		if r.FlightICAO != cs {
+			continue
+		}
+		rowArr := sameAirportAny(codes, r.ArrIATA, r.ArrICAO)
+		if dirKnown && rowArr != arrival {
+			continue
+		}
+		ref := first(r.DepActual, r.DepEst, r.DepSched)
+		if rowArr {
+			ref = first(r.ArrActual, r.ArrEst, r.ArrSched)
+		}
+		d := abs(now.Sub(ref))
+		if ref.IsZero() || d > callsignMax {
+			continue
+		}
+		if n == 0 || d < bestDist {
+			best, bestDist = r, d
+		}
+		n++
+	}
+	return best, bestDist, n
+}
+
+// RouteOf reads the two ends off a board row. The board has no city or
+// operator names, so those stay empty rather than guessed.
+func RouteOf(r Row) flightstatus.FlightRoute {
+	return flightstatus.FlightRoute{
+		OriginIATA: r.DepIATA, OriginICAO: r.DepICAO,
+		DestIATA: r.ArrIATA, DestICAO: r.ArrICAO,
+	}
 }
 
 // airportCodes returns the board airport plus its twin code (IATA↔ICAO)
