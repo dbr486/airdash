@@ -46,3 +46,21 @@ func TestTypeName(t *testing.T) {
 		}
 	}
 }
+
+func TestAirportCity(t *testing.T) {
+	cases := []struct{ iata, icao, want string }{
+		{"AGP", "", "Malaga"},
+		{"agp", "", "Malaga"},
+		{"KRK", "EPKK", "Balice"},
+		{"", "EGHH", "Bournemouth"},
+		{"MAN", "", "Manchester"},      // "Manchester, Greater Manchester"
+		{"ZZZ", "EGHH", "Bournemouth"}, // unknown IATA falls back to ICAO
+		{"", "", ""},
+		{"ZZZ", "ZZZZ", ""},
+	}
+	for _, c := range cases {
+		if got := AirportCity(c.iata, c.icao); got != c.want {
+			t.Errorf("AirportCity(%q, %q) = %q, want %q", c.iata, c.icao, got, c.want)
+		}
+	}
+}

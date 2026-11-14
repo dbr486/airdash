@@ -277,8 +277,8 @@ on a bad code or radius. `show_delay` toggles the delay feature (no effect
 without `AIRDASH_AEROAPI_KEY`); `paid_routes` lets AeroAPI fill a route
 the free sources lack; `delay_lookups_per_day` caps all AeroAPI calls, delay
 and route together, per UTC day (0–1000; 0 turns both off). `show_names` makes `origin_label`/`dest_label`
-carry city names instead of airport codes where adsbdb knows the
-municipality. `show_logos` turns airline logos on or off. `lat`/`lon`
+carry city names instead of airport codes: the route source's name when
+it sends one (adsbdb, AeroAPI), else the embedded OurAirports table. `show_logos` turns airline logos on or off. `lat`/`lon`
 move the home position (defaults from `AIRDASH_LAT`/`AIRDASH_LON`).
 
 ### Other endpoints
@@ -334,6 +334,7 @@ Tests and conventions: [CONTRIBUTING.md](CONTRIBUTING.md).
   non-commercial use) or [adsb.lol](https://adsb.lol)
 - Routes and airlines: [adsbdb](https://www.adsbdb.com), with [hexdb](https://hexdb.io) as a free fallback for routes
 - Airline names: [VRS standing data](https://github.com/vradarserver/standing-data) (CC0), refreshed with scripts/update-standing-data.sh
+- Airport city names: [OurAirports](https://ourairports.com/data/) (public domain), refreshed by the same script
 - Airport boards: [AirLabs](https://airlabs.co) schedules API
 - Flight status: [FlightAware AeroAPI](https://www.flightaware.com/commercial/aeroapi/)
 - Address lookup: [OpenStreetMap Nominatim](https://nominatim.org), © OpenStreetMap contributors

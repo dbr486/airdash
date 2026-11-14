@@ -1446,8 +1446,8 @@ func TestTick_BoardRouteOverridesFreeRoute(t *testing.T) {
 	tr.o.BoardRoute = &fakeBoardRoute{r: flightstatus.FlightRoute{OriginIATA: "LHR", OriginICAO: "EGLL", DestIATA: "WAW", DestICAO: "EPWA"}, ok: true}
 	tr.Tick(t.Context())
 	s, _ := tr.Current()
-	if s.Origin != "LHR" || s.Dest != "WAW" || s.DestName != "" {
-		t.Errorf("board route must win, without the free route's city names: %+v", s)
+	if s.Origin != "LHR" || s.Dest != "WAW" || s.DestName != "Warsaw" {
+		t.Errorf("board route must win, named from the airport table, not the free route: %+v", s)
 	}
 	if s.Airline != "Wizz Air" || s.AirlineIATA != "W6" {
 		t.Errorf("airline must stay: %+v", s)
@@ -1549,8 +1549,9 @@ func TestTick_FallbackFillsUnknownRoute(t *testing.T) {
 	tr := fallbackTracker(&fakeRoutes{}, fb, filter.Filter{})
 	tr.Tick(t.Context())
 	s, _ := tr.Current()
-	if s.Origin != "LHR" || s.Dest != "WAW" || s.OriginName != "" || s.DestName != "" {
-		t.Errorf("fallback route must fill an unknown one, without names: %+v", s)
+	// hexdb sends no city names; the embedded airport table names the ends.
+	if s.Origin != "LHR" || s.Dest != "WAW" || s.OriginName != "London" || s.DestName != "Warsaw" {
+		t.Errorf("fallback route must fill an unknown one, named from the airport table: %+v", s)
 	}
 }
 
@@ -1559,7 +1560,7 @@ func TestTick_FallbackFillsAfterImplausibleDrop(t *testing.T) {
 	tr := fallbackTracker(&fakeRoutes{byCallsign: map[string]routes.Route{"WZZ1": agpTFS}}, fb, filter.Filter{})
 	tr.Tick(t.Context())
 	s, _ := tr.Current()
-	if s.Origin != "LHR" || s.Dest != "WAW" || s.DestName != "" {
+	if s.Origin != "LHR" || s.Dest != "WAW" || s.DestName != "Warsaw" {
 		t.Errorf("fallback route must replace an implausible one: %+v", s)
 	}
 	if s.Airline != "Wizz Air" || s.AirlineIATA != "W6" {

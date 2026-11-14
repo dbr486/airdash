@@ -14,7 +14,8 @@ edits the settings.
    adsb.fi/adsb.lol   adsbdb     pics.avs.io     AirLabs board   AeroAPI      Nominatim
    (positions)    (routes, owners) (logos)       (optional)     (optional)   (address search)
 
-   VRS airline list + type names: embedded in the service binary, no network
+   VRS airline list + type names + OurAirports city names: embedded in the
+   service binary, no network
 ```
 
 The displays never talk to the internet directly. Keys, caches and rate
@@ -48,7 +49,8 @@ Wiring is in `cmd/airdash/main.go`; each package has one job.
    1.25 × the direct distance plus 100 km). Otherwise the airports are
    dropped and the airline stays. A route still missing is asked of hexdb
    (free, no key): its record must be under 30 days old, a single leg, and
-   pass the same position check; it carries no city names. Only then may
+   pass the same position check; it carries no city names, so the snapshot
+   names its ends (and board routes) from the embedded airport table. Only then may
    step 5 ask AeroAPI. hexdb errors never mark route lookup as failing.
    **`operators`** then names the operating airline for each aircraft that
    survives the filter: the callsign prefix is looked up in the embedded

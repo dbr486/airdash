@@ -739,6 +739,16 @@ func sameEnd(iataA, icaoA, iataB, icaoB string) bool {
 	return false
 }
 
+// cityOr keeps the source's city name and otherwise names the airport from
+// the embedded table: hexdb and the board send codes only, and without this
+// the show_names option would show codes for a third of routes.
+func cityOr(name, iata, icao string) string {
+	if name != "" {
+		return name
+	}
+	return standing.AirportCity(iata, icao)
+}
+
 func hasRoute(r routes.Route) bool {
 	return firstNonEmpty(r.OriginIATA, r.OriginICAO) != "" || firstNonEmpty(r.DestIATA, r.DestICAO) != ""
 }
@@ -872,8 +882,8 @@ func toSnapshot(c candidate, nearby int, radiusKm float64) Snapshot {
 		AirlineIATA: c.route.AirlineIATA,
 		Origin:      firstNonEmpty(c.route.OriginIATA, c.route.OriginICAO),
 		Dest:        firstNonEmpty(c.route.DestIATA, c.route.DestICAO),
-		OriginName:  c.route.OriginName,
-		DestName:    c.route.DestName,
+		OriginName:  cityOr(c.route.OriginName, c.route.OriginIATA, c.route.OriginICAO),
+		DestName:    cityOr(c.route.DestName, c.route.DestIATA, c.route.DestICAO),
 		AltFt:       c.ac.AltFt,
 		GroundKt:    c.ac.GroundKt,
 		Track:       c.ac.Track,
